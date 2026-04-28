@@ -1165,4 +1165,199 @@ mod tests {
             None => std::env::remove_var("AIKI_WORKSPACES_DIR"),
         }
     }
+
+    /// Helper: write a file and describe it in a JJ workspace
+    fn jj_write_and_describe(path: &Path, filename: &str, content: &str, desc: &str) {
+        use std::process::Command;
+        fs::write(path.join(filename), content).unwrap();
+        Command::new("jj")
+            .args(["describe", "-m", desc])
+            .current_dir(path)
+            .output()
+            .expect("jj describe failed");
+    }
+
+    /// Regression test for fix-absorbtion-on-multiple-runs.md:
+    /// Two sequential absorptions into default@ must both survive on disk.
+    #[test]
+    fn test_sequential_absorptions_preserve_earlier_changes() {
+        use std::process::Command;
+
+        let _lock = env_lock();
+        let (repo_dir, ws_dir) = setup_jj_repo();
+        let original = std::env::var("AIKI_WORKSPACES_DIR").ok();
+        std::env::set_var("AIKI_WORKSPACES_DIR", ws_dir.path());
+
+        // Simulate session.started hook: jj new --ignore-working-copy
+        Command::new("jj")
+            .args(["new", "--ignore-working-copy"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+
+        // --- Session A ---
+        let ws_a = create_isolated_workspace(repo_dir.path(), "session-a").unwrap();
+        jj_write_and_describe(&ws_a.path, "file_a.txt", "changes from session A", "[aiki] session A");
+
+        let result_a = absorb_workspace(repo_dir.path(), &ws_a, None);
+        assert!(
+            matches!(result_a, Ok(AbsorbResult::Absorbed)),
+            "Session A absorption should succeed, got: {:?}",
+            result_a
+        );
+        cleanup_workspace(repo_dir.path(), &ws_a).unwrap();
+
+        let file_a_path = repo_dir.path().join("file_a.txt");
+        assert!(file_a_path.exists(), "file_a.txt must exist after absorption A");
+        assert_eq!(fs::read_to_string(&file_a_path).unwrap(), "changes from session A");
+
+        // Simulate session B startup: jj new --ignore-working-copy
+        Command::new("jj")
+            .args(["new", "--ignore-working-copy"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+
+        // --- Session B ---
+        let ws_b = create_isolated_workspace(repo_dir.path(), "session-b").unwrap();
+        jj_write_and_describe(&ws_b.path, "file_b.txt", "changes from session B", "[aiki] session B");
+
+        let result_b = absorb_workspace(repo_dir.path(), &ws_b, None);
+        assert!(
+            matches!(result_b, Ok(AbsorbResult::Absorbed)),
+            "Session B absorption should succeed, got: {:?}",
+            result_b
+        );
+        cleanup_workspace(repo_dir.path(), &ws_b).unwrap();
+
+        // CRITICAL: Both files must survive
+        assert!(
+            file_a_path.exists(),
+            "BUG: file_a.txt from session A was reverted by session B's absorption!"
+        );
+        assert_eq!(fs::read_to_string(&file_a_path).unwrap(), "changes from session A");
+
+        let file_b_path = repo_dir.path().join("file_b.txt");
+        assert!(file_b_path.exists(), "file_b.txt must exist after absorption B");
+        assert_eq!(fs::read_to_string(&file_b_path).unwrap(), "changes from session B");
+
+        match original {
+            Some(v) => std::env::set_var("AIKI_WORKSPACES_DIR", v),
+            None => std::env::remove_var("AIKI_WORKSPACES_DIR"),
+        }
+    }
+
+    /// Variant: Both sessions start before either absorbs (concurrent --async).
+    #[test]
+    fn test_sequential_absorptions_with_concurrent_startup() {
+        use std::process::Command;
+
+        let _lock = env_lock();
+        let (repo_dir, ws_dir) = setup_jj_repo();
+        let original = std::env::var("AIKI_WORKSPACES_DIR").ok();
+        std::env::set_var("AIKI_WORKSPACES_DIR", ws_dir.path());
+
+        // Session A startup
+        Command::new("jj")
+            .args(["new", "--ignore-working-copy"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+        let ws_a = create_isolated_workspace(repo_dir.path(), "session-a2").unwrap();
+
+        // Session B startup (before A completes)
+        Command::new("jj")
+            .args(["new", "--ignore-working-copy"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+        let ws_b = create_isolated_workspace(repo_dir.path(), "session-b2").unwrap();
+
+        // Both agents work
+        jj_write_and_describe(&ws_a.path, "file_a.txt", "changes from A", "[aiki] A");
+        jj_write_and_describe(&ws_b.path, "file_b.txt", "changes from B", "[aiki] B");
+
+        // Agent A finishes first, absorbs
+        let result_a = absorb_workspace(repo_dir.path(), &ws_a, None);
+        assert!(matches!(result_a, Ok(AbsorbResult::Absorbed)));
+        cleanup_workspace(repo_dir.path(), &ws_a).unwrap();
+
+        let file_a_path = repo_dir.path().join("file_a.txt");
+        assert!(file_a_path.exists(), "file_a.txt must exist after A absorbs");
+
+        // Agent B finishes, absorbs
+        let result_b = absorb_workspace(repo_dir.path(), &ws_b, None);
+        assert!(matches!(result_b, Ok(AbsorbResult::Absorbed)));
+        cleanup_workspace(repo_dir.path(), &ws_b).unwrap();
+
+        // CRITICAL: Both files must survive
+        assert!(file_a_path.exists(), "BUG: file_a.txt reverted by session B absorption!");
+        let file_b_path = repo_dir.path().join("file_b.txt");
+        assert!(file_b_path.exists(), "file_b.txt must exist after B absorbs");
+
+        match original {
+            Some(v) => std::env::set_var("AIKI_WORKSPACES_DIR", v),
+            None => std::env::remove_var("AIKI_WORKSPACES_DIR"),
+        }
+    }
+
+    /// Stress test: 7 concurrent sessions absorb sequentially.
+    #[test]
+    fn test_seven_sequential_absorptions_all_survive() {
+        use std::process::Command;
+
+        let _lock = env_lock();
+        let (repo_dir, ws_dir) = setup_jj_repo();
+        let original = std::env::var("AIKI_WORKSPACES_DIR").ok();
+        std::env::set_var("AIKI_WORKSPACES_DIR", ws_dir.path());
+
+        let num_sessions = 7;
+        let mut workspaces = Vec::new();
+
+        // All sessions start concurrently
+        for i in 0..num_sessions {
+            Command::new("jj")
+                .args(["new", "--ignore-working-copy"])
+                .current_dir(repo_dir.path())
+                .output()
+                .unwrap();
+
+            let session_id = format!("stress-{}", i);
+            let ws = create_isolated_workspace(repo_dir.path(), &session_id).unwrap();
+
+            let filename = format!("file_{}.txt", i);
+            let content = format!("changes from session {}", i);
+            jj_write_and_describe(&ws.path, &filename, &content, &format!("[aiki] session {}", i));
+
+            workspaces.push(ws);
+        }
+
+        // All sessions absorb sequentially
+        for (i, ws) in workspaces.iter().enumerate() {
+            let result = absorb_workspace(repo_dir.path(), ws, None);
+            assert!(
+                matches!(result, Ok(AbsorbResult::Absorbed)),
+                "Session {} absorption failed: {:?}", i, result
+            );
+            cleanup_workspace(repo_dir.path(), ws).unwrap();
+
+            // Verify all previously absorbed files still exist
+            for j in 0..=i {
+                let filepath = repo_dir.path().join(format!("file_{}.txt", j));
+                assert!(
+                    filepath.exists(),
+                    "BUG: file_{}.txt reverted after session {} absorbed!", j, i
+                );
+                assert_eq!(
+                    fs::read_to_string(&filepath).unwrap(),
+                    format!("changes from session {}", j),
+                );
+            }
+        }
+
+        match original {
+            Some(v) => std::env::set_var("AIKI_WORKSPACES_DIR", v),
+            None => std::env::remove_var("AIKI_WORKSPACES_DIR"),
+        }
+    }
 }
