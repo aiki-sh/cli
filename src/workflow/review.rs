@@ -191,24 +191,26 @@ fn run_foreground(cwd: &Path, opts: &ReviewOpts) -> crate::error::Result<Workflo
     let wf = workflow(cwd, opts);
     let ctx = wf.run()?;
     let review_id = ctx.require_task_id()?;
-    maybe_run_fix(cwd, review_id, opts, false)?;
+    let fix_has_remaining_issues = maybe_run_fix(cwd, review_id, opts, false)?;
 
     match opts.output {
         Some(OutputFormat::Id) => println!("{}", review_id),
-        None => output_review_completed(cwd, review_id, !opts.workflow.fix),
+        None => output_review_completed(cwd, review_id, !opts.workflow.fix, fix_has_remaining_issues),
     }
     Ok(ctx)
 }
 
 /// Run the fix quality loop if `--fix` was requested.
+///
+/// Returns `true` if fix ran and issues remain after completion.
 fn maybe_run_fix(
     cwd: &Path,
     review_id: &str,
     opts: &ReviewOpts,
     quiet: bool,
-) -> crate::error::Result<()> {
+) -> crate::error::Result<bool> {
     if !opts.workflow.fix {
-        return Ok(());
+        return Ok(false);
     }
     let (scope, assignee) =
         resolve_scope_and_assignee(cwd, review_id, opts.workflow.coder.as_deref())?;
@@ -217,7 +219,7 @@ fn maybe_run_fix(
         if quiet { None } else { opts.output.clone() },
         &opts.workflow,
     );
-    let assignee_type = assignee.as_deref().and_then(crate::agents::AgentType::from_str);
+    let assignee_type = assignee.as_deref().map(crate::agents::AgentType::parse);
     let mut wf = fix::workflow(cwd, review_id, &fix_opts, &scope, assignee_type);
     let output = if quiet {
         OutputKind::Quiet
@@ -226,7 +228,8 @@ fn maybe_run_fix(
     };
     wf.ctx.output = WorkflowOutput::new(output);
     wf.run().map_err(AikiError::Other)?;
-    Ok(())
+    let remaining = fix::has_remaining_issues(cwd, review_id);
+    Ok(remaining)
 }
 
 /// Output review started message (for --start mode).
@@ -241,17 +244,23 @@ fn output_review_async(review_id: &str) {
 
 /// Output review completed message (for blocking mode).
 ///
-/// When `show_fix_hint` is true, appends a "Run `aiki fix`" hint.
-fn output_review_completed(cwd: &Path, review_id: &str, show_fix_hint: bool) {
+/// Hints:
+/// - `show_fix_hint`: review found issues, no fix attempted → suggest `aiki fix`
+/// - `show_pair_hint`: fix ran but issues remain → suggest `aiki fix --pair`
+/// - Otherwise (no issues, or fix resolved all) → suggest `aiki tldr`
+fn output_review_completed(cwd: &Path, review_id: &str, show_fix_hint: bool, show_pair_hint: bool) {
     let summary =
         crate::reviews::review_summary(cwd, review_id).unwrap_or_else(|_| "unknown".to_string());
+    let short_id = &review_id[..7.min(review_id.len())];
     let status = format!("Completed: {review_id} — {summary}\n");
-    if show_fix_hint {
-        let hint = format!("\n---\nRun `aiki fix {}` to remediate.\n", review_id);
-        println!("{status}{hint}");
+    let hint = if show_pair_hint {
+        format!("Run `aiki fix {} --pair` to interactively remediate remaining issues.\n", short_id)
+    } else if show_fix_hint {
+        format!("Run `aiki fix {}` to remediate.\n", short_id)
     } else {
-        println!("{status}");
-    }
+        format!("Run `aiki tldr {}` for a walkthrough.\n", short_id)
+    };
+    println!("{status}\n{hint}");
 }
 
 #[cfg(test)]

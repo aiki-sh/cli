@@ -261,24 +261,45 @@ fn build_summary_lines(graph: &TaskGraph, epic_id: &str, plan_path: &str, group:
     ));
     lines.extend(components::blank());
 
-    // Hint — if the review found issues, suggest `aiki fix`; otherwise show diff hint
+    // Hint — context-dependent next action.
+    // #1: No review → suggest `aiki review`
+    // #2: Review has issues, no fix attempted → suggest `aiki fix`
+    // #3: Review has no issues → suggest `aiki tldr`
+    // #4: Fix resolved all issues → suggest `aiki tldr`
+    // #5: Fix attempted, issues remain → suggest `aiki fix --pair`
     let epic = &graph.tasks[epic_id];
-    let review_hint = find_build_review(graph, epic_id).and_then(|review| {
-        let issues = extract_issues(review);
-        if issues.is_empty() {
-            None
-        } else {
-            Some(format!(
-                "Run `aiki fix {}` to remediate {} issue{}.",
-                review.short_id(),
-                issues.len(),
-                if issues.len() == 1 { "" } else { "s" },
-            ))
+    let hint_text = match find_build_review(graph, epic_id) {
+        None => {
+            // #1: No review step was run
+            format!("Run `aiki review {}` to review.", epic.short_id())
         }
-    });
-    let hint_text = review_hint.unwrap_or_else(|| {
-        format!("Run `aiki tldr {}` for a walkthrough.", epic.short_id())
-    });
+        Some(review) => {
+            let issues = extract_issues(review);
+            if issues.is_empty() {
+                // #3 or #4: No issues
+                format!("Run `aiki tldr {}` for a walkthrough.", epic.short_id())
+            } else {
+                let fix_attempted = !graph.edges.referrers(&review.id, "remediates").is_empty();
+                if fix_attempted {
+                    // #5: Fix was attempted, issues remain
+                    format!(
+                        "Run `aiki fix {} --pair` to interactively remediate {} remaining issue{}.",
+                        review.short_id(),
+                        issues.len(),
+                        if issues.len() == 1 { "" } else { "s" },
+                    )
+                } else {
+                    // #2: Review found issues, no fix yet
+                    format!(
+                        "Run `aiki fix {}` to remediate {} issue{}.",
+                        review.short_id(),
+                        issues.len(),
+                        if issues.len() == 1 { "" } else { "s" },
+                    )
+                }
+            }
+        }
+    };
     lines.push(Line {
         indent: 0,
         text: hint_text,
@@ -287,6 +308,7 @@ fn build_summary_lines(graph: &TaskGraph, epic_id: &str, plan_path: &str, group:
         group,
         dimmed: false,
     });
+    lines.extend(components::blank());
 
     lines
 }
@@ -524,8 +546,8 @@ mod tests {
 
         // Should contain build completed summary
         assert!(lines.iter().any(|l| l.text.contains("build completed")));
-        // Should contain hint
-        assert!(lines.iter().any(|l| l.text.contains("aiki tldr")));
+        // Should contain hint (no review → suggest review)
+        assert!(lines.iter().any(|l| l.text.contains("aiki review")));
     }
 
     #[test]

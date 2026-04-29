@@ -114,8 +114,8 @@ pub(crate) fn workflow(
     };
 
     let mut workflow_opts = opts.workflow.clone();
-    workflow_opts.agent = assignee;
-    workflow_opts.coder = assignee.map(|a| a.as_str().to_string());
+    workflow_opts.agent = assignee.clone();
+    workflow_opts.coder = assignee.as_ref().map(|a| a.as_str().to_string());
 
     Workflow {
         steps,
@@ -127,7 +127,7 @@ pub(crate) fn workflow(
             opts: workflow_opts,
             review_id: Some(review_id.to_string()),
             scope: Some(scope.clone()),
-            assignee: assignee.map(|a| a.as_str().to_string()),
+            assignee: assignee.as_ref().map(|a| a.as_str().to_string()),
             iteration: 0,
             notify_rx: None,
             task_names: std::collections::HashMap::new(),
@@ -235,10 +235,10 @@ fn run_continue_async(cwd: &Path, cli_opts: &FixOpts) -> Result<WorkflowContext>
         .workflow
         .coder
         .as_deref()
-        .and_then(AgentType::from_str);
+        .map(AgentType::parse);
     let assignee = determine_followup_assignee(agent_type, Some(fix_parent), None, None).ok();
 
-    let assignee_type = assignee.as_deref().and_then(AgentType::from_str);
+    let assignee_type = assignee.as_deref().map(AgentType::parse);
     let wf = continue_async_workflow(cwd, &opts, &scope, assignee_type, fix_parent_id);
     wf.run().map_err(AikiError::Other)
 }
@@ -273,7 +273,29 @@ fn run_foreground(cwd: &Path, opts: &FixOpts) -> Result<WorkflowContext> {
     };
     let mut wf = workflow(cwd, &opts.review_id, opts, &scope, Some(agent_type));
     wf.ctx.output = WorkflowOutput::new(output);
-    wf.run().map_err(AikiError::Other)
+    let ctx = wf.run().map_err(AikiError::Other)?;
+    if show_tui {
+        let short_review = &opts.review_id[..7.min(opts.review_id.len())];
+        let short_scope = &scope.id[..7.min(scope.id.len())];
+        if has_remaining_issues(cwd, &opts.review_id) {
+            eprintln!("\nRun `aiki fix {} --pair` to interactively remediate remaining issues.\n", short_review);
+        } else {
+            eprintln!("\nRun `aiki tldr {}` for a walkthrough.\n", short_scope);
+        }
+    }
+    Ok(ctx)
+}
+
+/// Check whether a review still has actionable issues after fix.
+pub(crate) fn has_remaining_issues(cwd: &Path, review_id: &str) -> bool {
+    let Ok(events_with_ids) = read_events_with_ids(cwd) else {
+        return false;
+    };
+    let tasks = materialize_graph_with_ids(&events_with_ids).tasks;
+    let Ok(review_task) = find_task(&tasks, review_id) else {
+        return false;
+    };
+    has_actionable_issues(review_task)
 }
 
 fn run_pair(cwd: &Path, opts: &FixOpts) -> Result<WorkflowContext> {
