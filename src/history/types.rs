@@ -66,10 +66,6 @@ pub enum ConversationEvent {
         files_written: Vec<String>,
         /// Full response text
         content: Option<String>,
-        /// Token usage for this turn
-        tokens: Option<crate::events::TokenUsage>,
-        /// Model used for this turn (extracted from transcript)
-        model: Option<String>,
         timestamp: DateTime<Utc>,
         /// Stable repository identifier (from repo-id file)
         repo_id: Option<String>,
@@ -81,16 +77,12 @@ pub enum ConversationEvent {
         session_id: String,
         agent_type: AgentType,
         timestamp: DateTime<Utc>,
-        /// Thread that caused this session to be launched via `aiki run`, if any
-        run_thread_id: Option<String>,
         /// Stable repository identifier (from repo-id file)
         repo_id: Option<String>,
         /// Current working directory where the event occurred
         cwd: Option<String>,
         /// Session mode (background or interactive)
         session_mode: Option<SessionMode>,
-        /// Path to the transcript file for this session
-        transcript_path: Option<String>,
     },
     /// Session ended
     SessionEnd {
@@ -116,29 +108,41 @@ pub enum ConversationEvent {
         /// Current working directory where the event occurred
         cwd: Option<String>,
     },
-    /// Model changed mid-session
-    ModelChanged {
-        session_id: String,
-        /// The model previously stored in the session (None if first observation)
-        previous_model: Option<String>,
-        /// The new model observed
-        new_model: String,
-        timestamp: DateTime<Utc>,
-        /// Stable repository identifier (from repo-id file)
-        repo_id: Option<String>,
-        /// Current working directory where the event occurred
-        cwd: Option<String>,
-    },
+}
+
+/// Materialized session view (computed from events)
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Part of history API
+pub struct Session {
+    pub id: String,
+    pub agent_type: AgentType,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    /// First line of first prompt (for display)
+    pub summary: Option<String>,
+}
+
+/// Materialized log entry (from response events)
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Part of history API
+pub struct LogEntry {
+    pub session_id: String,
+    pub agent_type: AgentType,
+    pub files_written: Vec<String>,
+    pub summary: Option<String>,
+    pub timestamp: DateTime<Utc>,
 }
 
 /// Summary of a conversation for listing purposes
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Part of history API
 pub struct ConversationSummary {
     pub session_id: String,
     pub agent_type: AgentType,
     pub started_at: DateTime<Utc>,
     pub turn_count: u32,
     pub last_activity: DateTime<Utc>,
+    pub repo_id: Option<String>,
     /// Session mode (background or interactive), if known from SessionStart event
     pub session_mode: Option<SessionMode>,
 }
@@ -156,10 +160,7 @@ mod tests {
 
     #[test]
     fn test_agent_type_from_str() {
-        assert_eq!(
-            AgentType::from_str("claude-code"),
-            Some(AgentType::ClaudeCode)
-        );
+        assert_eq!(AgentType::from_str("claude-code"), Some(AgentType::ClaudeCode));
         assert_eq!(AgentType::from_str("CURSOR"), Some(AgentType::Cursor));
         assert_eq!(AgentType::from_str("unknown"), Some(AgentType::Unknown));
         assert_eq!(AgentType::from_str("invalid"), None);

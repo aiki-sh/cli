@@ -4,106 +4,15 @@
 //! Each event is a JJ change with metadata in the description.
 
 use crate::error::{AikiError, Result};
-use crate::jj::{jj_cmd, parse_change_id_from_stderr};
-use crate::session::isolation::acquire_named_lock;
+use crate::jj::jj_cmd;
 use chrono::{DateTime, Utc};
-use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::path::Path;
 
-use super::types::{ConfidenceLevel, TaskEvent, TaskOutcome, TaskPriority};
-
-/// Global FIFO path for in-process callers (set/cleared by workflow runner).
-static EVENT_PIPE_PATH: RwLock<Option<PathBuf>> = RwLock::new(None);
-
-/// Get the event pipe path: checks the in-process RwLock first, then falls back
-/// to the `AIKI_EVENT_PIPE` env var (cached per-thread after first access).
-pub fn event_pipe_path() -> Option<PathBuf> {
-    // Fast path: check the in-process RwLock (cheap uncontended read lock)
-    if let Ok(guard) = EVENT_PIPE_PATH.read() {
-        if let Some(ref path) = *guard {
-            return Some(path.clone());
-        }
-    }
-
-    // Fallback: check env var, cached per-thread
-    thread_local! {
-        static CACHED_ENV: Option<PathBuf> = std::env::var_os("AIKI_EVENT_PIPE").map(PathBuf::from);
-    }
-    CACHED_ENV.with(|cached| cached.clone())
-}
-
-/// Set the global event pipe path (used by workflow runner at init).
-pub fn set_event_pipe_path(path: PathBuf) {
-    if let Ok(mut guard) = EVENT_PIPE_PATH.write() {
-        *guard = Some(path);
-    }
-}
-
-/// Clear the global event pipe path (used by workflow runner at cleanup).
-pub fn clear_event_pipe_path() {
-    if let Ok(mut guard) = EVENT_PIPE_PATH.write() {
-        *guard = None;
-    }
-}
-
-/// Best-effort FIFO notification: writes "{change_id}\n" to the event pipe.
-/// All errors are silently ignored.
-fn notify_fifo(change_id: &str) {
-    let Some(path) = event_pipe_path() else {
-        return;
-    };
-
-    // Open with O_WRONLY | O_NONBLOCK — returns ENXIO if no reader, which we skip
-    let c_path = match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-
-    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
-    if fd < 0 {
-        return; // ENXIO (no reader) or other error — skip silently
-    }
-
-    let msg = format!("{change_id}\n");
-    let _ = unsafe { libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len()) };
-    unsafe { libc::close(fd) };
-}
+use super::types::{TaskEvent, TaskOutcome, TaskPriority};
 
 const TASKS_BRANCH: &str = "aiki/tasks";
 const METADATA_START: &str = "[aiki-task]";
 const METADATA_END: &str = "[/aiki-task]";
-
-fn acquire_task_write_lock(
-    cwd: &Path,
-) -> Result<fd_lock::RwLockWriteGuard<'static, std::fs::File>> {
-    let repo_root = crate::jj::get_repo_root(cwd)?;
-    acquire_named_lock(&repo_root, "task-event-write")
-}
-
-fn set_tasks_bookmark(cwd: &Path, change_id: &str) -> Result<()> {
-    let bm = jj_cmd()
-        .current_dir(cwd)
-        .args([
-            "bookmark",
-            "set",
-            TASKS_BRANCH,
-            "-r",
-            change_id,
-            "--ignore-working-copy",
-        ])
-        .output()
-        .map_err(|e| AikiError::JjCommandFailed(format!("Failed to set bookmark: {}", e)))?;
-
-    if !bm.status.success() {
-        let stderr = String::from_utf8_lossy(&bm.stderr);
-        return Err(AikiError::JjCommandFailed(format!(
-            "Failed to advance '{}': {}",
-            TASKS_BRANCH,
-            stderr.trim()
-        )));
-    }
-    Ok(())
-}
 
 /// Ensure the aiki/tasks branch exists (cached per process)
 pub fn ensure_tasks_branch(cwd: &Path) -> Result<()> {
@@ -115,21 +24,13 @@ pub fn ensure_tasks_branch(cwd: &Path) -> Result<()> {
 /// Uses `jj new --no-edit` to create the event change without affecting the working copy.
 pub fn write_event(cwd: &Path, event: &TaskEvent) -> Result<()> {
     ensure_tasks_branch(cwd)?;
-    let _lock = acquire_task_write_lock(cwd)?;
 
     let metadata = event_to_metadata_block(event);
 
     // Create a new change as child of aiki/tasks WITHOUT switching working copy
     let result = jj_cmd()
         .current_dir(cwd)
-        .args([
-            "new",
-            TASKS_BRANCH,
-            "--no-edit",
-            "--ignore-working-copy",
-            "-m",
-            &metadata,
-        ])
+        .args(["new", TASKS_BRANCH, "--no-edit", "--ignore-working-copy", "-m", &metadata])
         .output()
         .map_err(|e| AikiError::JjCommandFailed(format!("Failed to create task event: {}", e)))?;
 
@@ -140,10 +41,6 @@ pub fn write_event(cwd: &Path, event: &TaskEvent) -> Result<()> {
             stderr
         )));
     }
-
-    let change_id = parse_change_id_from_stderr(&result.stderr)?;
-    set_tasks_bookmark(cwd, &change_id)?;
-    notify_fifo(&change_id);
 
     Ok(())
 }
@@ -163,7 +60,6 @@ pub fn write_events_batch(cwd: &Path, events: &[TaskEvent]) -> Result<()> {
     }
 
     ensure_tasks_branch(cwd)?;
-    let _lock = acquire_task_write_lock(cwd)?;
 
     let metadata = events
         .iter()
@@ -173,18 +69,9 @@ pub fn write_events_batch(cwd: &Path, events: &[TaskEvent]) -> Result<()> {
 
     let result = jj_cmd()
         .current_dir(cwd)
-        .args([
-            "new",
-            TASKS_BRANCH,
-            "--no-edit",
-            "--ignore-working-copy",
-            "-m",
-            &metadata,
-        ])
+        .args(["new", TASKS_BRANCH, "--no-edit", "--ignore-working-copy", "-m", &metadata])
         .output()
-        .map_err(|e| {
-            AikiError::JjCommandFailed(format!("Failed to create batch task event: {}", e))
-        })?;
+        .map_err(|e| AikiError::JjCommandFailed(format!("Failed to create batch task event: {}", e)))?;
 
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
@@ -193,10 +80,6 @@ pub fn write_events_batch(cwd: &Path, events: &[TaskEvent]) -> Result<()> {
             stderr
         )));
     }
-
-    let change_id = parse_change_id_from_stderr(&result.stderr)?;
-    set_tasks_bookmark(cwd, &change_id)?;
-    notify_fifo(&change_id);
 
     Ok(())
 }
@@ -246,8 +129,8 @@ pub fn write_link_event_with_autorun(
     }
 
     // 3. Cycle detection for blocking and hierarchical kinds
-    let needs_cycle_check =
-        kind == "subtask-of" || find_link_kind(kind).map_or(false, |lk| lk.blocks_ready);
+    let needs_cycle_check = kind == "subtask-of"
+        || find_link_kind(kind).map_or(false, |lk| lk.blocks_ready);
     if needs_cycle_check {
         if graph.would_create_cycle(from, &to_normalized, kind) {
             return Err(AikiError::LinkCycle {
@@ -288,21 +171,15 @@ pub fn write_link_event_with_autorun(
                             };
                             write_event(cwd, &supersedes_event)?;
                             eprintln!(
-                                // stderr-ok: write-path only, never called during monitoring
                                 "Superseded: {} previously {} {}",
                                 short_id(old_target),
-                                if kind == "implements-plan" {
-                                    "implemented"
-                                } else {
-                                    "orchestrated"
-                                },
+                                if kind == "implements-plan" { "implemented" } else { "orchestrated" },
                                 short_id(&to_normalized)
                             );
                         }
                         // If old_target is a file path, skip the supersedes link silently (bug #4 fix)
                     } else if kind == "subtask-of" {
                         eprintln!(
-                            // stderr-ok: write-path only, never called during monitoring
                             "Re-parented: {} moved from {} to {}",
                             short_id(from),
                             short_id(old_target),
@@ -342,14 +219,9 @@ pub fn write_link_event_with_autorun(
                         };
                         write_event(cwd, &supersedes_event)?;
                         eprintln!(
-                            // stderr-ok: write-path only, never called during monitoring
                             "Superseded: {} previously {} {}",
                             short_id(old_from),
-                            if kind == "orchestrates" {
-                                "orchestrated"
-                            } else {
-                                "implemented"
-                            },
+                            if kind == "orchestrates" { "orchestrated" } else { "implemented" },
                             short_id(&to_normalized)
                         );
                     }
@@ -567,10 +439,7 @@ pub fn read_events_with_ids(cwd: &Path) -> Result<Vec<EventWithId>> {
         let mut commit_events = Vec::new();
         parse_all_metadata_blocks(entry, &mut commit_events);
         for event in commit_events {
-            events.push(EventWithId {
-                change_id: change_id.clone(),
-                event,
-            });
+            events.push(EventWithId { change_id: change_id.clone(), event });
         }
     }
 
@@ -651,6 +520,7 @@ fn event_to_metadata_block(event: &TaskEvent) -> String {
             assignee,
             sources,
             template,
+            working_copy,
             instructions,
             data,
             timestamp,
@@ -676,6 +546,10 @@ fn event_to_metadata_block(event: &TaskEvent) -> String {
             if let Some(template) = template {
                 add_metadata("template", template, &mut lines);
             }
+            // Add working_copy if present
+            if let Some(wc) = working_copy {
+                add_metadata("working_copy", wc, &mut lines);
+            }
             // Add instructions if present (escaped to handle newlines and special chars)
             if let Some(instr) = instructions {
                 add_metadata_escaped("instructions", instr, &mut lines);
@@ -691,8 +565,6 @@ fn event_to_metadata_block(event: &TaskEvent) -> String {
             agent_type,
             session_id,
             turn_id,
-            working_copy,
-            instructions,
             timestamp,
         } => {
             add_metadata("event", "started", &mut lines);
@@ -706,18 +578,11 @@ fn event_to_metadata_block(event: &TaskEvent) -> String {
             if let Some(tid) = turn_id {
                 add_metadata("turn_id", tid, &mut lines);
             }
-            if let Some(wc) = working_copy {
-                add_metadata("working_copy", wc, &mut lines);
-            }
-            if let Some(instr) = instructions {
-                add_metadata_escaped("instructions", instr, &mut lines);
-            }
             add_metadata_timestamp(timestamp, &mut lines);
         }
         TaskEvent::Stopped {
             task_ids,
             reason,
-            session_id,
             turn_id,
             timestamp,
         } => {
@@ -728,9 +593,6 @@ fn event_to_metadata_block(event: &TaskEvent) -> String {
             if let Some(reason) = reason {
                 add_metadata_escaped("reason", reason, &mut lines);
             }
-            if let Some(sid) = session_id {
-                add_metadata("session_id", sid, &mut lines);
-            }
             if let Some(tid) = turn_id {
                 add_metadata("turn_id", tid, &mut lines);
             }
@@ -739,9 +601,7 @@ fn event_to_metadata_block(event: &TaskEvent) -> String {
         TaskEvent::Closed {
             task_ids,
             outcome,
-            confidence,
             summary,
-            session_id,
             turn_id,
             timestamp,
         } => {
@@ -750,14 +610,8 @@ fn event_to_metadata_block(event: &TaskEvent) -> String {
                 add_metadata("task_id", task_id, &mut lines);
             }
             add_metadata("outcome", outcome, &mut lines);
-            if let Some(confidence) = confidence {
-                add_metadata("confidence", &confidence.as_u8().to_string(), &mut lines);
-            }
             if let Some(summary) = summary {
                 add_metadata_escaped("summary", summary, &mut lines);
-            }
-            if let Some(sid) = session_id {
-                add_metadata("session_id", sid, &mut lines);
             }
             if let Some(tid) = turn_id {
                 add_metadata("turn_id", tid, &mut lines);
@@ -865,48 +719,6 @@ fn event_to_metadata_block(event: &TaskEvent) -> String {
             }
             add_metadata_timestamp(timestamp, &mut lines);
         }
-        TaskEvent::Reserved {
-            task_ids,
-            agent_type,
-            timestamp,
-        } => {
-            add_metadata("event", "reserved", &mut lines);
-            for task_id in task_ids {
-                add_metadata("task_id", task_id, &mut lines);
-            }
-            add_metadata("agent_type", agent_type, &mut lines);
-            add_metadata_timestamp(timestamp, &mut lines);
-        }
-        TaskEvent::Released {
-            task_ids,
-            reason,
-            timestamp,
-        } => {
-            add_metadata("event", "released", &mut lines);
-            for task_id in task_ids {
-                add_metadata("task_id", task_id, &mut lines);
-            }
-            if let Some(reason) = reason {
-                add_metadata_escaped("reason", reason, &mut lines);
-            }
-            add_metadata_timestamp(timestamp, &mut lines);
-        }
-        TaskEvent::Absorbed {
-            task_ids,
-            session_id,
-            turn_id,
-            timestamp,
-        } => {
-            add_metadata("event", "absorbed", &mut lines);
-            for task_id in task_ids {
-                add_metadata("task_id", task_id, &mut lines);
-            }
-            add_metadata("session_id", session_id, &mut lines);
-            if let Some(tid) = turn_id {
-                add_metadata("turn_id", tid, &mut lines);
-            }
-            add_metadata_timestamp(timestamp, &mut lines);
-        }
     }
 
     lines.push(METADATA_END.to_string());
@@ -931,14 +743,6 @@ fn parse_all_metadata_blocks(desc: &str, events: &mut Vec<TaskEvent>) {
             break;
         }
     }
-}
-
-fn parse_persisted_confidence(fields: &std::collections::HashMap<&str, Vec<&str>>) -> Option<ConfidenceLevel> {
-    fields
-        .get("confidence")
-        .and_then(|v| v.first())
-        .and_then(|s| s.parse::<u8>().ok())
-        .and_then(ConfidenceLevel::from_u8)
 }
 
 /// Parse a metadata block into a TaskEvent
@@ -997,6 +801,11 @@ fn parse_metadata_block(block: &str) -> Option<TaskEvent> {
                 .get("template")
                 .and_then(|v| v.first())
                 .map(|s| s.to_string());
+            // Parse working_copy
+            let working_copy = fields
+                .get("working_copy")
+                .and_then(|v| v.first())
+                .map(|s| s.to_string());
             // Parse instructions (escaped value)
             let instructions = fields
                 .get("instructions")
@@ -1025,6 +834,7 @@ fn parse_metadata_block(block: &str) -> Option<TaskEvent> {
                 assignee,
                 sources,
                 template,
+                working_copy,
                 instructions,
                 data,
                 timestamp,
@@ -1049,23 +859,12 @@ fn parse_metadata_block(block: &str) -> Option<TaskEvent> {
                 .get("turn_id")
                 .and_then(|v| v.first())
                 .map(|s| s.to_string());
-            let working_copy = fields
-                .get("working_copy")
-                .or_else(|| fields.get("snapshot"))
-                .and_then(|v| v.first())
-                .map(|s| s.to_string());
-            let instructions = fields
-                .get("instructions")
-                .and_then(|v| v.first())
-                .map(|s| unescape_metadata_value(s));
 
             Some(TaskEvent::Started {
                 task_ids,
                 agent_type,
                 session_id,
                 turn_id,
-                working_copy,
-                instructions,
                 timestamp,
             })
         }
@@ -1079,10 +878,6 @@ fn parse_metadata_block(block: &str) -> Option<TaskEvent> {
                 .get("reason")
                 .and_then(|v| v.first())
                 .map(|s| unescape_metadata_value(s));
-            let session_id = fields
-                .get("session_id")
-                .and_then(|v| v.first())
-                .map(|s| s.to_string());
             let turn_id = fields
                 .get("turn_id")
                 .and_then(|v| v.first())
@@ -1093,7 +888,6 @@ fn parse_metadata_block(block: &str) -> Option<TaskEvent> {
             Some(TaskEvent::Stopped {
                 task_ids,
                 reason,
-                session_id,
                 turn_id,
                 timestamp,
             })
@@ -1109,17 +903,10 @@ fn parse_metadata_block(block: &str) -> Option<TaskEvent> {
                 .and_then(|v| v.first())
                 .and_then(|s| TaskOutcome::from_str(s))
                 .unwrap_or(TaskOutcome::Done);
-            // Keep malformed historical values readable by treating them as
-            // missing confidence rather than failing the entire event parse.
-            let confidence = parse_persisted_confidence(&fields);
             let summary = fields
                 .get("summary")
                 .and_then(|v| v.first())
                 .map(|s| unescape_metadata_value(s));
-            let session_id = fields
-                .get("session_id")
-                .and_then(|v| v.first())
-                .map(|s| s.to_string());
             let turn_id = fields
                 .get("turn_id")
                 .and_then(|v| v.first())
@@ -1128,9 +915,7 @@ fn parse_metadata_block(block: &str) -> Option<TaskEvent> {
             Some(TaskEvent::Closed {
                 task_ids,
                 outcome,
-                confidence,
                 summary,
-                session_id,
                 turn_id,
                 timestamp,
             })
@@ -1188,7 +973,7 @@ fn parse_metadata_block(block: &str) -> Option<TaskEvent> {
                 Some(v) => {
                     let value = v.first().map(|s| *s).unwrap_or("");
                     if value.is_empty() {
-                        // Empty assignee value — skip silently.
+                        eprintln!("Warning: ignoring updated event with empty assignee for task {task_id}. Use `aiki task unset <id> assignee` to clear the assignee.");
                         return None;
                     }
                     Some(value.to_string())
@@ -1278,60 +1063,6 @@ fn parse_metadata_block(block: &str) -> Option<TaskEvent> {
                 timestamp,
             })
         }
-        "reserved" => {
-            let task_ids = fields
-                .get("task_id")?
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            let agent_type = fields
-                .get("agent_type")
-                .and_then(|v| v.first())
-                .unwrap_or(&"unknown")
-                .to_string();
-
-            Some(TaskEvent::Reserved {
-                task_ids,
-                agent_type,
-                timestamp,
-            })
-        }
-        "released" => {
-            let task_ids = fields
-                .get("task_id")?
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            let reason = fields
-                .get("reason")
-                .and_then(|v| v.first())
-                .map(|s| unescape_metadata_value(s));
-
-            Some(TaskEvent::Released {
-                task_ids,
-                reason,
-                timestamp,
-            })
-        }
-        "absorbed" => {
-            let task_ids = fields
-                .get("task_id")?
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            let session_id = fields.get("session_id")?.first()?.to_string();
-            let turn_id = fields
-                .get("turn_id")
-                .and_then(|v| v.first())
-                .map(|s| s.to_string());
-
-            Some(TaskEvent::Absorbed {
-                task_ids,
-                session_id,
-                turn_id,
-                timestamp,
-            })
-        }
         _ => None,
     }
 }
@@ -1351,6 +1082,7 @@ mod tests {
             assignee: Some("claude-code".to_string()),
             sources: Vec::new(),
             template: None,
+            working_copy: None,
             instructions: None,
             data: std::collections::HashMap::new(),
             timestamp: DateTime::parse_from_rfc3339("2026-01-09T10:30:00Z")
@@ -1466,34 +1198,6 @@ timestamp=2026-01-09T10:30:00Z
     }
 
     #[test]
-    fn test_parse_metadata_block_closed_with_malformed_confidence_treats_it_as_missing() {
-        let block = r#"
-event=closed
-task_id=a1b2
-outcome=done
-confidence=9
-summary=Malformed confidence should be ignored
-timestamp=2026-01-09T10:30:00Z
-"#;
-
-        let event = parse_metadata_block(block).expect("Should parse");
-        match event {
-            TaskEvent::Closed {
-                confidence,
-                summary,
-                ..
-            } => {
-                assert_eq!(confidence, None);
-                assert_eq!(
-                    summary,
-                    Some("Malformed confidence should be ignored".to_string())
-                );
-            }
-            _ => panic!("Expected Closed event"),
-        }
-    }
-
-    #[test]
     fn test_roundtrip_created() {
         let original = TaskEvent::Created {
             task_id: "test".to_string(),
@@ -1504,6 +1208,7 @@ timestamp=2026-01-09T10:30:00Z
             assignee: None,
             sources: Vec::new(),
             template: None,
+            working_copy: None,
             instructions: None,
             data: std::collections::HashMap::new(),
             timestamp: Utc::now(),
@@ -1547,8 +1252,6 @@ timestamp=2026-01-09T10:30:00Z
             agent_type: "claude-code".to_string(),
             session_id: Some("test-session-uuid".to_string()),
             turn_id: None,
-            working_copy: None,
-            instructions: None,
             timestamp: Utc::now(),
         };
 
@@ -1582,7 +1285,6 @@ timestamp=2026-01-09T10:30:00Z
     #[test]
     fn test_roundtrip_stopped() {
         let original = TaskEvent::Stopped {
-            session_id: None,
             task_ids: vec!["task1".to_string()],
             reason: Some("Need more info".to_string()),
             turn_id: None,
@@ -1619,10 +1321,8 @@ timestamp=2026-01-09T10:30:00Z
     #[test]
     fn test_roundtrip_closed() {
         let original = TaskEvent::Closed {
-            session_id: None,
             task_ids: vec!["task1".to_string(), "task2".to_string()],
             outcome: TaskOutcome::WontDo,
-            confidence: None,
             summary: None,
             turn_id: None,
             timestamp: Utc::now(),
@@ -1658,10 +1358,8 @@ timestamp=2026-01-09T10:30:00Z
     #[test]
     fn test_roundtrip_closed_with_summary() {
         let original = TaskEvent::Closed {
-            session_id: None,
             task_ids: vec!["task1".to_string()],
             outcome: TaskOutcome::Done,
-            confidence: None,
             summary: Some("Fixed the auth bug".to_string()),
             turn_id: None,
             timestamp: Utc::now(),
@@ -1690,41 +1388,10 @@ timestamp=2026-01-09T10:30:00Z
     }
 
     #[test]
-    fn test_roundtrip_closed_with_confidence() {
-        let original = TaskEvent::Closed {
-            session_id: Some("session-123".to_string()),
-            task_ids: vec!["task1".to_string()],
-            outcome: TaskOutcome::Done,
-            confidence: Some(ConfidenceLevel::High),
-            summary: Some("Implemented the fix".to_string()),
-            turn_id: None,
-            timestamp: Utc::now(),
-        };
-
-        let block = event_to_metadata_block(&original);
-        assert!(block.contains("confidence=3"));
-
-        let start = block.find("[aiki-task]").unwrap() + "[aiki-task]".len();
-        let end = block.find("[/aiki-task]").unwrap();
-        let content = &block[start..end];
-
-        let parsed = parse_metadata_block(content).expect("Should parse");
-
-        match parsed {
-            TaskEvent::Closed { confidence, .. } => {
-                assert_eq!(confidence, Some(ConfidenceLevel::High));
-            }
-            _ => panic!("Expected Closed event"),
-        }
-    }
-
-    #[test]
     fn test_roundtrip_closed_summary_with_special_chars() {
         let original = TaskEvent::Closed {
-            session_id: None,
             task_ids: vec!["task1".to_string()],
             outcome: TaskOutcome::Done,
-            confidence: None,
             summary: Some("Fixed bug: added null check\nnew line here".to_string()),
             turn_id: None,
             timestamp: Utc::now(),
@@ -1892,7 +1559,10 @@ timestamp=2026-01-09T10:30:00Z
 "#;
         let event = parse_metadata_block(block).expect("Should parse");
         match event {
-            TaskEvent::Stopped { reason, .. } => {
+            TaskEvent::Stopped {
+                reason,
+                ..
+            } => {
                 assert!(reason.is_none());
             }
             _ => panic!("Expected Stopped event"),
@@ -1917,7 +1587,11 @@ timestamp=2026-01-09T10:30:00Z
         for original in &test_cases {
             let escaped = escape_metadata_value(original);
             let unescaped = unescape_metadata_value(&escaped);
-            assert_eq!(original, &unescaped, "Roundtrip failed for: {:?}", original);
+            assert_eq!(
+                original, &unescaped,
+                "Roundtrip failed for: {:?}",
+                original
+            );
         }
     }
 
@@ -1928,14 +1602,8 @@ timestamp=2026-01-09T10:30:00Z
         let escaped = escape_metadata_value(input);
 
         assert!(!escaped.contains('\n'), "Should not contain newline");
-        assert!(
-            !escaped.contains('\r'),
-            "Should not contain carriage return"
-        );
-        assert!(
-            !escaped.contains('='),
-            "Should not contain unescaped equals"
-        );
+        assert!(!escaped.contains('\r'), "Should not contain carriage return");
+        assert!(!escaped.contains('='), "Should not contain unescaped equals");
     }
 
     #[test]
@@ -1949,6 +1617,7 @@ timestamp=2026-01-09T10:30:00Z
             assignee: None,
             sources: Vec::new(),
             template: None,
+            working_copy: None,
             instructions: None,
             data: std::collections::HashMap::new(),
             timestamp: Utc::now(),
@@ -1963,7 +1632,16 @@ timestamp=2026-01-09T10:30:00Z
         let parsed = parse_metadata_block(content).expect("Should parse");
 
         match (original, parsed) {
-            (TaskEvent::Created { name: name1, .. }, TaskEvent::Created { name: name2, .. }) => {
+            (
+                TaskEvent::Created {
+                    name: name1,
+                    ..
+                },
+                TaskEvent::Created {
+                    name: name2,
+                    ..
+                },
+            ) => {
                 assert_eq!(name1, name2);
             }
             _ => panic!("Event type mismatch"),
@@ -2100,7 +1778,10 @@ timestamp=2026-01-09T10:30:00Z
         let parsed = parse_metadata_block(content).expect("Should parse");
 
         match (original, parsed) {
-            (TaskEvent::Reopened { reason: r1, .. }, TaskEvent::Reopened { reason: r2, .. }) => {
+            (
+                TaskEvent::Reopened { reason: r1, .. },
+                TaskEvent::Reopened { reason: r2, .. },
+            ) => {
                 assert_eq!(r1, r2);
             }
             _ => panic!("Event type mismatch"),
@@ -2261,7 +1942,10 @@ timestamp=2026-01-09T10:30:00Z
         let parsed = parse_metadata_block(content).expect("Should parse");
 
         match (original, parsed) {
-            (TaskEvent::Updated { name: n1, .. }, TaskEvent::Updated { name: n2, .. }) => {
+            (
+                TaskEvent::Updated { name: n1, .. },
+                TaskEvent::Updated { name: n2, .. },
+            ) => {
                 assert_eq!(n1, n2);
             }
             _ => panic!("Event type mismatch"),
@@ -2289,12 +1973,8 @@ timestamp=2026-01-09T10:30:00Z
 
         match (original, parsed) {
             (
-                TaskEvent::Updated {
-                    instructions: i1, ..
-                },
-                TaskEvent::Updated {
-                    instructions: i2, ..
-                },
+                TaskEvent::Updated { instructions: i1, .. },
+                TaskEvent::Updated { instructions: i2, .. },
             ) => {
                 assert_eq!(i1, i2);
             }
@@ -2310,10 +1990,7 @@ timestamp=2026-01-09T10:30:00Z
             priority: None,
             assignee: None,
             data: None,
-            instructions: Some(
-                "Fix bug: x = y + 1\nCheck 100% coverage\nUse `backticks` and \"quotes\""
-                    .to_string(),
-            ),
+            instructions: Some("Fix bug: x = y + 1\nCheck 100% coverage\nUse `backticks` and \"quotes\"".to_string()),
             timestamp: Utc::now(),
         };
 
@@ -2326,12 +2003,8 @@ timestamp=2026-01-09T10:30:00Z
 
         match (original, parsed) {
             (
-                TaskEvent::Updated {
-                    instructions: i1, ..
-                },
-                TaskEvent::Updated {
-                    instructions: i2, ..
-                },
+                TaskEvent::Updated { instructions: i1, .. },
+                TaskEvent::Updated { instructions: i2, .. },
             ) => {
                 assert_eq!(i1, i2);
             }
@@ -2352,10 +2025,7 @@ timestamp=2026-01-09T10:30:00Z
         };
 
         let block = event_to_metadata_block(&original);
-        assert!(
-            !block.contains("instructions="),
-            "Should not contain instructions when None"
-        );
+        assert!(!block.contains("instructions="), "Should not contain instructions when None");
 
         let start = block.find("[aiki-task]").unwrap() + "[aiki-task]".len();
         let end = block.find("[/aiki-task]").unwrap();
@@ -2383,7 +2053,9 @@ timestamp=2026-01-09T10:30:00Z
         let event = parse_metadata_block(block).expect("Should parse");
         match event {
             TaskEvent::Reopened {
-                task_id, reason, ..
+                task_id,
+                reason,
+                ..
             } => {
                 assert_eq!(task_id, "a1b2");
                 assert_eq!(reason, "Found new info");
@@ -2449,7 +2121,9 @@ timestamp=2026-01-09T10:30:00Z
 
         let event = parse_metadata_block(block).expect("Should parse");
         match event {
-            TaskEvent::Updated { name, priority, .. } => {
+            TaskEvent::Updated {
+                name, priority, ..
+            } => {
                 assert_eq!(name, Some("New name only".to_string()));
                 assert_eq!(priority, None);
             }
@@ -2800,7 +2474,9 @@ timestamp=2026-02-10T14:30:00Z
 
         let event = parse_metadata_block(block).expect("Should parse");
         match event {
-            TaskEvent::LinkAdded { from, to, kind, .. } => {
+            TaskEvent::LinkAdded {
+                from, to, kind, ..
+            } => {
                 assert_eq!(from, "mvslrspmoynoxyyywqyutmovxpvztkls");
                 assert_eq!(to, "nqrtxsypzkwolmnrstvuqxyzplmrwknos");
                 assert_eq!(kind, "blocked-by");
@@ -2820,10 +2496,7 @@ timestamp=2026-02-10T14:30:00Z
         };
 
         let block = event_to_metadata_block(&original);
-        assert!(
-            block.contains("autorun=true"),
-            "Serialized block should contain autorun=true"
-        );
+        assert!(block.contains("autorun=true"), "Serialized block should contain autorun=true");
 
         let start = block.find("[aiki-task]").unwrap() + "[aiki-task]".len();
         let end = block.find("[/aiki-task]").unwrap();
@@ -2849,10 +2522,7 @@ timestamp=2026-02-10T14:30:00Z
         };
 
         let block = event_to_metadata_block(&original);
-        assert!(
-            block.contains("autorun=false"),
-            "Serialized block should contain autorun=false"
-        );
+        assert!(block.contains("autorun=false"), "Serialized block should contain autorun=false");
 
         let start = block.find("[aiki-task]").unwrap() + "[aiki-task]".len();
         let end = block.find("[/aiki-task]").unwrap();
@@ -2897,10 +2567,7 @@ timestamp=2026-02-10T14:30:00Z
         };
 
         let block = event_to_metadata_block(&original);
-        assert!(
-            !block.contains("autorun"),
-            "None autorun should not be serialized"
-        );
+        assert!(!block.contains("autorun"), "None autorun should not be serialized");
     }
 
     #[test]
@@ -2939,16 +2606,12 @@ timestamp=2026-02-10T14:30:00Z
             agent_type: "claude-code".to_string(),
             session_id: Some("sess-123".to_string()),
             turn_id: Some("turn-abc-1".to_string()),
-            working_copy: None,
-            instructions: None,
             timestamp: Utc::now(),
+
         };
 
         let block = event_to_metadata_block(&original);
-        assert!(
-            block.contains("turn_id=turn-abc-1"),
-            "Serialized block should contain turn_id"
-        );
+        assert!(block.contains("turn_id=turn-abc-1"), "Serialized block should contain turn_id");
 
         let start = block.find("[aiki-task]").unwrap() + "[aiki-task]".len();
         let end = block.find("[/aiki-task]").unwrap();
@@ -2968,16 +2631,12 @@ timestamp=2026-02-10T14:30:00Z
         let original = TaskEvent::Stopped {
             task_ids: vec!["task1".to_string()],
             reason: Some("blocked".to_string()),
-            session_id: None,
             turn_id: Some("turn-xyz-5".to_string()),
             timestamp: Utc::now(),
         };
 
         let block = event_to_metadata_block(&original);
-        assert!(
-            block.contains("turn_id=turn-xyz-5"),
-            "Serialized block should contain turn_id"
-        );
+        assert!(block.contains("turn_id=turn-xyz-5"), "Serialized block should contain turn_id");
 
         let start = block.find("[aiki-task]").unwrap() + "[aiki-task]".len();
         let end = block.find("[/aiki-task]").unwrap();
@@ -2997,18 +2656,13 @@ timestamp=2026-02-10T14:30:00Z
         let original = TaskEvent::Closed {
             task_ids: vec!["task1".to_string()],
             outcome: TaskOutcome::Done,
-            confidence: None,
             summary: Some("All done".to_string()),
-            session_id: None,
             turn_id: Some("turn-def-3".to_string()),
             timestamp: Utc::now(),
         };
 
         let block = event_to_metadata_block(&original);
-        assert!(
-            block.contains("turn_id=turn-def-3"),
-            "Serialized block should contain turn_id"
-        );
+        assert!(block.contains("turn_id=turn-def-3"), "Serialized block should contain turn_id");
 
         let start = block.find("[aiki-task]").unwrap() + "[aiki-task]".len();
         let end = block.find("[/aiki-task]").unwrap();
@@ -3031,16 +2685,12 @@ timestamp=2026-02-10T14:30:00Z
             agent_type: "claude-code".to_string(),
             session_id: None,
             turn_id: None,
-            working_copy: None,
-            instructions: None,
             timestamp: Utc::now(),
+
         };
 
         let block = event_to_metadata_block(&original);
-        assert!(
-            !block.contains("turn_id="),
-            "Should not contain turn_id when None"
-        );
+        assert!(!block.contains("turn_id="), "Should not contain turn_id when None");
 
         let start = block.find("[aiki-task]").unwrap() + "[aiki-task]".len();
         let end = block.find("[/aiki-task]").unwrap();
@@ -3050,26 +2700,6 @@ timestamp=2026-02-10T14:30:00Z
         match parsed {
             TaskEvent::Started { turn_id, .. } => {
                 assert_eq!(turn_id, None);
-            }
-            _ => panic!("Expected Started event"),
-        }
-    }
-
-    #[test]
-    fn test_parse_started_snapshot_alias() {
-        let content = concat!(
-            "event=started\n",
-            "task_id=task1\n",
-            "agent_type=claude-code\n",
-            "snapshot=abc123snapshot\n",
-            "timestamp=2026-03-30T19:00:00Z\n"
-        );
-
-        let parsed = parse_metadata_block(content).expect("Should parse");
-
-        match parsed {
-            TaskEvent::Started { working_copy, .. } => {
-                assert_eq!(working_copy, Some("abc123snapshot".to_string()));
             }
             _ => panic!("Expected Started event"),
         }
@@ -3086,16 +2716,14 @@ timestamp=2026-02-10T14:30:00Z
             assignee: None,
             sources: Vec::new(),
             template: None,
+            working_copy: None,
             instructions: None,
             data: std::collections::HashMap::new(),
             timestamp: Utc::now(),
         };
 
         let block = event_to_metadata_block(&original);
-        assert!(
-            block.contains("slug=build"),
-            "Serialized block should contain slug"
-        );
+        assert!(block.contains("slug=build"), "Serialized block should contain slug");
 
         let start = block.find("[aiki-task]").unwrap() + "[aiki-task]".len();
         let end = block.find("[/aiki-task]").unwrap();
@@ -3118,10 +2746,7 @@ timestamp=2026-02-10T14:30:00Z
 
         match parsed {
             TaskEvent::Created { slug, .. } => {
-                assert_eq!(
-                    slug, None,
-                    "Old events without slug should deserialize as None"
-                );
+                assert_eq!(slug, None, "Old events without slug should deserialize as None");
             }
             _ => panic!("Expected Created event"),
         }
@@ -3151,9 +2776,7 @@ timestamp=2026-02-10T14:30:00Z
             _ => panic!("Expected Closed, got {:?}", events[0]),
         }
         match &events[1] {
-            TaskEvent::Reopened {
-                task_id, reason, ..
-            } => {
+            TaskEvent::Reopened { task_id, reason, .. } => {
                 assert_eq!(task_id, "task1");
                 assert_eq!(reason, "Spawning subtask");
             }
@@ -3177,189 +2800,5 @@ timestamp=2026-02-10T14:30:00Z
         let mut events = Vec::new();
         parse_all_metadata_blocks("no metadata here", &mut events);
         assert!(events.is_empty());
-    }
-
-    #[test]
-    fn test_roundtrip_absorbed() {
-        let original = TaskEvent::Absorbed {
-            task_ids: vec!["task1".to_string(), "task2".to_string()],
-            session_id: "sess-123".to_string(),
-            turn_id: Some("turn-456".to_string()),
-            timestamp: DateTime::parse_from_rfc3339("2026-03-04T10:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        };
-
-        let block = event_to_metadata_block(&original);
-        assert!(block.contains("event=absorbed"));
-        assert!(block.contains("task_id=task1"));
-        assert!(block.contains("task_id=task2"));
-        assert!(block.contains("session_id=sess-123"));
-        assert!(block.contains("turn_id=turn-456"));
-
-        let start = block.find("[aiki-task]").unwrap() + "[aiki-task]".len();
-        let end = block.find("[/aiki-task]").unwrap();
-        let content = &block[start..end];
-        let parsed = parse_metadata_block(content).expect("Should parse");
-
-        match parsed {
-            TaskEvent::Absorbed {
-                task_ids,
-                session_id,
-                turn_id,
-                timestamp,
-            } => {
-                assert_eq!(task_ids, vec!["task1", "task2"]);
-                assert_eq!(session_id, "sess-123");
-                assert_eq!(turn_id, Some("turn-456".to_string()));
-                assert_eq!(timestamp, original.timestamp());
-            }
-            _ => panic!("Expected Absorbed event"),
-        }
-    }
-
-    #[test]
-    fn test_roundtrip_absorbed_no_turn_id() {
-        let original = TaskEvent::Absorbed {
-            task_ids: vec!["task1".to_string(), "task2".to_string()],
-            session_id: "sess-789".to_string(),
-            turn_id: None,
-            timestamp: DateTime::parse_from_rfc3339("2026-03-04T11:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        };
-
-        let block = event_to_metadata_block(&original);
-        assert!(block.contains("event=absorbed"));
-        assert!(block.contains("session_id=sess-789"));
-        assert!(
-            !block.contains("turn_id="),
-            "Should not contain turn_id when None"
-        );
-
-        let start = block.find("[aiki-task]").unwrap() + "[aiki-task]".len();
-        let end = block.find("[/aiki-task]").unwrap();
-        let content = &block[start..end];
-        let parsed = parse_metadata_block(content).expect("Should parse");
-
-        match parsed {
-            TaskEvent::Absorbed {
-                task_ids,
-                session_id,
-                turn_id,
-                timestamp,
-            } => {
-                assert_eq!(task_ids, vec!["task1", "task2"]);
-                assert_eq!(session_id, "sess-789");
-                assert_eq!(turn_id, None);
-                assert_eq!(timestamp, original.timestamp());
-            }
-            _ => panic!("Expected Absorbed event"),
-        }
-    }
-
-    #[test]
-    fn test_roundtrip_reserved() {
-        let original = TaskEvent::Reserved {
-            task_ids: vec!["task1".to_string(), "task2".to_string()],
-            agent_type: "claude-code".to_string(),
-            timestamp: DateTime::parse_from_rfc3339("2026-03-04T10:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        };
-
-        let block = event_to_metadata_block(&original);
-        assert!(block.contains("event=reserved"));
-        assert!(block.contains("task_id=task1"));
-        assert!(block.contains("task_id=task2"));
-        assert!(block.contains("agent_type=claude-code"));
-
-        let start = block.find("[aiki-task]").unwrap() + "[aiki-task]".len();
-        let end = block.find("[/aiki-task]").unwrap();
-        let content = &block[start..end];
-        let parsed = parse_metadata_block(content).expect("Should parse");
-
-        match parsed {
-            TaskEvent::Reserved {
-                task_ids,
-                agent_type,
-                timestamp,
-            } => {
-                assert_eq!(task_ids, vec!["task1", "task2"]);
-                assert_eq!(agent_type, "claude-code");
-                assert_eq!(timestamp, original.timestamp());
-            }
-            _ => panic!("Expected Reserved event"),
-        }
-    }
-
-    #[test]
-    fn test_roundtrip_released() {
-        let original = TaskEvent::Released {
-            task_ids: vec!["task1".to_string()],
-            reason: Some("Spawn failed: timeout".to_string()),
-            timestamp: DateTime::parse_from_rfc3339("2026-03-04T10:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        };
-
-        let block = event_to_metadata_block(&original);
-        assert!(block.contains("event=released"));
-        assert!(block.contains("task_id=task1"));
-        assert!(block.contains("reason=Spawn failed: timeout"));
-
-        let start = block.find("[aiki-task]").unwrap() + "[aiki-task]".len();
-        let end = block.find("[/aiki-task]").unwrap();
-        let content = &block[start..end];
-        let parsed = parse_metadata_block(content).expect("Should parse");
-
-        match parsed {
-            TaskEvent::Released {
-                task_ids,
-                reason,
-                timestamp,
-            } => {
-                assert_eq!(task_ids, vec!["task1"]);
-                assert_eq!(reason, Some("Spawn failed: timeout".to_string()));
-                assert_eq!(timestamp, original.timestamp());
-            }
-            _ => panic!("Expected Released event"),
-        }
-    }
-
-    #[test]
-    fn test_roundtrip_released_no_reason() {
-        let original = TaskEvent::Released {
-            task_ids: vec!["task1".to_string(), "task2".to_string()],
-            reason: None,
-            timestamp: DateTime::parse_from_rfc3339("2026-03-04T11:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        };
-
-        let block = event_to_metadata_block(&original);
-        assert!(block.contains("event=released"));
-        assert!(
-            !block.contains("reason="),
-            "Should not contain reason when None"
-        );
-
-        let start = block.find("[aiki-task]").unwrap() + "[aiki-task]".len();
-        let end = block.find("[/aiki-task]").unwrap();
-        let content = &block[start..end];
-        let parsed = parse_metadata_block(content).expect("Should parse");
-
-        match parsed {
-            TaskEvent::Released {
-                task_ids,
-                reason,
-                timestamp,
-            } => {
-                assert_eq!(task_ids, vec!["task1", "task2"]);
-                assert_eq!(reason, None);
-                assert_eq!(timestamp, original.timestamp());
-            }
-            _ => panic!("Expected Released event"),
-        }
     }
 }

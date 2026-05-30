@@ -1,11 +1,8 @@
 use crate::cache::debug_log;
-use crate::editors::codex::otel::{self, CodexOtelContext, CodexOtelEvent, ToolKind};
+use crate::editors::codex::otel::{self, CodexOtelContext, CodexOtelEvent};
 use crate::error::Result;
 use crate::event_bus;
-use crate::events::{
-    AikiChangeCompletedPayload, AikiChangePermissionAskedPayload, AikiEvent, ChangeOperation,
-    DeleteOperation, MoveOperation, WriteOperation,
-};
+use crate::events::{AikiEvent, AikiSessionStartPayload, AikiTurnStartedPayload};
 use crate::provenance::record::{AgentType, DetectionMethod};
 use crate::session::{AikiSession, AikiSessionFile, SessionMode};
 use chrono::Utc;
@@ -17,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// Socket-activated: reads a single HTTP request, processes it, responds 200 OK, exits.
 /// All errors are non-fatal (always responds 200 OK to never block Codex).
-pub fn run(_agent: String) -> Result<()> {
+pub fn run(agent: String) -> Result<()> {
     // Read HTTP request from stdin
     let request = match read_http_request() {
         Ok(r) => r,
@@ -380,7 +377,6 @@ fn dump_otlp_payload(body: &[u8], content_type: Option<&str>, request_path: &str
 ///
 /// On Linux, SO_PEERCRED works for Unix domain sockets. For TCP, we fall back
 /// to the same lsof approach.
-#[allow(dead_code)]
 fn get_socket_peer_pid() -> Option<u32> {
     // Try Unix domain socket methods first (cheap, no subprocess)
     if let Some(pid) = get_unix_socket_peer_pid() {
@@ -393,7 +389,6 @@ fn get_socket_peer_pid() -> Option<u32> {
 
 /// Try LOCAL_PEERPID (macOS) or SO_PEERCRED (Linux) on fd 0.
 /// Only works if the socket is AF_UNIX.
-#[allow(dead_code)]
 fn get_unix_socket_peer_pid() -> Option<u32> {
     #[cfg(target_os = "macos")]
     {
@@ -446,7 +441,6 @@ fn get_unix_socket_peer_pid() -> Option<u32> {
 ///
 /// Calls getpeername(0) to get the peer's ephemeral port, then runs
 /// `lsof -i TCP@127.0.0.1:{port} -sTCP:ESTABLISHED -t` to resolve the PID.
-#[allow(dead_code)]
 fn get_tcp_peer_pid() -> Option<u32> {
     // getpeername on fd 0 to learn the peer's address:port
     let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
@@ -505,7 +499,6 @@ fn get_tcp_peer_pid() -> Option<u32> {
 }
 
 /// Info resolved from the socket peer's process tree.
-#[allow(dead_code)]
 struct SocketPeerInfo {
     /// The PID of the codex process found in the ancestor chain.
     codex_pid: u32,
@@ -521,7 +514,6 @@ struct SocketPeerInfo {
 ///
 /// Also captures the cwd of the codex process via sysinfo, which avoids
 /// the race condition of reading the `.jsonl` session file.
-#[allow(dead_code)]
 fn resolve_codex_info_from_socket() -> Option<SocketPeerInfo> {
     let peer_pid = get_socket_peer_pid()?;
 
@@ -593,12 +585,34 @@ fn resolve_codex_info_from_socket() -> Option<SocketPeerInfo> {
 fn process_event(event: CodexOtelEvent, context: &CodexOtelContext) {
     match event {
         CodexOtelEvent::ConversationStarts { conversation_id } => {
-            debug_log(|| {
-                format!(
-                    "OTel: conversation_starts ignored (native SessionStart is authoritative): {}",
-                    conversation_id
-                )
-            });
+            debug_log(|| format!("OTel: conversation_starts: {}", conversation_id));
+
+            // Resolve Codex PID and cwd from socket peer if OTel didn't provide them.
+            // This avoids the .jsonl race condition for cwd and gives us PID for session tracking.
+            let socket_info = if context.agent_pid.is_none() || context.cwd.is_none() {
+                debug_log(|| {
+                    format!(
+                        "OTel: missing pid={} cwd={}, trying socket peer",
+                        context.agent_pid.is_none(),
+                        context.cwd.is_none()
+                    )
+                });
+                resolve_codex_info_from_socket()
+            } else {
+                None
+            };
+
+            let cwd = context
+                .cwd
+                .clone()
+                .or_else(|| socket_info.as_ref().and_then(|i| i.cwd.clone()))
+                .or_else(|| lookup_cwd_from_codex_session(&conversation_id));
+            let cwd = match cwd {
+                Some(c) => c,
+                None => return,
+            };
+
+            maybe_emit_session_started(&conversation_id, context, &cwd, socket_info);
         }
 
         CodexOtelEvent::UserPrompt {
@@ -607,87 +621,33 @@ fn process_event(event: CodexOtelEvent, context: &CodexOtelContext) {
         } => {
             debug_log(|| {
                 format!(
-                    "OTel: user_prompt ignored (native UserPromptSubmit is authoritative): conv={}, prompt_len={}",
+                    "OTel: user_prompt: conv={}, prompt_len={}",
                     conversation_id,
                     prompt.as_ref().map_or(0, |p| p.len())
                 )
             });
+
+            let cwd = match context.cwd.clone() {
+                Some(c) => c,
+                None => match lookup_cwd_from_codex_session(&conversation_id) {
+                    Some(c) => c,
+                    None => return,
+                },
+            };
+
+            maybe_emit_turn_started(&conversation_id, context, &cwd, prompt.unwrap_or_default());
         }
 
         CodexOtelEvent::ToolResult {
-            conversation_id,
-            tool_name,
-            arguments,
+            conversation_id, ..
         } => {
-            let kind = tool_name
-                .as_deref()
-                .map(otel::classify_tool)
-                .unwrap_or(ToolKind::Other);
-
+            // Modified files come from JJ file tracking, not OTel
             debug_log(|| {
                 format!(
-                    "OTel: tool_result: conv={} tool={:?} kind={:?}",
-                    conversation_id, tool_name, kind
+                    "OTel: tool_result: conv={} (ignored, files from JJ)",
+                    conversation_id
                 )
             });
-
-            match kind {
-                ToolKind::Write => {
-                    maybe_emit_change_completed(
-                        &conversation_id,
-                        context,
-                        &tool_name,
-                        &arguments,
-                    );
-                }
-                ToolKind::Read | ToolKind::Shell | ToolKind::Other => {
-                    debug_log(|| {
-                        format!(
-                            "OTel: tool_result {:?} ({:?}) — no provenance needed",
-                            tool_name, kind
-                        )
-                    });
-                }
-            }
-        }
-
-        CodexOtelEvent::ToolDecision {
-            conversation_id,
-            tool_name,
-            arguments,
-            decision,
-        } => {
-            let kind = tool_name
-                .as_deref()
-                .map(otel::classify_tool)
-                .unwrap_or(ToolKind::Other);
-
-            debug_log(|| {
-                format!(
-                    "OTel: tool_decision: conv={} tool={:?} kind={:?} decision={:?}",
-                    conversation_id, tool_name, kind, decision
-                )
-            });
-
-            match kind {
-                ToolKind::Write => {
-                    maybe_emit_change_permission_asked(
-                        &conversation_id,
-                        context,
-                        &tool_name,
-                        &arguments,
-                        &decision,
-                    );
-                }
-                ToolKind::Read | ToolKind::Shell | ToolKind::Other => {
-                    debug_log(|| {
-                        format!(
-                            "OTel: tool_decision {:?} ({:?}) ignored to avoid duplicate permission events",
-                            tool_name, kind
-                        )
-                    });
-                }
-            }
         }
 
         CodexOtelEvent::Unknown { event_name } => {
@@ -696,84 +656,60 @@ fn process_event(event: CodexOtelEvent, context: &CodexOtelContext) {
     }
 }
 
-fn maybe_emit_change_permission_asked(
+fn maybe_emit_session_started(
     conversation_id: &str,
     context: &CodexOtelContext,
-    tool_name: &Option<String>,
-    arguments: &Option<String>,
-    decision: &Option<String>,
+    cwd: &PathBuf,
+    socket_info: Option<SocketPeerInfo>,
 ) {
-    if !decision
-        .as_deref()
-        .map(|d| d.eq_ignore_ascii_case("approved"))
-        .unwrap_or(false)
-    {
-        debug_log(|| {
-            format!(
-                "OTel: apply_patch pre-change skipped for {} (decision={:?})",
-                conversation_id, decision
-            )
-        });
+    let agent_pid = context
+        .agent_pid
+        .or(socket_info.as_ref().map(|i| i.codex_pid));
+
+    // Check if session already started via session file existence
+    let session = AikiSession::new(
+        AgentType::Codex,
+        conversation_id,
+        context.agent_version.as_deref(),
+        DetectionMethod::Hook,
+        SessionMode::Interactive,
+    )
+    .with_parent_pid(agent_pid);
+
+    let session_file = AikiSessionFile::new(&session);
+    if session_file.exists() {
         return;
     }
 
-    let Some(arguments) = arguments else {
+    if !cwd.is_absolute() {
         debug_log(|| {
             format!(
-                "OTel: apply_patch pre-change skipped for {} (no arguments)",
-                conversation_id
-            )
-        });
-        return;
-    };
-
-    let Some(patch_content) = otel::extract_patch_content(arguments) else {
-        debug_log(|| {
-            format!(
-                "OTel: apply_patch pre-change skipped for {} (no patch content)",
-                conversation_id
-            )
-        });
-        return;
-    };
-
-    if patch_content.is_empty() {
-        debug_log(|| {
-            format!(
-                "OTel: apply_patch pre-change skipped for {} (empty patch content)",
+                "OTel: skipping session.started for {} (cwd not absolute)",
                 conversation_id
             )
         });
         return;
     }
 
-    let operations = otel::parse_apply_patch(&patch_content);
-    if operations.is_empty() {
-        debug_log(|| {
-            format!(
-                "OTel: apply_patch pre-change skipped for {} (no operations parsed)",
-                conversation_id
-            )
-        });
-        return;
+    let now = Utc::now();
+    let event = AikiEvent::SessionStarted(AikiSessionStartPayload {
+        session,
+        cwd: cwd.clone(),
+        timestamp: now,
+    });
+
+    if let Err(e) = event_bus::dispatch(event) {
+        debug_log(|| format!("Failed to dispatch session.started from OTel: {}", e));
     }
+    // Session file is created by the session.started handler
+}
 
-    let cwd = match context.cwd.clone() {
-        Some(c) => c,
-        None => match lookup_cwd_from_codex_session(conversation_id) {
-            Some(c) => c,
-            None => {
-                debug_log(|| {
-                    format!(
-                        "OTel: apply_patch pre-change skipped for {} (no cwd)",
-                        conversation_id
-                    )
-                });
-                return;
-            }
-        },
-    };
-
+fn maybe_emit_turn_started(
+    conversation_id: &str,
+    context: &CodexOtelContext,
+    cwd: &PathBuf,
+    prompt: String,
+) {
     let session = AikiSession::new(
         AgentType::Codex,
         conversation_id,
@@ -784,218 +720,39 @@ fn maybe_emit_change_permission_asked(
     .with_parent_pid(context.agent_pid);
 
     let session_file = AikiSessionFile::new(&session);
+
+    // Need session to exist first
     if !session_file.exists() {
+        return;
+    }
+
+    // OTel user_prompt events may arrive multiple times or out of order.
+    // The turn.started handler will query JJ for the actual turn number and
+    // record the prompt. We just dispatch the event and let the handler
+    // manage deduplication via JJ history.
+
+    if !cwd.is_absolute() {
         debug_log(|| {
             format!(
-                "OTel: apply_patch pre-change skipped for {} (no session file)",
+                "OTel: skipping turn.started for {} (cwd not absolute)",
                 conversation_id
             )
         });
         return;
     }
 
-    let tool = tool_name
-        .clone()
-        .unwrap_or_else(|| "apply_patch".to_string());
     let now = Utc::now();
+    let event = AikiEvent::TurnStarted(AikiTurnStartedPayload {
+        session,
+        cwd: cwd.clone(),
+        timestamp: now,
+        turn: crate::events::Turn::unknown(), // Set by handle_turn_started
+        prompt,
+        injected_refs: vec![],
+    });
 
-    for (op_type, file_info) in &operations {
-        let Some(operation) = build_change_operation_from_parsed_patch(op_type, file_info) else {
-            continue;
-        };
-
-        debug_log(|| {
-            format!(
-                "OTel: dispatching change.permission_asked for {} ({}: {})",
-                conversation_id, op_type, file_info
-            )
-        });
-
-        let event = AikiEvent::ChangePermissionAsked(AikiChangePermissionAskedPayload {
-            session: session.clone(),
-            cwd: cwd.clone(),
-            timestamp: now,
-            tool_name: tool.clone(),
-            operation,
-        });
-
-        if let Err(e) = event_bus::dispatch(event) {
-            debug_log(|| {
-                format!(
-                    "Failed to dispatch change.permission_asked for {}: {}",
-                    file_info, e
-                )
-            });
-        }
-    }
-}
-
-/// Emit change.completed events for Codex apply_patch tool results.
-///
-/// Parses the patch content from tool arguments, extracts file operations,
-/// and dispatches change.completed events so the hooks flow can write provenance
-/// metadata (including task= IDs) to JJ change descriptions.
-fn maybe_emit_change_completed(
-    conversation_id: &str,
-    context: &CodexOtelContext,
-    tool_name: &Option<String>,
-    arguments: &Option<String>,
-) {
-    let patch_content = match arguments {
-        Some(args) => match otel::extract_patch_content(args) {
-            Some(content) => content,
-            None => {
-                debug_log(|| "OTel: apply_patch skipped (no patch content in args)".to_string());
-                return;
-            }
-        },
-        None => {
-            debug_log(|| "OTel: apply_patch skipped (no arguments)".to_string());
-            return;
-        }
-    };
-
-    if patch_content.is_empty() {
-        debug_log(|| "OTel: apply_patch skipped (empty patch content)".to_string());
-        return;
-    }
-
-    let operations = otel::parse_apply_patch(&patch_content);
-    if operations.is_empty() {
-        debug_log(|| "OTel: apply_patch skipped (no operations parsed)".to_string());
-        return;
-    }
-
-    let cwd = match context.cwd.clone() {
-        Some(c) => c,
-        None => match lookup_cwd_from_codex_session(conversation_id) {
-            Some(c) => c,
-            None => {
-                debug_log(|| {
-                    format!(
-                        "OTel: apply_patch skipped for {} (no cwd)",
-                        conversation_id
-                    )
-                });
-                return;
-            }
-        },
-    };
-
-    let session = AikiSession::new(
-        AgentType::Codex,
-        conversation_id,
-        context.agent_version.as_deref(),
-        DetectionMethod::Hook,
-        SessionMode::Interactive,
-    )
-    .with_parent_pid(context.agent_pid);
-
-    let session_file = AikiSessionFile::new(&session);
-    if !session_file.exists() {
-        debug_log(|| {
-            format!(
-                "OTel: apply_patch skipped for {} (no session file)",
-                conversation_id
-            )
-        });
-        return;
-    }
-
-    let tool = tool_name
-        .clone()
-        .unwrap_or_else(|| "apply_patch".to_string());
-    let now = Utc::now();
-
-    for (op_type, file_info) in &operations {
-        let Some(operation) = build_change_operation_from_parsed_patch(op_type, file_info) else {
-            continue;
-        };
-
-        debug_log(|| {
-            format!(
-                "OTel: dispatching change.completed for {} ({}: {})",
-                conversation_id, op_type, file_info
-            )
-        });
-
-        let event = AikiEvent::ChangeCompleted(AikiChangeCompletedPayload {
-            session: session.clone(),
-            cwd: cwd.clone(),
-            timestamp: now,
-            tool_name: tool.clone(),
-            success: true,
-            turn: crate::events::Turn::unknown(),
-            operation,
-        });
-
-        if let Err(e) = event_bus::dispatch(event) {
-            debug_log(|| {
-                format!(
-                    "Failed to dispatch change.completed for {}: {}",
-                    file_info, e
-                )
-            });
-        }
-    }
-}
-
-fn build_change_operation_from_parsed_patch(
-    op_type: &str,
-    file_info: &str,
-) -> Option<ChangeOperation> {
-    match op_type {
-        "write" => Some(ChangeOperation::Write(WriteOperation {
-            file_paths: vec![file_info.to_string()],
-            edit_details: vec![],
-        })),
-        "delete" => Some(ChangeOperation::Delete(DeleteOperation {
-            file_paths: vec![file_info.to_string()],
-        })),
-        "move" => {
-            let parts: Vec<&str> = file_info.splitn(2, ':').collect();
-            if parts.len() == 2 {
-                Some(ChangeOperation::Move(MoveOperation::from_move_paths(vec![
-                    parts[0].to_string(),
-                    parts[1].to_string(),
-                ])))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn build_change_operation_from_patch_write() {
-        let op = build_change_operation_from_parsed_patch("write", "src/main.rs");
-        assert!(matches!(
-            op,
-            Some(ChangeOperation::Write(WriteOperation { file_paths, .. }))
-            if file_paths == vec!["src/main.rs".to_string()]
-        ));
-    }
-
-    #[test]
-    fn build_change_operation_from_patch_move() {
-        let op = build_change_operation_from_parsed_patch("move", "old.rs:new.rs");
-        assert!(matches!(
-            op,
-            Some(ChangeOperation::Move(MoveOperation { source_paths, destination_paths, .. }))
-            if source_paths == vec!["old.rs".to_string()]
-                && destination_paths == vec!["new.rs".to_string()]
-        ));
-    }
-
-    #[test]
-    fn build_change_operation_from_patch_invalid_move() {
-        let op = build_change_operation_from_parsed_patch("move", "old.rs");
-        assert!(op.is_none());
+    if let Err(e) = event_bus::dispatch(event) {
+        debug_log(|| format!("Failed to dispatch turn.started from OTel: {}", e));
     }
 }
 

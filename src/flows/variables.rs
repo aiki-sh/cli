@@ -74,6 +74,14 @@ impl VariableResolver {
         self.cache_valid = false;
     }
 
+    /// Add environment variables
+    #[allow(dead_code)] // Part of VariableResolver API
+    pub fn add_env_vars(&mut self, env_vars: &HashMap<String, String>) {
+        self.variables
+            .extend(env_vars.iter().map(|(k, v)| (k.clone(), v.clone())));
+        self.cache_valid = false;
+    }
+
     /// Get all resolved variables as a flat map.
     ///
     /// This resolves lazy variables that haven't been computed yet and returns
@@ -223,7 +231,7 @@ impl VariableResolver {
             "Variable not found in event context. Available: event.file_paths, event.task.id, etc."
                 .to_string()
         } else if var_name.starts_with("session.") {
-            "Variable not found in session context. Available: session.thread.tail, session.thread.tail.status, session.thread.head, session.mode, session.task.id, session.task.status, session.task.type, session.cwd, etc."
+            "Variable not found in session context. Available: session.task.id, session.cwd, etc."
                 .to_string()
         } else {
             format!(
@@ -244,8 +252,7 @@ impl VariableResolver {
             return false;
         }
         // Rest can be alphanumeric, underscore, or dot
-        s.chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.')
     }
 }
 
@@ -287,7 +294,9 @@ mod tests {
         resolver.add_var("value", "42");
 
         assert_eq!(
-            resolver.resolve("{{value}} + {{value}} = answer").unwrap(),
+            resolver
+                .resolve("{{value}} + {{value}} = answer")
+                .unwrap(),
             "42 + 42 = answer"
         );
     }
@@ -303,6 +312,22 @@ mod tests {
         let mut resolver = VariableResolver::new();
         let err = resolver.resolve("Value: {{undefined}}").unwrap_err();
         assert!(matches!(err, AikiError::VariableNotFound { .. }));
+    }
+
+    #[test]
+    fn test_resolve_env_vars_via_add() {
+        let mut resolver = VariableResolver::new();
+        let mut env_vars = HashMap::new();
+        env_vars.insert("HOME".to_string(), "/home/user".to_string());
+        env_vars.insert("PATH".to_string(), "/usr/bin".to_string());
+        resolver.add_env_vars(&env_vars);
+
+        assert_eq!(
+            resolver
+                .resolve("Home: {{HOME}}, Path: {{PATH}}")
+                .unwrap(),
+            "Home: /home/user, Path: /usr/bin"
+        );
     }
 
     #[test]
@@ -372,7 +397,9 @@ mod tests {
         resolver.add_var("metadata", r#"{"author":"Claude"}"#);
         resolver.add_var("cwd", "/tmp");
 
-        let result = resolver.resolve("{{metadata.author}} in {{cwd}}").unwrap();
+        let result = resolver
+            .resolve("{{metadata.author}} in {{cwd}}")
+            .unwrap();
         assert_eq!(result, "Claude in /tmp");
     }
 
@@ -382,7 +409,9 @@ mod tests {
         resolver.add_var("metadata", r#"{"author":"Claude"}"#);
 
         // Unknown field should error
-        let err = resolver.resolve("{{metadata.nonexistent}}").unwrap_err();
+        let err = resolver
+            .resolve("{{metadata.nonexistent}}")
+            .unwrap_err();
         assert!(matches!(err, AikiError::VariableNotFound { .. }));
     }
 
@@ -524,12 +553,16 @@ mod tests {
         });
 
         // First access - should compute
-        let result1 = resolver.resolve("Changes: {{event.task.changes}}").unwrap();
+        let result1 = resolver
+            .resolve("Changes: {{event.task.changes}}")
+            .unwrap();
         assert_eq!(result1, "Changes: change1 change2");
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
 
         // Second access - should use cached value, not recompute
-        let result2 = resolver.resolve("Again: {{event.task.changes}}").unwrap();
+        let result2 = resolver
+            .resolve("Again: {{event.task.changes}}")
+            .unwrap();
         assert_eq!(result2, "Again: change1 change2");
         assert_eq!(call_count.load(Ordering::SeqCst), 1); // Still 1, not 2
     }
@@ -544,7 +577,10 @@ mod tests {
         let result = resolver
             .resolve("Files: {{event.task.files}}, Changes: {{event.task.changes}}")
             .unwrap();
-        assert_eq!(result, "Files: file1.rs file2.rs, Changes: abc123 def456");
+        assert_eq!(
+            result,
+            "Files: file1.rs file2.rs, Changes: abc123 def456"
+        );
     }
 
     #[test]
@@ -556,7 +592,9 @@ mod tests {
         resolver.add_lazy_var("event.task.files", || "modified.rs".to_string());
 
         let result = resolver
-            .resolve("Task {{event.task.id}} ({{event.task.name}}): {{event.task.files}}")
+            .resolve(
+                "Task {{event.task.id}} ({{event.task.name}}): {{event.task.files}}",
+            )
             .unwrap();
         assert_eq!(result, "Task task-123 (My Task): modified.rs");
     }
@@ -566,7 +604,9 @@ mod tests {
         let mut resolver = VariableResolver::new();
 
         // Don't add the lazy var, just try to resolve it
-        let err = resolver.resolve("Files: {{event.task.files}}").unwrap_err();
+        let err = resolver
+            .resolve("Files: {{event.task.files}}")
+            .unwrap_err();
         assert!(matches!(err, AikiError::VariableNotFound { .. }));
     }
 

@@ -41,17 +41,14 @@ pub fn configure_zed() -> Result<()> {
         "agent_servers".to_string(),
         json!({
             "claude": {
-                "type": "custom",
                 "command": "aiki",
                 "args": ["hooks", "acp", "--agent", "claude-code"]
             },
             "codex": {
-                "type": "custom",
                 "command": "aiki",
                 "args": ["hooks", "acp", "--agent", "codex"]
             },
             "gemini": {
-                "type": "custom",
                 "command": "aiki",
                 "args": ["hooks", "acp", "--agent", "gemini"]
             }

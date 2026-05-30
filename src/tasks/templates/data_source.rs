@@ -109,6 +109,7 @@ mod tests {
             assignee: None,
             sources: Vec::new(),
             template: None,
+            working_copy: None,
             instructions: None,
             data: HashMap::new(),
             created_at: Utc::now(),

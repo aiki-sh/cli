@@ -3,7 +3,6 @@ pub mod claude_code;
 pub mod codex;
 pub mod cursor;
 pub mod npm;
-pub mod transcript;
 pub mod zed;
 
 use crate::cache::debug_log;
@@ -17,7 +16,6 @@ use std::io::{self, Read};
 /// - `HookCommandOutput`: Editor protocol (JSON value, exit code)
 pub struct HookCommandOutput {
     pub json_value: Option<serde_json::Value>,
-    pub stdout_text: Option<String>,
     pub exit_code: i32,
 }
 
@@ -26,25 +24,12 @@ impl HookCommandOutput {
     pub fn new(json_value: Option<serde_json::Value>, exit_code: i32) -> Self {
         Self {
             json_value,
-            stdout_text: None,
-            exit_code,
-        }
-    }
-
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn from_stdout(stdout_text: impl Into<String>, exit_code: i32) -> Self {
-        Self {
-            json_value: None,
-            stdout_text: Some(stdout_text.into()),
             exit_code,
         }
     }
 
     pub fn print_and_exit(self) -> ! {
-        if let Some(text) = &self.stdout_text {
-            println!("{}", text);
-        } else if let Some(value) = &self.json_value {
+        if let Some(value) = &self.json_value {
             if let Ok(json) = serde_json::to_string(value) {
                 println!("{}", json);
             }

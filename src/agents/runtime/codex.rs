@@ -2,57 +2,11 @@
 //!
 //! Spawns Codex sessions using the `codex` CLI in non-interactive mode.
 
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use super::{
-    build_spawn_env, AgentRuntime, AgentSessionResult, AgentSpawnOptions, BackgroundHandle,
-    MonitoredChild,
-};
-use super::AgentType;
+use super::{AgentRuntime, AgentSessionResult, AgentSpawnOptions, BackgroundHandle, MonitoredChild};
+use crate::agents::AgentType;
 use crate::error::{AikiError, Result};
-
-/// Check if the working directory is inside a git repository.
-/// Walks up from `dir` looking for a `.git` directory or file.
-fn has_git_repo(dir: &Path) -> bool {
-    let mut current = Some(dir);
-    while let Some(d) = current {
-        if d.join(".git").exists() {
-            return true;
-        }
-        current = d.parent();
-    }
-    false
-}
-
-/// If `dir` is a JJ workspace whose repo store lives elsewhere (e.g. a shared
-/// store in the original repo), return the parent `.jj` directory that needs
-/// to be writable. JJ workspaces store a plain-text path in `.jj/repo` that
-/// points to the shared repo store. When the store is outside the workspace
-/// tree, Codex's sandbox must be told about it via `--add-dir`.
-fn jj_shared_store_dir(dir: &Path) -> Option<PathBuf> {
-    let repo_file = dir.join(".jj/repo");
-    if let Ok(contents) = std::fs::read_to_string(&repo_file) {
-        let store_path = PathBuf::from(contents.trim());
-        // Only needed when the store is outside the workspace
-        if !store_path.starts_with(dir) {
-            // Return the `.jj` parent directory (one level up from `repo`)
-            return store_path.parent().map(|p| p.to_path_buf());
-        }
-    }
-    None
-}
-
-/// Apply common Codex CLI flags: `--skip-git-repo-check` when there's no
-/// `.git`, and `--add-dir` when the JJ store lives outside the workspace.
-fn apply_jj_flags(cmd: &mut Command, cwd: &Path) {
-    if !has_git_repo(cwd) {
-        cmd.arg("--skip-git-repo-check");
-    }
-    if let Some(store_dir) = jj_shared_store_dir(cwd) {
-        cmd.arg("--add-dir").arg(store_dir);
-    }
-}
 
 /// Runtime for Codex agent
 pub struct CodexRuntime;
@@ -72,18 +26,23 @@ impl Default for CodexRuntime {
 }
 
 impl AgentRuntime for CodexRuntime {
+    fn agent_type(&self) -> AgentType {
+        AgentType::Codex
+    }
+
     fn spawn_blocking(&self, options: &AgentSpawnOptions) -> Result<AgentSessionResult> {
         let prompt = options.task_prompt();
 
         // Spawn codex process with prompt
         // Uses `codex exec` for non-interactive execution
-        // Bypass sandbox to allow nested codex (child inherits parent's seatbelt which blocks API access)
-        // TODO: replace with --profile once permission profiles are configured (see ops/now/fix-codex-run.md)
+        // --full-auto enables workspace writes with sandbox protection (-a on-request, --sandbox workspace-write)
         let mut cmd = Command::new("codex");
         cmd.current_dir(&options.cwd)
-            .args(["exec", "--dangerously-bypass-approvals-and-sandbox", &prompt])
-            .envs(build_spawn_env(options, "background"));
-        apply_jj_flags(&mut cmd, &options.cwd);
+            .args(["exec", "--full-auto", &prompt]);
+        // Propagate parent session UUID for workspace isolation chaining
+        if let Some(ref uuid) = options.parent_session_uuid {
+            cmd.env("AIKI_PARENT_SESSION_UUID", uuid);
+        }
         let output = cmd.output();
 
         match output {
@@ -120,25 +79,32 @@ impl AgentRuntime for CodexRuntime {
 
         // Spawn codex process detached from parent
         // The process runs independently and continues after parent exits
-        // Bypass sandbox to allow nested codex (child inherits parent's seatbelt which blocks API access)
-        // TODO: replace with --profile once permission profiles are configured (see ops/now/fix-codex-run.md)
+        // --full-auto enables workspace writes with sandbox protection (-a on-request, --sandbox workspace-write)
         let mut cmd = Command::new("codex");
         cmd.current_dir(&options.cwd)
-            .args(["exec", "--dangerously-bypass-approvals-and-sandbox", &prompt])
-            .envs(build_spawn_env(options, "background"))
+            .args(["exec", "--full-auto", &prompt])
+            // Pass task ID so session system can track this as a task-driven session
+            .env("AIKI_TASK", &options.task_id)
+            // Mark as background session for mode detection
+            .env("AIKI_SESSION_MODE", "background")
             // Detach stdin/stdout/stderr so process runs independently
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        apply_jj_flags(&mut cmd, &options.cwd);
+        // Propagate parent session UUID for workspace isolation chaining
+        if let Some(ref uuid) = options.parent_session_uuid {
+            cmd.env("AIKI_PARENT_SESSION_UUID", uuid);
+        }
         let child = cmd.spawn();
 
         match child {
-            Ok(_child) => Ok(BackgroundHandle {
-                thread: options.thread.clone(),
-                session_id: None,
-                agent_type: AgentType::Codex,
-            }),
+            Ok(child) => {
+                let pid = child.id();
+                Ok(BackgroundHandle {
+                    pid,
+                    task_id: options.task_id.clone(),
+                })
+            }
             Err(e) => Err(AikiError::AgentSpawnFailed(format!(
                 "Failed to spawn codex in background: {}",
                 e
@@ -150,23 +116,27 @@ impl AgentRuntime for CodexRuntime {
         let prompt = options.task_prompt();
 
         // Spawn codex process - keep Child handle for monitoring
-        // Bypass sandbox to allow nested codex (child inherits parent's seatbelt which blocks API access)
-        // TODO: replace with --profile once permission profiles are configured (see ops/now/fix-codex-run.md)
+        // --full-auto enables workspace writes with sandbox protection (-a on-request, --sandbox workspace-write)
         let mut cmd = Command::new("codex");
         cmd.current_dir(&options.cwd)
-            .args(["exec", "--dangerously-bypass-approvals-and-sandbox", &prompt])
-            .envs(build_spawn_env(options, "monitored"))
-            // Detach stdin so process runs independently
+            .args(["exec", "--full-auto", &prompt])
+            // Pass task ID so session system can track this as a task-driven session
+            .env("AIKI_TASK", &options.task_id)
+            // Mark as monitored session for mode detection
+            .env("AIKI_SESSION_MODE", "monitored")
+            // Detach stdin/stdout so process runs independently
             .stdin(Stdio::null())
-            // Capture stdout/stderr so failures surface the real CLI message
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             // Capture stderr so we can report errors when the agent fails
             .stderr(Stdio::piped());
-        apply_jj_flags(&mut cmd, &options.cwd);
+        // Propagate parent session UUID for workspace isolation chaining
+        if let Some(ref uuid) = options.parent_session_uuid {
+            cmd.env("AIKI_PARENT_SESSION_UUID", uuid);
+        }
         let child = cmd.spawn();
 
         match child {
-            Ok(child) => Ok(MonitoredChild::new(child)),
+            Ok(child) => Ok(MonitoredChild::new(child, &options.task_id)),
             Err(e) => Err(AikiError::AgentSpawnFailed(format!(
                 "Failed to spawn codex for monitoring: {}",
                 e
@@ -179,7 +149,10 @@ impl AgentRuntime for CodexRuntime {
 ///
 /// Takes the last few non-empty lines as a summary, up to ~500 chars
 fn extract_summary(output: &str) -> String {
-    let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+    let lines: Vec<&str> = output
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
 
     if lines.is_empty() {
         return "Task completed".to_string();
@@ -205,6 +178,12 @@ fn extract_summary(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_codex_runtime_agent_type() {
+        let runtime = CodexRuntime::new();
+        assert_eq!(runtime.agent_type(), AgentType::Codex);
+    }
 
     #[test]
     fn test_extract_summary_empty() {

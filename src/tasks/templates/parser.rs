@@ -25,9 +25,7 @@
 
 use crate::error::{AikiError, Result};
 
-use super::types::{
-    SubtaskFrontmatter, TaskDefaults, TaskDefinition, TaskTemplate, TemplateFrontmatter,
-};
+use super::types::{SubtaskFrontmatter, TaskDefaults, TaskDefinition, TaskTemplate, TemplateFrontmatter};
 
 /// Errors that can occur when extracting YAML frontmatter
 #[derive(Debug)]
@@ -43,10 +41,7 @@ impl std::fmt::Display for FrontmatterError {
         match self {
             FrontmatterError::Yaml(e) => write!(f, "{}", e),
             FrontmatterError::Unterminated => {
-                write!(
-                    f,
-                    "Unterminated frontmatter: found opening '---' but no closing '---'"
-                )
+                write!(f, "Unterminated frontmatter: found opening '---' but no closing '---'")
             }
         }
     }
@@ -111,10 +106,12 @@ pub fn parse_template(content: &str, name: &str, file_path: &str) -> Result<Task
             "loop.index1".to_string(),
             serde_yaml::Value::String("data.loop.index1 + 1".to_string()),
         );
-        spawn_data.insert("loop.first".to_string(), serde_yaml::Value::Bool(false));
+        spawn_data.insert(
+            "loop.first".to_string(),
+            serde_yaml::Value::Bool(false),
+        );
         let spawn_entry = SpawnEntry {
             when: format!("not ({})", loop_config.until),
-            max_iterations: Some(loop_config.max_iterations),
             task: Some(SpawnTaskConfig {
                 template: "self".to_string(),
                 priority: None,
@@ -127,18 +124,18 @@ pub fn parse_template(content: &str, name: &str, file_path: &str) -> Result<Task
         template.spawns.push(spawn_entry);
 
         // Add initial loop metadata to template defaults
-        template
-            .defaults
-            .data
-            .insert("loop.index".to_string(), serde_json::json!(0));
-        template
-            .defaults
-            .data
-            .insert("loop.index1".to_string(), serde_json::json!(1));
-        template
-            .defaults
-            .data
-            .insert("loop.first".to_string(), serde_json::json!(true));
+        template.defaults.data.insert(
+            "loop.index".to_string(),
+            serde_json::json!(0),
+        );
+        template.defaults.data.insert(
+            "loop.index1".to_string(),
+            serde_json::json!(1),
+        );
+        template.defaults.data.insert(
+            "loop.first".to_string(),
+            serde_json::json!(true),
+        );
     }
 
     // Validate spawn entries: each must have exactly one of task/subtask
@@ -249,8 +246,7 @@ fn extract_frontmatter(content: &str, file_path: &str) -> Result<(TemplateFrontm
             // No closing delimiter found - error
             Err(AikiError::TemplateFrontmatterInvalid {
                 file: file_path.to_string(),
-                details: "Unterminated frontmatter: found opening '---' but no closing '---'"
-                    .to_string(),
+                details: "Unterminated frontmatter: found opening '---' but no closing '---'".to_string(),
             })
         }
     }
@@ -275,14 +271,13 @@ fn parse_markdown_body(
 
     let parent = TaskDefinition {
         name: task_name,
-        slug: None,      // Parent tasks don't have slugs from templates
+        slug: None, // Parent tasks don't have slugs from templates
         task_type: None, // Set from frontmatter by resolver
         instructions: parent_instructions,
         priority: None,
         assignee: None,
         sources: Vec::new(),
         data: Default::default(),
-        needs_context: None,
     };
 
     // Parse subtasks from H2 sections after the # Subtasks marker
@@ -380,7 +375,6 @@ fn parse_single_subtask(name: &str, lines: &[&str], file_path: &str) -> Result<T
         assignee: frontmatter.assignee,
         sources: frontmatter.sources,
         data: frontmatter.data,
-        needs_context: frontmatter.needs_context,
     })
 }
 
@@ -390,12 +384,10 @@ fn extract_subtask_frontmatter(
     file_path: &str,
 ) -> Result<(SubtaskFrontmatter, String)> {
     let content = lines.join("\n");
-    let (frontmatter, body) =
-        extract_yaml_frontmatter::<SubtaskFrontmatter>(&content).map_err(|e| {
-            AikiError::TemplateFrontmatterInvalid {
-                file: file_path.to_string(),
-                details: e.to_string(),
-            }
+    let (frontmatter, body) = extract_yaml_frontmatter::<SubtaskFrontmatter>(&content)
+        .map_err(|e| AikiError::TemplateFrontmatterInvalid {
+            file: file_path.to_string(),
+            details: e.to_string(),
         })?;
     Ok((frontmatter.unwrap_or_default(), body.trim().to_string()))
 }
@@ -457,8 +449,8 @@ Examine the code.
 Review for issues.
 "#;
 
-        let template = parse_template(content, "review", "review.md").unwrap();
-        assert_eq!(template.name, "review");
+        let template = parse_template(content, "aiki/review", "review.md").unwrap();
+        assert_eq!(template.name, "aiki/review");
         assert_eq!(template.version, Some("1.2.0".to_string()));
         assert_eq!(template.description, Some("Test template".to_string()));
         assert_eq!(template.defaults.task_type, Some("review".to_string()));
@@ -572,11 +564,11 @@ Content.
 
     #[test]
     fn test_template_id() {
-        let mut template = TaskTemplate::new("review");
-        assert_eq!(template.template_id(), "review");
+        let mut template = TaskTemplate::new("aiki/review");
+        assert_eq!(template.template_id(), "aiki/review");
 
         template.version = Some("1.0.0".to_string());
-        assert_eq!(template.template_id(), "review@1.0.0");
+        assert_eq!(template.template_id(), "aiki/review@1.0.0");
     }
 
     #[test]
@@ -674,15 +666,15 @@ Do the second step.
 version: "1.0.0"
 type: review
 spawns:
-  - when: not data.approved
+  - when: not approved
     task:
-      template: fix
+      template: aiki/fix
       priority: p0
       data:
         max_iterations: 3
   - when: data.needs_analysis
     subtask:
-      template: analysis
+      template: aiki/analysis
       assignee: claude-code
 ---
 
@@ -691,15 +683,15 @@ spawns:
 Review the changes.
 "#;
 
-        let template = parse_template(content, "review", "review.md").unwrap();
+        let template = parse_template(content, "aiki/review", "review.md").unwrap();
         assert_eq!(template.spawns.len(), 2);
 
         // First spawn: standalone task
-        assert_eq!(template.spawns[0].when, "not data.approved");
+        assert_eq!(template.spawns[0].when, "not approved");
         assert!(template.spawns[0].task.is_some());
         assert!(template.spawns[0].subtask.is_none());
         let task_cfg = template.spawns[0].task.as_ref().unwrap();
-        assert_eq!(task_cfg.template, "fix");
+        assert_eq!(task_cfg.template, "aiki/fix");
         assert_eq!(task_cfg.priority, Some("p0".to_string()));
 
         // Second spawn: subtask
@@ -707,7 +699,7 @@ Review the changes.
         assert!(template.spawns[1].task.is_none());
         assert!(template.spawns[1].subtask.is_some());
         let subtask_cfg = template.spawns[1].subtask.as_ref().unwrap();
-        assert_eq!(subtask_cfg.template, "analysis");
+        assert_eq!(subtask_cfg.template, "aiki/analysis");
         assert_eq!(subtask_cfg.assignee, Some("claude-code".to_string()));
     }
 
@@ -731,11 +723,11 @@ Do something.
         let content = r#"---
 version: "1.0.0"
 spawns:
-  - when: not data.approved
+  - when: not approved
     task:
-      template: fix
+      template: aiki/fix
     subtask:
-      template: analysis
+      template: aiki/analysis
 ---
 
 # Review task
@@ -743,7 +735,7 @@ spawns:
 Review the changes.
 "#;
 
-        let result = parse_template(content, "review", "review.md");
+        let result = parse_template(content, "aiki/review", "review.md");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("both 'task' and 'subtask'"), "Error: {}", err);
@@ -754,7 +746,7 @@ Review the changes.
         let content = r#"---
 version: "1.0.0"
 spawns:
-  - when: not data.approved
+  - when: not approved
 ---
 
 # Review task
@@ -762,14 +754,10 @@ spawns:
 Review the changes.
 "#;
 
-        let result = parse_template(content, "review", "review.md");
+        let result = parse_template(content, "aiki/review", "review.md");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("neither 'task' nor 'subtask'"),
-            "Error: {}",
-            err
-        );
+        assert!(err.contains("neither 'task' nor 'subtask'"), "Error: {}", err);
     }
 
     #[test]
@@ -783,7 +771,7 @@ slug: criteria
 Evaluate the implementation.
 "#;
 
-        let template = parse_template(content, "review/criteria/code", "code.md").unwrap();
+        let template = parse_template(content, "aiki/review/criteria/code", "code.md").unwrap();
         assert_eq!(template.parent.slug, Some("criteria".to_string()));
         assert_eq!(template.parent.name, "Understand Criteria: Code");
     }
@@ -819,7 +807,7 @@ version: "1.0.0"
         let content = r#"---
 version: "1.0.0"
 loop:
-  until: data.approved
+  until: approved
 ---
 
 # Looping task
@@ -829,38 +817,10 @@ Do something repeatedly.
         let template = parse_template(content, "test", "test.md").unwrap();
         assert_eq!(template.spawns.len(), 1);
         let entry = &template.spawns[0];
-        assert_eq!(entry.when, "not (data.approved)");
-        // Default max_iterations (100) should be passed through
-        assert_eq!(entry.max_iterations, Some(100));
+        assert_eq!(entry.when, "not (approved)");
         let task_cfg = entry.task.as_ref().unwrap();
         assert_eq!(task_cfg.template, "self");
         assert!(task_cfg.autorun);
-    }
-
-    #[test]
-    fn test_parse_template_with_loop_explicit_max_iterations() {
-        let content = r#"---
-loop:
-  until: subtasks.review.approved
-  max_iterations: 5
----
-
-# Fix loop
-
-Fix and review.
-"#;
-        let template = parse_template(content, "test", "test.md").unwrap();
-        assert_eq!(template.spawns.len(), 1);
-        let entry = &template.spawns[0];
-        // when condition should only contain the user's until expression
-        assert_eq!(entry.when, "not (subtasks.review.approved)");
-        // Explicit max_iterations should be passed through
-        assert_eq!(entry.max_iterations, Some(5));
-        // Loop metadata should still be present
-        let task_cfg = entry.task.as_ref().unwrap();
-        assert!(task_cfg.data.contains_key("loop.index"));
-        assert!(task_cfg.data.contains_key("loop.index1"));
-        assert!(task_cfg.data.contains_key("loop.first"));
     }
 
     #[test]
@@ -868,11 +828,11 @@ Fix and review.
         let content = r#"---
 version: "1.0.0"
 loop:
-  until: data.approved
+  until: approved
 spawns:
-  - when: "not data.approved"
+  - when: "not approved"
     task:
-      template: fix
+      template: aiki/fix
 ---
 
 # Looping task with spawns
@@ -882,10 +842,16 @@ Do something.
         let template = parse_template(content, "test", "test.md").unwrap();
         // Explicit spawn + desugared loop spawn
         assert_eq!(template.spawns.len(), 2);
-        assert_eq!(template.spawns[0].when, "not data.approved");
-        assert_eq!(template.spawns[0].task.as_ref().unwrap().template, "fix");
-        assert_eq!(template.spawns[1].when, "not (data.approved)");
-        assert_eq!(template.spawns[1].task.as_ref().unwrap().template, "self");
+        assert_eq!(template.spawns[0].when, "not approved");
+        assert_eq!(
+            template.spawns[0].task.as_ref().unwrap().template,
+            "aiki/fix"
+        );
+        assert_eq!(template.spawns[1].when, "not (approved)");
+        assert_eq!(
+            template.spawns[1].task.as_ref().unwrap().template,
+            "self"
+        );
         assert!(template.spawns[1].task.as_ref().unwrap().autorun);
     }
 

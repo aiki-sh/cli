@@ -4,11 +4,8 @@
 
 use std::process::{Command, Stdio};
 
-use super::{
-    build_spawn_env, AgentRuntime, AgentSessionResult, AgentSpawnOptions, BackgroundHandle,
-    MonitoredChild,
-};
-use super::AgentType;
+use super::{AgentRuntime, AgentSessionResult, AgentSpawnOptions, BackgroundHandle, MonitoredChild};
+use crate::agents::AgentType;
 use crate::error::{AikiError, Result};
 
 /// Runtime for Claude Code agent
@@ -29,6 +26,10 @@ impl Default for ClaudeCodeRuntime {
 }
 
 impl AgentRuntime for ClaudeCodeRuntime {
+    fn agent_type(&self) -> AgentType {
+        AgentType::ClaudeCode
+    }
+
     fn spawn_blocking(&self, options: &AgentSpawnOptions) -> Result<AgentSessionResult> {
         let prompt = options.task_prompt();
 
@@ -40,8 +41,11 @@ impl AgentRuntime for ClaudeCodeRuntime {
             .args(["--print", "--dangerously-skip-permissions", &prompt])
             // Unset nesting guard so child Claude Code sessions can start
             .env_remove("CLAUDECODE")
-            .env_remove("CLAUDE_CODE_ENTRYPOINT")
-            .envs(build_spawn_env(options, "background"));
+            .env_remove("CLAUDE_CODE_ENTRYPOINT");
+        // Propagate parent session UUID for workspace isolation chaining
+        if let Some(ref uuid) = options.parent_session_uuid {
+            cmd.env("AIKI_PARENT_SESSION_UUID", uuid);
+        }
         let output = cmd.output();
 
         match output {
@@ -85,19 +89,28 @@ impl AgentRuntime for ClaudeCodeRuntime {
             // Unset nesting guard so child Claude Code sessions can start
             .env_remove("CLAUDECODE")
             .env_remove("CLAUDE_CODE_ENTRYPOINT")
-            .envs(build_spawn_env(options, "background"))
+            // Pass task ID so session system can track this as a task-driven session
+            .env("AIKI_TASK", &options.task_id)
+            // Mark as background session for mode detection
+            .env("AIKI_SESSION_MODE", "background")
             // Detach stdin/stdout/stderr so process runs independently
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Propagate parent session UUID for workspace isolation chaining
+        if let Some(ref uuid) = options.parent_session_uuid {
+            cmd.env("AIKI_PARENT_SESSION_UUID", uuid);
+        }
         let child = cmd.spawn();
 
         match child {
-            Ok(_child) => Ok(BackgroundHandle {
-                thread: options.thread.clone(),
-                session_id: None,
-                agent_type: AgentType::ClaudeCode,
-            }),
+            Ok(child) => {
+                let pid = child.id();
+                Ok(BackgroundHandle {
+                    pid,
+                    task_id: options.task_id.clone(),
+                })
+            }
             Err(e) => Err(AikiError::AgentSpawnFailed(format!(
                 "Failed to spawn claude in background: {}",
                 e
@@ -116,17 +129,23 @@ impl AgentRuntime for ClaudeCodeRuntime {
             // Unset nesting guard so child Claude Code sessions can start
             .env_remove("CLAUDECODE")
             .env_remove("CLAUDE_CODE_ENTRYPOINT")
-            .envs(build_spawn_env(options, "monitored"))
-            // Detach stdin so process runs independently
+            // Pass task ID so session system can track this as a task-driven session
+            .env("AIKI_TASK", &options.task_id)
+            // Mark as monitored session for mode detection
+            .env("AIKI_SESSION_MODE", "monitored")
+            // Detach stdin/stdout so process runs independently
             .stdin(Stdio::null())
-            // Capture stdout/stderr so failures surface the real CLI message
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             // Capture stderr so we can report errors when the agent fails
             .stderr(Stdio::piped());
+        // Propagate parent session UUID for workspace isolation chaining
+        if let Some(ref uuid) = options.parent_session_uuid {
+            cmd.env("AIKI_PARENT_SESSION_UUID", uuid);
+        }
         let child = cmd.spawn();
 
         match child {
-            Ok(child) => Ok(MonitoredChild::new(child)),
+            Ok(child) => Ok(MonitoredChild::new(child, &options.task_id)),
             Err(e) => Err(AikiError::AgentSpawnFailed(format!(
                 "Failed to spawn claude for monitoring: {}",
                 e
@@ -139,7 +158,10 @@ impl AgentRuntime for ClaudeCodeRuntime {
 ///
 /// Takes the last few non-empty lines as a summary, up to ~500 chars
 fn extract_summary(output: &str) -> String {
-    let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+    let lines: Vec<&str> = output
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
 
     if lines.is_empty() {
         return "Task completed".to_string();
@@ -167,6 +189,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_claude_code_runtime_agent_type() {
+        let runtime = ClaudeCodeRuntime::new();
+        assert_eq!(runtime.agent_type(), AgentType::ClaudeCode);
+    }
+
+    #[test]
     fn test_extract_summary_empty() {
         assert_eq!(extract_summary(""), "Task completed");
         assert_eq!(extract_summary("   \n  \n  "), "Task completed");
@@ -183,10 +211,7 @@ mod tests {
     #[test]
     fn test_extract_summary_long() {
         // Create output longer than 500 chars
-        let long_output = (0..100)
-            .map(|i| format!("Line {}", i))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let long_output = (0..100).map(|i| format!("Line {}", i)).collect::<Vec<_>>().join("\n");
         let summary = extract_summary(&long_output);
         assert!(summary.len() <= 600); // Allow some margin
     }

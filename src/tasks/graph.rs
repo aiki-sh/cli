@@ -5,7 +5,6 @@
 //! requires only a new entry in `LINK_KINDS` — zero changes to EdgeStore.
 
 use super::types::{FastHashMap, Task, TaskComment, TaskEvent, TaskOutcome, TaskStatus};
-use crate::cache::debug_log;
 
 /// Link kind metadata — defines cardinality rules and blocking behavior.
 /// Checked at write time when adding links.
@@ -96,13 +95,6 @@ pub const LINK_KINDS: &[LinkKind] = &[
         task_only: false,
     },
     LinkKind {
-        name: "populated-by",
-        max_forward: None,
-        max_reverse: None,
-        blocks_ready: true,
-        task_only: true,
-    },
-    LinkKind {
         name: "adds-plan",
         max_forward: None,
         max_reverse: None,
@@ -129,15 +121,6 @@ pub const LINK_KINDS: &[LinkKind] = &[
         max_forward: Some(1),
         max_reverse: None,
         blocks_ready: false,
-        task_only: true,
-    },
-    // Session-context link: task must run in same agent session as predecessor
-    // Implies depends-on (blocks_ready: true). Linear chains only (max 1 each direction).
-    LinkKind {
-        name: "needs-context",
-        max_forward: Some(1),
-        max_reverse: Some(1),
-        blocks_ready: true,
         task_only: true,
     },
 ];
@@ -215,8 +198,7 @@ impl EdgeStore {
         }
 
         // Clean up metadata
-        self.link_meta
-            .remove(&(from.to_string(), to.to_string(), kind.to_string()));
+        self.link_meta.remove(&(from.to_string(), to.to_string(), kind.to_string()));
     }
 
     /// Forward lookup: given a `from` node and kind, return all targets.
@@ -248,6 +230,12 @@ impl EdgeStore {
         self.targets(from, kind).first().map(|s| s.as_str())
     }
 
+    /// Reverse lookup for single-link kinds: return the one referrer (if any).
+    #[allow(dead_code)]
+    pub fn referrer(&self, to: &str, kind: &str) -> Option<&str> {
+        self.referrers(to, kind).first().map(|s| s.as_str())
+    }
+
     /// Check if a specific forward link exists.
     pub fn has_link(&self, from: &str, to: &str, kind: &str) -> bool {
         self.targets(from, kind).contains(&to.to_string())
@@ -255,24 +243,15 @@ impl EdgeStore {
 
     /// Set metadata for a specific link.
     pub fn set_meta(&mut self, from: &str, to: &str, kind: &str, meta: LinkMeta) {
-        self.link_meta
-            .insert((from.to_string(), to.to_string(), kind.to_string()), meta);
+        self.link_meta.insert(
+            (from.to_string(), to.to_string(), kind.to_string()),
+            meta,
+        );
     }
 
     /// Get metadata for a specific link.
     pub fn get_meta(&self, from: &str, to: &str, kind: &str) -> Option<&LinkMeta> {
-        self.link_meta
-            .get(&(from.to_string(), to.to_string(), kind.to_string()))
-    }
-
-    /// Iterate all edges as (from, to, kind) triples.
-    pub fn all_edges(&self) -> impl Iterator<Item = (&str, &str, &str)> {
-        self.forward.iter().flat_map(|(kind, from_map)| {
-            from_map.iter().flat_map(move |(from, tos)| {
-                tos.iter()
-                    .map(move |to| (from.as_str(), to.as_str(), kind.as_str()))
-            })
-        })
+        self.link_meta.get(&(from.to_string(), to.to_string(), kind.to_string()))
     }
 }
 
@@ -311,8 +290,7 @@ impl TaskGraph {
         // "follows-up" kept for backward compat with existing links (renamed to "remediates")
         const TERMINAL_UNBLOCK: &[&str] = &["validates", "remediates", "follows-up"];
         // Link types that only unblock on Closed(Done)
-        const DONE_ONLY_UNBLOCK: &[&str] =
-            &["blocked-by", "depends-on", "needs-context", "populated-by"];
+        const DONE_ONLY_UNBLOCK: &[&str] = &["blocked-by", "depends-on"];
 
         let terminal_blocked = TERMINAL_UNBLOCK.iter().any(|link_type| {
             self.edges
@@ -340,6 +318,18 @@ impl TaskGraph {
         });
 
         terminal_blocked || done_blocked
+    }
+
+    /// A parent task cannot be closed while it has open children.
+    /// Returns the list of open children, or empty if closeable.
+    #[allow(dead_code)]
+    pub fn open_children(&self, task_id: &str) -> Vec<&Task> {
+        self.edges
+            .referrers(task_id, "subtask-of")
+            .iter()
+            .filter_map(|c| self.tasks.get(c))
+            .filter(|t| t.status != TaskStatus::Closed)
+            .collect()
     }
 
     /// Children of a parent: `edges.referrers(parent_id, "subtask-of")`.
@@ -370,6 +360,7 @@ impl TaskGraph {
 
     /// Cycle detection for a proposed new link.
     /// Walks `edges.targets(id, kind)` via DFS to verify acyclicity.
+    #[allow(dead_code)]
     pub fn would_create_cycle(&self, from: &str, to: &str, kind: &str) -> bool {
         // Adding from→to would create a cycle if `from` is reachable from `to`
         // by following existing links of the same kind
@@ -405,14 +396,7 @@ impl TaskGraph {
     ///
     /// Returns task IDs that should be auto-started.
     pub fn find_autorun_candidates(&self, closed_task_id: &str) -> Vec<String> {
-        const BLOCKING_KINDS: &[&str] = &[
-            "validates",
-            "remediates",
-            "follows-up",
-            "depends-on",
-            "blocked-by",
-            "needs-context",
-        ];
+        const BLOCKING_KINDS: &[&str] = &["validates", "remediates", "follows-up", "depends-on", "blocked-by"];
 
         let mut candidates = std::collections::HashSet::new();
 
@@ -448,52 +432,33 @@ impl TaskGraph {
         candidates.into_iter().collect()
     }
 
-    /// Get the full ordered `needs-context` chain containing the given task.
-    ///
-    /// Walks backward to find the chain head (no predecessor), then forward
-    /// to collect all tasks in order. Returns a single-element vec if the
-    /// task has no needs-context links.
-    pub fn get_needs_context_chain(&self, task_id: &str) -> Vec<String> {
-        // Link direction: `B needs-context A` = link from B to A (B targets A).
-        // B depends on A, so A runs first. The "head" has no targets (doesn't
-        // need context from anyone). Walk via `targets` to find the head.
-
-        // Walk backward (via targets) to find the head
-        let mut head = task_id.to_string();
-        loop {
-            let predecessors = self.edges.targets(&head, "needs-context");
-            if predecessors.is_empty() {
-                break;
+    /// Full provenance chain: walk `sourced-from` links.
+    /// Uses a visited set to handle cycles.
+    #[allow(dead_code)]
+    pub fn provenance_chain(&self, task_id: &str) -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(task_id.to_string());
+        let mut stack = vec![task_id.to_string()];
+        while let Some(node) = stack.pop() {
+            for target in self.edges.targets(&node, "sourced-from") {
+                if visited.insert(target.clone()) {
+                    chain.push(target.clone());
+                    stack.push(target.clone());
+                }
             }
-            head = predecessors[0].clone();
-        }
-
-        // Walk forward (via referrers) from head to collect the chain
-        let mut chain = vec![head.clone()];
-        let mut current = head;
-        loop {
-            let successors = self.edges.referrers(&current, "needs-context");
-            if successors.is_empty() {
-                break;
-            }
-            current = successors[0].clone();
-            chain.push(current.clone());
         }
         chain
     }
 
-    /// Returns `true` if this task is the head of a `needs-context` chain.
-    ///
-    /// A chain head has at least one successor but no predecessor in the
-    /// needs-context graph. Standalone tasks (no needs-context links at all)
-    /// return `false`.
-    ///
-    /// Link direction: `B needs-context A` = link from B to A. A is the head
-    /// (runs first). The head has no targets and at least one referrer.
-    pub fn is_needs_context_head(&self, task_id: &str) -> bool {
-        let has_predecessor = !self.edges.targets(task_id, "needs-context").is_empty();
-        let has_successor = !self.edges.referrers(task_id, "needs-context").is_empty();
-        !has_predecessor && has_successor
+    /// Reverse provenance: what tasks came from this origin?
+    #[allow(dead_code)]
+    pub fn spawned_from(&self, origin: &str) -> Vec<&Task> {
+        self.edges
+            .referrers(origin, "sourced-from")
+            .iter()
+            .filter_map(|id| self.tasks.get(id))
+            .collect()
     }
 }
 
@@ -511,11 +476,7 @@ pub fn materialize_graph(events: &[TaskEvent]) -> TaskGraph {
         process_event(event, &mut tasks, &mut edges, &mut slug_index);
     }
 
-    TaskGraph {
-        tasks,
-        edges,
-        slug_index,
-    }
+    TaskGraph { tasks, edges, slug_index }
 }
 
 /// Materialize a task graph from an event stream with change IDs.
@@ -567,11 +528,7 @@ fn materialize_graph_refs(events: &[&TaskEvent]) -> TaskGraph {
         process_event(event, &mut tasks, &mut edges, &mut slug_index);
     }
 
-    TaskGraph {
-        tasks,
-        edges,
-        slug_index,
-    }
+    TaskGraph { tasks, edges, slug_index }
 }
 
 /// Process a single event into the tasks map, edge store, and slug index.
@@ -591,10 +548,20 @@ fn process_event(
             assignee,
             sources,
             template,
+            working_copy,
             instructions,
             data,
             timestamp,
         } => {
+            // Index old-style dot-notation parent-child as subtask-of (backward compat).
+            if let Some(parent_id) = super::id::get_parent_id(task_id) {
+                edges.add(task_id, parent_id, "subtask-of");
+                // Index slug under the dot-notation parent
+                if let Some(s) = slug {
+                    slug_index.insert((parent_id.to_string(), s.clone()), task_id.clone());
+                }
+            }
+
             // Index old-style sources as sourced-from edges (backward compat).
             for source in sources {
                 edges.add(task_id, source, "sourced-from");
@@ -603,15 +570,12 @@ fn process_event(
             // Index old-style data attributes as edges.
             // Synthesize implements-plan only for epic tasks:
             // - Must have data.plan (the plan file path)
-            // - Must NOT have data.epic or data.target (decompose/build/implement tasks have these)
+            // - Must NOT have data.epic (decompose/build tasks have this)
             // - data.plan must be a file path, not a task ID (old system used
             //   data.plan for epic task IDs)
             if let Some(plan) = data.get("plan") {
                 let plan_raw = plan.strip_prefix("file:").unwrap_or(plan);
-                if !data.contains_key("epic")
-                    && !data.contains_key("target")
-                    && plan_raw.contains('/')
-                {
+                if !data.contains_key("epic") && plan_raw.contains('/') {
                     let target = if plan.starts_with("file:") {
                         plan.clone()
                     } else {
@@ -621,12 +585,8 @@ fn process_event(
                 }
             }
 
-            // Orchestrates edges from helper tasks (decompose uses data.epic, implement uses data.target)
             if let Some(epic_id) = data.get("epic") {
                 edges.add(task_id, epic_id, "orchestrates");
-            }
-            if let Some(target_id) = data.get("target") {
-                edges.add(task_id, target_id, "orchestrates");
             }
 
             if let Some(scope_id) = data.get("scope.id") {
@@ -665,6 +625,7 @@ fn process_event(
                     assignee: assignee.clone(),
                     sources: sources.clone(),
                     template: template.clone(),
+                    working_copy: working_copy.clone(),
                     instructions: instructions.clone(),
                     data: data.clone(),
                     created_at: *timestamp,
@@ -673,10 +634,8 @@ fn process_event(
                     last_session_id: None,
                     stopped_reason: None,
                     closed_outcome: None,
-                    confidence: None,
                     summary: None,
                     turn_started: None,
-                    closed_at: None,
                     turn_closed: None,
                     turn_stopped: None,
                     comments: Vec::new(),
@@ -685,12 +644,10 @@ fn process_event(
         }
         TaskEvent::Started {
             task_ids,
-            agent_type,
             session_id,
             turn_id,
-            working_copy: _,
-            instructions,
             timestamp,
+            ..
         } => {
             for task_id in task_ids {
                 if let Some(task) = tasks.get_mut(task_id) {
@@ -701,14 +658,6 @@ fn process_event(
                     task.started_at = Some(*timestamp);
                     task.turn_started = turn_id.clone();
                     task.turn_stopped = None;
-                    // Set assignee from the agent that started the task
-                    if agent_type != "unknown" {
-                        task.assignee = Some(agent_type.clone());
-                    }
-                    // Apply instructions if provided atomically with start
-                    if let Some(instr) = instructions {
-                        task.instructions = Some(instr.clone());
-                    }
                 }
             }
         }
@@ -730,20 +679,16 @@ fn process_event(
         TaskEvent::Closed {
             task_ids,
             outcome,
-            confidence,
             summary,
             turn_id,
-            timestamp,
             ..
         } => {
             for task_id in task_ids {
                 if let Some(task) = tasks.get_mut(task_id) {
                     task.status = TaskStatus::Closed;
                     task.closed_outcome = Some(*outcome);
-                    task.confidence = *confidence;
                     task.summary = summary.clone();
                     task.claimed_by_session = None;
-                    task.closed_at = Some(*timestamp);
                     task.turn_closed = turn_id.clone();
                 }
             }
@@ -752,7 +697,6 @@ fn process_event(
             if let Some(task) = tasks.get_mut(task_id) {
                 task.status = TaskStatus::Open;
                 task.closed_outcome = None;
-                task.confidence = None;
                 task.claimed_by_session = None;
             }
         }
@@ -821,13 +765,7 @@ fn process_event(
                 }
             }
         }
-        TaskEvent::LinkAdded {
-            from,
-            to,
-            kind,
-            autorun,
-            ..
-        } => {
+        TaskEvent::LinkAdded { from, to, kind, autorun, .. } => {
             // Map renamed link kinds for backward compatibility
             let effective_kind = match kind.as_str() {
                 "implements" => "implements-plan",
@@ -866,36 +804,6 @@ fn process_event(
                 }
             }
         }
-        TaskEvent::Reserved { task_ids, .. } => {
-            for task_id in task_ids {
-                if let Some(task) = tasks.get_mut(task_id) {
-                    if task.status != TaskStatus::Open {
-                        debug_log(|| {
-                            format!(
-                            "warn: Reserved event for task {} in status {}, expected Open — skipping",
-                            &task_id[..6],
-                            task.status
-                        )
-                        });
-                        continue;
-                    }
-                    task.status = TaskStatus::Reserved;
-                }
-            }
-        }
-        TaskEvent::Released { task_ids, .. } => {
-            for task_id in task_ids {
-                if let Some(task) = tasks.get_mut(task_id) {
-                    if task.status != TaskStatus::Reserved {
-                        continue;
-                    }
-                    task.status = TaskStatus::Open;
-                }
-            }
-        }
-        TaskEvent::Absorbed { .. } => {
-            // Absorbed events are informational; they don't change task state.
-        }
     }
 }
 
@@ -925,97 +833,9 @@ pub fn is_task_only_kind(kind: &str) -> bool {
 }
 
 /// Look up a link kind by name.
+#[allow(dead_code)]
 pub fn find_link_kind(name: &str) -> Option<&'static LinkKind> {
     LINK_KINDS.iter().find(|k| k.name == name)
-}
-
-// ---------------------------------------------------------------------------
-// Graph delta (diff between two snapshots)
-// ---------------------------------------------------------------------------
-
-/// A change in task status between two graph snapshots.
-pub struct StatusChange<'a> {
-    pub task: &'a Task,
-    pub prev_status: TaskStatus,
-    pub next_status: TaskStatus,
-}
-
-/// Computed diff between two `TaskGraph` snapshots.
-///
-/// Produced once per debounce window by the drain loop to determine what
-/// changed between the previous and current materialized graph.
-pub struct GraphDelta<'a> {
-    pub prev: &'a TaskGraph,
-    pub next: &'a TaskGraph,
-    /// Tasks present in `next` but not in `prev`.
-    pub new_tasks: Vec<&'a Task>,
-    /// Tasks whose status changed between snapshots.
-    pub status_changes: Vec<StatusChange<'a>>,
-    /// New comments added between snapshots: (task_id, comment).
-    pub new_comments: Vec<(&'a str, &'a TaskComment)>,
-    /// New edges added between snapshots: (from, to, kind).
-    pub new_edges: Vec<(&'a str, &'a str, &'a str)>,
-}
-
-/// Compute the diff between two graph snapshots.
-pub fn compute_delta<'a>(prev: &'a TaskGraph, next: &'a TaskGraph) -> GraphDelta<'a> {
-    // New tasks: present in next but not prev
-    let new_tasks: Vec<&Task> = next
-        .tasks
-        .iter()
-        .filter(|(id, _)| !prev.tasks.contains_key(id.as_str()))
-        .map(|(_, t)| t)
-        .collect();
-
-    // Status changes: present in both, status differs
-    let status_changes: Vec<StatusChange> = next
-        .tasks
-        .iter()
-        .filter_map(|(id, next_task)| {
-            prev.tasks.get(id.as_str()).and_then(|prev_task| {
-                if prev_task.status != next_task.status {
-                    Some(StatusChange {
-                        task: next_task,
-                        prev_status: prev_task.status,
-                        next_status: next_task.status,
-                    })
-                } else {
-                    None
-                }
-            })
-        })
-        .collect();
-
-    // New comments: for each task in next, comments beyond what prev had
-    let new_comments: Vec<(&str, &TaskComment)> = next
-        .tasks
-        .iter()
-        .flat_map(|(id, next_task)| {
-            let prev_count = prev
-                .tasks
-                .get(id.as_str())
-                .map_or(0, |t| t.comments.len());
-            next_task.comments[prev_count.min(next_task.comments.len())..]
-                .iter()
-                .map(move |c| (id.as_str(), c))
-        })
-        .collect();
-
-    // New edges: edges in next not present in prev
-    let new_edges: Vec<(&str, &str, &str)> = next
-        .edges
-        .all_edges()
-        .filter(|(from, to, kind)| !prev.edges.has_link(from, to, kind))
-        .collect();
-
-    GraphDelta {
-        prev,
-        next,
-        new_tasks,
-        status_changes,
-        new_comments,
-        new_edges,
-    }
 }
 
 #[cfg(test)]
@@ -1035,6 +855,7 @@ mod tests {
             assignee: None,
             sources: Vec::new(),
             template: None,
+            working_copy: None,
             instructions: None,
             data: HashMap::new(),
             timestamp: Utc::now(),
@@ -1045,9 +866,7 @@ mod tests {
         TaskEvent::Closed {
             task_ids: vec![id.to_string()],
             outcome: crate::tasks::types::TaskOutcome::Done,
-            confidence: None,
             summary: None,
-            session_id: None,
             turn_id: None,
             timestamp: Utc::now(),
         }
@@ -1057,9 +876,7 @@ mod tests {
         TaskEvent::Closed {
             task_ids: vec![id.to_string()],
             outcome: crate::tasks::types::TaskOutcome::WontDo,
-            confidence: None,
             summary: None,
-            session_id: None,
             turn_id: None,
             timestamp: Utc::now(),
         }
@@ -1069,7 +886,6 @@ mod tests {
         TaskEvent::Stopped {
             task_ids: vec![id.to_string()],
             reason: Some("test stop".to_string()),
-            session_id: None,
             turn_id: None,
             timestamp: Utc::now(),
         }
@@ -1497,6 +1313,39 @@ mod tests {
     }
 
     #[test]
+    fn test_provenance_chain() {
+        let events = vec![
+            make_created("A", "Task A"),
+            make_created("B", "Task B"),
+            make_created("C", "Task C"),
+            make_link("B", "A", "sourced-from"),
+            make_link("C", "B", "sourced-from"),
+            make_link("B", "file:design.md", "sourced-from"),
+        ];
+
+        let graph = materialize_graph(&events);
+        let chain = graph.provenance_chain("C");
+        assert!(chain.contains(&"B".to_string()));
+        assert!(chain.contains(&"A".to_string()));
+        assert!(chain.contains(&"file:design.md".to_string()));
+    }
+
+    #[test]
+    fn test_spawned_from() {
+        let events = vec![
+            make_created("A", "Task A"),
+            make_created("B", "From A"),
+            make_created("C", "Also from A"),
+            make_link("B", "A", "sourced-from"),
+            make_link("C", "A", "sourced-from"),
+        ];
+
+        let graph = materialize_graph(&events);
+        let spawned = graph.spawned_from("A");
+        assert_eq!(spawned.len(), 2);
+    }
+
+    #[test]
     fn test_is_task_only_kind() {
         // Task-only blocking links (legacy + semantic)
         assert!(is_task_only_kind("blocked-by"));
@@ -1520,8 +1369,8 @@ mod tests {
 
     #[test]
     fn test_link_kinds_registry() {
-        // Verify all 15 kinds are registered
-        assert_eq!(LINK_KINDS.len(), 15);
+        // Verify all 13 kinds are registered
+        assert_eq!(LINK_KINDS.len(), 13);
 
         let blocked = find_link_kind("blocked-by").unwrap();
         assert!(blocked.blocks_ready);
@@ -1593,6 +1442,7 @@ mod tests {
             assignee: None,
             sources: vec!["file:design.md".to_string(), "task:task0".to_string()],
             template: None,
+            working_copy: None,
             instructions: None,
             data: HashMap::new(),
             timestamp: Utc::now(),
@@ -1623,6 +1473,7 @@ mod tests {
                 assignee: None,
                 sources: vec!["file:design.md".to_string()],
                 template: None,
+                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
@@ -1659,6 +1510,7 @@ mod tests {
             assignee: None,
             sources: Vec::new(),
             template: None,
+            working_copy: None,
             instructions: None,
             data,
             timestamp: Utc::now(),
@@ -1689,6 +1541,7 @@ mod tests {
             assignee: None,
             sources: Vec::new(),
             template: None,
+            working_copy: None,
             instructions: None,
             data,
             timestamp: Utc::now(),
@@ -1717,6 +1570,7 @@ mod tests {
             assignee: None,
             sources: Vec::new(),
             template: None,
+            working_copy: None,
             instructions: None,
             data,
             timestamp: Utc::now(),
@@ -1726,61 +1580,6 @@ mod tests {
         assert_eq!(
             graph.edges.target("build1", "orchestrates"),
             Some("epic_task_id")
-        );
-    }
-
-    #[test]
-    fn test_data_target_as_orchestrates() {
-        let mut data = HashMap::new();
-        data.insert("plan".to_string(), "feature.md".to_string());
-        data.insert("target".to_string(), "epic_task_id".to_string());
-
-        let events = vec![TaskEvent::Created {
-            task_id: "implement1".to_string(),
-            name: "Implement task".to_string(),
-            slug: None,
-            task_type: Some("orchestrator".to_string()),
-            priority: TaskPriority::P2,
-            assignee: None,
-            sources: Vec::new(),
-            template: None,
-            instructions: None,
-            data,
-            timestamp: Utc::now(),
-        }];
-
-        let graph = materialize_graph(&events);
-        assert_eq!(
-            graph.edges.target("implement1", "orchestrates"),
-            Some("epic_task_id")
-        );
-    }
-
-    #[test]
-    fn test_data_target_does_not_synthesize_implements_plan() {
-        let mut data = HashMap::new();
-        data.insert("plan".to_string(), "ops/now/feature.md".to_string());
-        data.insert("target".to_string(), "some_epic_id".to_string());
-
-        let events = vec![TaskEvent::Created {
-            task_id: "implement1".to_string(),
-            name: "Implement: ops/now/feature.md".to_string(),
-            slug: None,
-            task_type: Some("orchestrator".to_string()),
-            priority: TaskPriority::P2,
-            assignee: None,
-            sources: Vec::new(),
-            template: None,
-            instructions: None,
-            data,
-            timestamp: Utc::now(),
-        }];
-
-        let graph = materialize_graph(&events);
-        assert_eq!(
-            graph.edges.target("implement1", "implements-plan"),
-            None,
-            "data.plan with data.target should not synthesize implements-plan"
         );
     }
 
@@ -1800,6 +1599,7 @@ mod tests {
             assignee: None,
             sources: Vec::new(),
             template: None,
+            working_copy: None,
             instructions: None,
             data,
             timestamp: Utc::now(),
@@ -1831,6 +1631,7 @@ mod tests {
             assignee: None,
             sources: Vec::new(),
             template: None,
+            working_copy: None,
             instructions: None,
             data,
             timestamp: Utc::now(),
@@ -1846,11 +1647,11 @@ mod tests {
     }
 
     #[test]
-    fn test_subtask_links_must_be_explicit() {
+    fn test_backward_compat_dot_notation_as_subtask_of() {
         let events = vec![
             make_created("parent", "Parent task"),
             TaskEvent::Created {
-                task_id: "child-1".to_string(),
+                task_id: "parent.1".to_string(),
                 name: "First subtask".to_string(),
                 slug: None,
                 task_type: None,
@@ -1858,12 +1659,13 @@ mod tests {
                 assignee: None,
                 sources: Vec::new(),
                 template: None,
+                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
             },
             TaskEvent::Created {
-                task_id: "child-2".to_string(),
+                task_id: "parent.2".to_string(),
                 name: "Second subtask".to_string(),
                 slug: None,
                 task_type: None,
@@ -1871,6 +1673,7 @@ mod tests {
                 assignee: None,
                 sources: Vec::new(),
                 template: None,
+                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
@@ -1878,9 +1681,12 @@ mod tests {
         ];
 
         let graph = materialize_graph(&events);
-        assert_eq!(graph.edges.target("child-1", "subtask-of"), None);
-        assert_eq!(graph.edges.target("child-2", "subtask-of"), None);
-        assert!(graph.children_of("parent").is_empty());
+        // Children should have subtask-of links to parent
+        assert_eq!(graph.edges.target("parent.1", "subtask-of"), Some("parent"));
+        assert_eq!(graph.edges.target("parent.2", "subtask-of"), Some("parent"));
+        // Parent should see its children via reverse lookup
+        let children = graph.children_of("parent");
+        assert_eq!(children.len(), 2);
     }
 
     /// Regression: source filtering depends on `graph.edges.targets(id, "sourced-from")`.
@@ -1937,6 +1743,7 @@ mod tests {
                 assignee: None,
                 sources: vec!["file:plan.md".to_string()],
                 template: None,
+                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
@@ -2037,8 +1844,6 @@ mod tests {
                 agent_type: "claude-code".to_string(),
                 session_id: None,
                 turn_id: Some("turn-aaa-1".to_string()),
-                working_copy: None,
-                instructions: None,
                 timestamp: Utc::now(),
             },
         ];
@@ -2059,14 +1864,11 @@ mod tests {
                 agent_type: "claude-code".to_string(),
                 session_id: None,
                 turn_id: Some("turn-aaa-1".to_string()),
-                working_copy: None,
-                instructions: None,
                 timestamp: Utc::now(),
             },
             TaskEvent::Stopped {
                 task_ids: vec!["t1".to_string()],
                 reason: None,
-                session_id: None,
                 turn_id: Some("turn-aaa-2".to_string()),
                 timestamp: Utc::now(),
             },
@@ -2087,16 +1889,12 @@ mod tests {
                 agent_type: "claude-code".to_string(),
                 session_id: None,
                 turn_id: Some("turn-aaa-1".to_string()),
-                working_copy: None,
-                instructions: None,
                 timestamp: Utc::now(),
             },
             TaskEvent::Closed {
                 task_ids: vec!["t1".to_string()],
                 outcome: crate::tasks::types::TaskOutcome::Done,
-                confidence: None,
                 summary: None,
-                session_id: None,
                 turn_id: Some("turn-aaa-3".to_string()),
                 timestamp: Utc::now(),
             },
@@ -2117,14 +1915,11 @@ mod tests {
                 agent_type: "claude-code".to_string(),
                 session_id: None,
                 turn_id: Some("turn-aaa-1".to_string()),
-                working_copy: None,
-                instructions: None,
                 timestamp: Utc::now(),
             },
             TaskEvent::Stopped {
                 task_ids: vec!["t1".to_string()],
                 reason: None,
-                session_id: None,
                 turn_id: Some("turn-aaa-2".to_string()),
                 timestamp: Utc::now(),
             },
@@ -2133,8 +1928,6 @@ mod tests {
                 agent_type: "claude-code".to_string(),
                 session_id: None,
                 turn_id: Some("turn-bbb-1".to_string()),
-                working_copy: None,
-                instructions: None,
                 timestamp: Utc::now(),
             },
         ];
@@ -2155,8 +1948,6 @@ mod tests {
                 agent_type: "claude-code".to_string(),
                 session_id: None,
                 turn_id: None,
-                working_copy: None,
-                instructions: None,
                 timestamp: Utc::now(),
             },
         ];
@@ -2167,11 +1958,12 @@ mod tests {
     }
 
     #[test]
-    fn test_slug_index_linked_subtask() {
+    fn test_slug_index_dot_notation() {
+        // Dot-notation subtask with slug should be indexed
         let events = vec![
             make_created("parent", "Parent"),
             TaskEvent::Created {
-                task_id: "child-build".to_string(),
+                task_id: "parent.1".to_string(),
                 name: "Build step".to_string(),
                 slug: Some("build".to_string()),
                 task_type: None,
@@ -2179,22 +1971,22 @@ mod tests {
                 assignee: None,
                 sources: Vec::new(),
                 template: None,
+                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
             },
-            make_link("child-build", "parent", "subtask-of"),
         ];
 
         let graph = materialize_graph(&events);
         let found = graph.find_by_slug("parent", "build");
         assert!(found.is_some(), "Should find subtask by slug");
-        assert_eq!(found.unwrap().id, "child-build");
+        assert_eq!(found.unwrap().id, "parent.1");
     }
 
     #[test]
     fn test_slug_index_link_added() {
-        // Subtask linked via LinkAdded should be indexed.
+        // Subtask linked via LinkAdded (not dot-notation) should also be indexed
         let events = vec![
             make_created("parent", "Parent"),
             TaskEvent::Created {
@@ -2206,6 +1998,7 @@ mod tests {
                 assignee: None,
                 sources: Vec::new(),
                 template: None,
+                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
@@ -2224,8 +2017,7 @@ mod tests {
         // Subtask without slug should not appear in slug_index
         let events = vec![
             make_created("parent", "Parent"),
-            make_created("child-no-slug", "No slug subtask"),
-            make_link("child-no-slug", "parent", "subtask-of"),
+            make_created("parent.1", "No slug subtask"),
         ];
 
         let graph = materialize_graph(&events);
@@ -2238,7 +2030,7 @@ mod tests {
         let events = vec![
             make_created("parent", "Parent"),
             TaskEvent::Created {
-                task_id: "child-build".to_string(),
+                task_id: "parent.1".to_string(),
                 name: "Build".to_string(),
                 slug: Some("build".to_string()),
                 task_type: None,
@@ -2246,13 +2038,13 @@ mod tests {
                 assignee: None,
                 sources: Vec::new(),
                 template: None,
+                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
             },
-            make_link("child-build", "parent", "subtask-of"),
             TaskEvent::Created {
-                task_id: "child-test".to_string(),
+                task_id: "parent.2".to_string(),
                 name: "Test".to_string(),
                 slug: Some("test".to_string()),
                 task_type: None,
@@ -2260,23 +2052,17 @@ mod tests {
                 assignee: None,
                 sources: Vec::new(),
                 template: None,
+                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
             },
-            make_link("child-test", "parent", "subtask-of"),
         ];
 
         let graph = materialize_graph(&events);
         assert_eq!(graph.slug_index.len(), 2);
-        assert_eq!(
-            graph.find_by_slug("parent", "build").unwrap().id,
-            "child-build"
-        );
-        assert_eq!(
-            graph.find_by_slug("parent", "test").unwrap().id,
-            "child-test"
-        );
+        assert_eq!(graph.find_by_slug("parent", "build").unwrap().id, "parent.1");
+        assert_eq!(graph.find_by_slug("parent", "test").unwrap().id, "parent.2");
     }
 
     #[test]
@@ -2286,7 +2072,7 @@ mod tests {
             make_created("p1", "Parent 1"),
             make_created("p2", "Parent 2"),
             TaskEvent::Created {
-                task_id: "p1-child".to_string(),
+                task_id: "p1.1".to_string(),
                 name: "Build for P1".to_string(),
                 slug: Some("build".to_string()),
                 task_type: None,
@@ -2294,13 +2080,13 @@ mod tests {
                 assignee: None,
                 sources: Vec::new(),
                 template: None,
+                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
             },
-            make_link("p1-child", "p1", "subtask-of"),
             TaskEvent::Created {
-                task_id: "p2-child".to_string(),
+                task_id: "p2.1".to_string(),
                 name: "Build for P2".to_string(),
                 slug: Some("build".to_string()),
                 task_type: None,
@@ -2308,16 +2094,16 @@ mod tests {
                 assignee: None,
                 sources: Vec::new(),
                 template: None,
+                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
             },
-            make_link("p2-child", "p2", "subtask-of"),
         ];
 
         let graph = materialize_graph(&events);
-        assert_eq!(graph.find_by_slug("p1", "build").unwrap().id, "p1-child");
-        assert_eq!(graph.find_by_slug("p2", "build").unwrap().id, "p2-child");
+        assert_eq!(graph.find_by_slug("p1", "build").unwrap().id, "p1.1");
+        assert_eq!(graph.find_by_slug("p2", "build").unwrap().id, "p2.1");
     }
 
     #[test]
@@ -2325,7 +2111,7 @@ mod tests {
         let events = vec![
             make_created("parent", "Parent"),
             TaskEvent::Created {
-                task_id: "child-build".to_string(),
+                task_id: "parent.1".to_string(),
                 name: "Build step".to_string(),
                 slug: Some("build".to_string()),
                 task_type: None,
@@ -2333,25 +2119,19 @@ mod tests {
                 assignee: None,
                 sources: Vec::new(),
                 template: None,
+                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
             },
-            make_link("child-build", "parent", "subtask-of"),
         ];
 
         let graph = materialize_graph(&events);
         // Same slug under same parent should fail
         let err = validate_slug_unique(&graph, "parent", "build").unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.contains("build"),
-            "Error should mention the slug: {msg}"
-        );
-        assert!(
-            msg.contains("parent"),
-            "Error should mention the parent: {msg}"
-        );
+        assert!(msg.contains("build"), "Error should mention the slug: {msg}");
+        assert!(msg.contains("parent"), "Error should mention the parent: {msg}");
     }
 
     #[test]
@@ -2360,7 +2140,7 @@ mod tests {
             make_created("p1", "Parent 1"),
             make_created("p2", "Parent 2"),
             TaskEvent::Created {
-                task_id: "p1-child".to_string(),
+                task_id: "p1.1".to_string(),
                 name: "Build for P1".to_string(),
                 slug: Some("build".to_string()),
                 task_type: None,
@@ -2368,11 +2148,11 @@ mod tests {
                 assignee: None,
                 sources: Vec::new(),
                 template: None,
+                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
             },
-            make_link("p1-child", "p1", "subtask-of"),
         ];
 
         let graph = materialize_graph(&events);
@@ -2385,7 +2165,7 @@ mod tests {
         let events = vec![
             make_created("parent", "Parent"),
             TaskEvent::Created {
-                task_id: "child-build".to_string(),
+                task_id: "parent.1".to_string(),
                 name: "Build step".to_string(),
                 slug: Some("build".to_string()),
                 task_type: None,
@@ -2393,11 +2173,11 @@ mod tests {
                 assignee: None,
                 sources: Vec::new(),
                 template: None,
+                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
             },
-            make_link("child-build", "parent", "subtask-of"),
         ];
 
         let graph = materialize_graph(&events);
@@ -2419,6 +2199,7 @@ mod tests {
                 assignee: None,
                 sources: Vec::new(),
                 template: None,
+                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
@@ -2669,10 +2450,7 @@ mod tests {
         ];
         let graph = materialize_graph(&events);
         let candidates = graph.find_autorun_candidates("A");
-        assert!(
-            candidates.is_empty(),
-            "Already-closed tasks should not auto-start"
-        );
+        assert!(candidates.is_empty(), "Already-closed tasks should not auto-start");
     }
 
     #[test]
@@ -2687,18 +2465,13 @@ mod tests {
                 agent_type: "test".to_string(),
                 session_id: None,
                 turn_id: None,
-                working_copy: None,
-                instructions: None,
                 timestamp: Utc::now(),
             },
             make_closed("A"),
         ];
         let graph = materialize_graph(&events);
         let candidates = graph.find_autorun_candidates("A");
-        assert!(
-            candidates.is_empty(),
-            "In-progress tasks should not auto-start"
-        );
+        assert!(candidates.is_empty(), "In-progress tasks should not auto-start");
     }
 
     #[test]
@@ -2713,8 +2486,6 @@ mod tests {
                 agent_type: "test".to_string(),
                 session_id: None,
                 turn_id: None,
-                working_copy: None,
-                instructions: None,
                 timestamp: Utc::now(),
             },
             make_stopped("B"),
@@ -2756,10 +2527,7 @@ mod tests {
         ];
         let graph = materialize_graph(&events);
         let candidates = graph.find_autorun_candidates("A");
-        assert!(
-            candidates.is_empty(),
-            "Non-blocking kinds should not trigger autorun"
-        );
+        assert!(candidates.is_empty(), "Non-blocking kinds should not trigger autorun");
     }
 
     #[test]
@@ -2822,445 +2590,6 @@ mod tests {
         ];
         let graph = materialize_graph(&events);
         let candidates = graph.find_autorun_candidates("A");
-        assert!(
-            candidates.is_empty(),
-            "Removed link should not trigger autorun"
-        );
-    }
-
-    // --- needs-context link tests ---
-
-    #[test]
-    fn test_needs_context_link_kind_exists() {
-        let kind = LINK_KINDS.iter().find(|k| k.name == "needs-context");
-        assert!(kind.is_some(), "needs-context should exist in LINK_KINDS");
-        let kind = kind.unwrap();
-        assert_eq!(kind.max_forward, Some(1), "Linear chains: max 1 forward");
-        assert_eq!(kind.max_reverse, Some(1), "Linear chains: max 1 reverse");
-        assert!(kind.blocks_ready, "needs-context should block ready queue");
-        assert!(kind.task_only, "needs-context should be task-only");
-    }
-
-    #[test]
-    fn test_needs_context_blocks_ready() {
-        // B needs-context A → B is blocked while A is open
-        let events = vec![
-            make_created("A", "Explore"),
-            make_created("B", "Plan"),
-            make_link("B", "A", "needs-context"),
-        ];
-        let graph = materialize_graph(&events);
-        assert!(graph.is_blocked("B"), "B should be blocked when A is open");
-        assert!(!graph.is_blocked("A"), "A should not be blocked");
-    }
-
-    #[test]
-    fn test_needs_context_unblocks_on_done() {
-        // B needs-context A → B unblocks when A is Closed(Done)
-        let events = vec![
-            make_created("A", "Explore"),
-            make_created("B", "Plan"),
-            make_link("B", "A", "needs-context"),
-            make_closed("A"),
-        ];
-        let graph = materialize_graph(&events);
-        assert!(
-            !graph.is_blocked("B"),
-            "B should unblock when A is Closed(Done)"
-        );
-    }
-
-    #[test]
-    fn test_needs_context_stays_blocked_on_wont_do() {
-        // needs-context is in DONE_ONLY_UNBLOCK — WontDo should NOT unblock
-        let events = vec![
-            make_created("A", "Explore"),
-            make_created("B", "Plan"),
-            make_link("B", "A", "needs-context"),
-            make_closed_wont_do("A"),
-        ];
-        let graph = materialize_graph(&events);
-        assert!(
-            graph.is_blocked("B"),
-            "B should stay blocked when A is Closed(WontDo)"
-        );
-    }
-
-    #[test]
-    fn test_needs_context_stays_blocked_on_stopped() {
-        // needs-context is in DONE_ONLY_UNBLOCK — Stopped should NOT unblock
-        let events = vec![
-            make_created("A", "Explore"),
-            make_created("B", "Plan"),
-            make_link("B", "A", "needs-context"),
-            make_stopped("A"),
-        ];
-        let graph = materialize_graph(&events);
-        assert!(
-            graph.is_blocked("B"),
-            "B should stay blocked when A is Stopped"
-        );
-    }
-
-    #[test]
-    fn test_get_needs_context_chain_linear() {
-        // A → B → C chain
-        let events = vec![
-            make_created("A", "Explore"),
-            make_created("B", "Plan"),
-            make_created("C", "Implement"),
-            make_link("B", "A", "needs-context"),
-            make_link("C", "B", "needs-context"),
-        ];
-        let graph = materialize_graph(&events);
-
-        // From any task in the chain, should get [A, B, C]
-        assert_eq!(graph.get_needs_context_chain("A"), vec!["A", "B", "C"]);
-        assert_eq!(graph.get_needs_context_chain("B"), vec!["A", "B", "C"]);
-        assert_eq!(graph.get_needs_context_chain("C"), vec!["A", "B", "C"]);
-    }
-
-    #[test]
-    fn test_get_needs_context_chain_single_task() {
-        // Task with no needs-context links returns just itself
-        let events = vec![make_created("A", "Standalone")];
-        let graph = materialize_graph(&events);
-        assert_eq!(graph.get_needs_context_chain("A"), vec!["A"]);
-    }
-
-    #[test]
-    fn test_get_needs_context_chain_pair() {
-        // A → B (two-task chain)
-        let events = vec![
-            make_created("A", "Explore"),
-            make_created("B", "Plan"),
-            make_link("B", "A", "needs-context"),
-        ];
-        let graph = materialize_graph(&events);
-        assert_eq!(graph.get_needs_context_chain("A"), vec!["A", "B"]);
-        assert_eq!(graph.get_needs_context_chain("B"), vec!["A", "B"]);
-    }
-
-    #[test]
-    fn test_is_needs_context_head_true() {
-        // A → B → C: A is the head
-        let events = vec![
-            make_created("A", "Explore"),
-            make_created("B", "Plan"),
-            make_created("C", "Implement"),
-            make_link("B", "A", "needs-context"),
-            make_link("C", "B", "needs-context"),
-        ];
-        let graph = materialize_graph(&events);
-        assert!(
-            graph.is_needs_context_head("A"),
-            "A should be head of chain"
-        );
-    }
-
-    #[test]
-    fn test_is_needs_context_head_false_middle() {
-        // A → B → C: B is in the middle, not a head
-        let events = vec![
-            make_created("A", "Explore"),
-            make_created("B", "Plan"),
-            make_created("C", "Implement"),
-            make_link("B", "A", "needs-context"),
-            make_link("C", "B", "needs-context"),
-        ];
-        let graph = materialize_graph(&events);
-        assert!(
-            !graph.is_needs_context_head("B"),
-            "B (middle) should not be head"
-        );
-        assert!(
-            !graph.is_needs_context_head("C"),
-            "C (tail) should not be head"
-        );
-    }
-
-    #[test]
-    fn test_is_needs_context_head_false_standalone() {
-        // Task with no needs-context links is not a head
-        let events = vec![make_created("A", "Standalone")];
-        let graph = materialize_graph(&events);
-        assert!(
-            !graph.is_needs_context_head("A"),
-            "Standalone task should not be head"
-        );
-    }
-
-    #[test]
-    fn test_needs_context_in_find_autorun_candidates() {
-        // B needs-context A with autorun. A closed → B should be a candidate.
-        let events = vec![
-            make_created("A", "Explore"),
-            make_created("B", "Plan"),
-            make_autorun_link("B", "A", "needs-context"),
-            make_closed("A"),
-        ];
-        let graph = materialize_graph(&events);
-        let candidates = graph.find_autorun_candidates("A");
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0], "B");
-    }
-
-    // --- Reserved / Released lifecycle tests ---
-
-    fn make_reserved(ids: &[&str]) -> TaskEvent {
-        TaskEvent::Reserved {
-            task_ids: ids.iter().map(|s| s.to_string()).collect(),
-            agent_type: "claude-code".to_string(),
-            timestamp: Utc::now(),
-        }
-    }
-
-    fn make_released(ids: &[&str], reason: Option<&str>) -> TaskEvent {
-        TaskEvent::Released {
-            task_ids: ids.iter().map(|s| s.to_string()).collect(),
-            reason: reason.map(|s| s.to_string()),
-            timestamp: Utc::now(),
-        }
-    }
-
-    fn make_started(id: &str) -> TaskEvent {
-        TaskEvent::Started {
-            task_ids: vec![id.to_string()],
-            agent_type: "claude-code".to_string(),
-            session_id: None,
-            turn_id: None,
-            working_copy: None,
-            instructions: None,
-            timestamp: Utc::now(),
-        }
-    }
-
-    #[test]
-    fn test_reserved_event_transitions_open_to_reserved() {
-        let events = vec![make_created("A", "Task A"), make_reserved(&["A"])];
-        let graph = materialize_graph(&events);
-        let task = graph.tasks.get("A").unwrap();
-        assert_eq!(task.status, TaskStatus::Reserved);
-    }
-
-    #[test]
-    fn test_released_event_transitions_reserved_to_open() {
-        let events = vec![
-            make_created("A", "Task A"),
-            make_reserved(&["A"]),
-            make_released(&["A"], None),
-        ];
-        let graph = materialize_graph(&events);
-        let task = graph.tasks.get("A").unwrap();
-        assert_eq!(task.status, TaskStatus::Open);
-    }
-
-    #[test]
-    fn test_started_event_transitions_reserved_to_in_progress() {
-        let events = vec![
-            make_created("A", "Task A"),
-            make_reserved(&["A"]),
-            make_started("A"),
-        ];
-        let graph = materialize_graph(&events);
-        let task = graph.tasks.get("A").unwrap();
-        assert_eq!(task.status, TaskStatus::InProgress);
-    }
-
-    #[test]
-    fn test_reserved_event_on_non_open_task_is_skipped() {
-        // Task is InProgress — Reserved event should be skipped (guard warns)
-        // Use 6+ char IDs because the guard does &task_id[..6]
-        let events = vec![
-            make_created("task_alpha", "Task Alpha"),
-            make_started("task_alpha"),
-            make_reserved(&["task_alpha"]),
-        ];
-        let graph = materialize_graph(&events);
-        let task = graph.tasks.get("task_alpha").unwrap();
-        // Should remain InProgress (Reserved was skipped)
-        assert_eq!(task.status, TaskStatus::InProgress);
-    }
-
-    #[test]
-    fn test_released_event_on_non_reserved_task_is_skipped() {
-        // Task is Open — Released event should be skipped (guard warns)
-        // Use 6+ char IDs because the guard does &task_id[..6]
-        let events = vec![
-            make_created("task_beta", "Task Beta"),
-            make_released(&["task_beta"], Some("spurious release")),
-        ];
-        let graph = materialize_graph(&events);
-        let task = graph.tasks.get("task_beta").unwrap();
-        // Should remain Open (Released was skipped)
-        assert_eq!(task.status, TaskStatus::Open);
-    }
-
-    #[test]
-    fn test_reserved_batch_multiple_tasks() {
-        let events = vec![
-            make_created("A", "Task A"),
-            make_created("B", "Task B"),
-            make_reserved(&["A", "B"]),
-        ];
-        let graph = materialize_graph(&events);
-        assert_eq!(graph.tasks.get("A").unwrap().status, TaskStatus::Reserved);
-        assert_eq!(graph.tasks.get("B").unwrap().status, TaskStatus::Reserved);
-    }
-
-    #[test]
-    fn test_released_with_reason_transitions_reserved_to_open() {
-        let events = vec![
-            make_created("A", "Task A"),
-            make_reserved(&["A"]),
-            make_released(&["A"], Some("Spawn failed, rolling back claim")),
-        ];
-        let graph = materialize_graph(&events);
-        let task = graph.tasks.get("A").unwrap();
-        assert_eq!(task.status, TaskStatus::Open);
-    }
-
-    #[test]
-    fn test_reserve_release_reserve_cycle() {
-        // Full cycle: Open → Reserved → Open → Reserved
-        let events = vec![
-            make_created("A", "Task A"),
-            make_reserved(&["A"]),
-            make_released(&["A"], None),
-            make_reserved(&["A"]),
-        ];
-        let graph = materialize_graph(&events);
-        let task = graph.tasks.get("A").unwrap();
-        assert_eq!(task.status, TaskStatus::Reserved);
-    }
-
-    // --- Autostart regression: Reserved status in find_autorun_candidates ---
-
-    #[test]
-    fn test_find_autorun_candidates_skips_reserved_tasks() {
-        // B validates A with autorun. B is Reserved. find_autorun_candidates should
-        // include Reserved tasks (they are eligible for auto-start, like Open/Stopped).
-        // NOTE: Currently find_autorun_candidates only allows Open/Stopped, which means
-        // Reserved tasks are skipped. This test documents that behavior so any change
-        // to include Reserved is a deliberate decision, not an accident.
-        let events = vec![
-            make_created("A", "Implementation"),
-            make_created("B", "Review"),
-            make_autorun_link("B", "A", "validates"),
-            make_reserved(&["B"]),
-            make_closed("A"),
-        ];
-        let graph = materialize_graph(&events);
-        let candidates = graph.find_autorun_candidates("A");
-        // Reserved tasks are currently NOT returned by find_autorun_candidates.
-        // The outer run_close code accepts Reserved for spawn autorun (line 3174)
-        // but this graph method skips them. If Reserved should be eligible,
-        // update this assertion and the filter in find_autorun_candidates.
-        assert!(
-            candidates.is_empty(),
-            "Reserved tasks are currently skipped by find_autorun_candidates. \
-             If this starts failing, it means Reserved was intentionally added — update this test."
-        );
-    }
-
-    // --- GraphDelta / compute_delta ---
-
-    #[test]
-    fn test_compute_delta_all_categories() {
-        // Build "prev" graph: task A (Open), task B (Open) with 1 comment, edge A→B subtask-of
-        let prev_events = vec![
-            make_created("A", "Task A"),
-            make_created("B", "Task B"),
-            make_link("A", "B", "subtask-of"),
-            TaskEvent::CommentAdded {
-                task_ids: vec!["B".to_string()],
-                text: "first comment".to_string(),
-                data: HashMap::new(),
-                timestamp: Utc::now(),
-            },
-        ];
-        let prev = materialize_graph(&prev_events);
-
-        // Build "next" graph: task A (Started), B (Open) with 2 comments,
-        // new task C, new edge B→C blocked-by
-        let next_events = vec![
-            make_created("A", "Task A"),
-            make_created("B", "Task B"),
-            make_created("C", "Task C"),
-            make_link("A", "B", "subtask-of"),
-            make_link("B", "C", "blocked-by"),
-            make_started("A"),
-            TaskEvent::CommentAdded {
-                task_ids: vec!["B".to_string()],
-                text: "first comment".to_string(),
-                data: HashMap::new(),
-                timestamp: Utc::now(),
-            },
-            TaskEvent::CommentAdded {
-                task_ids: vec!["B".to_string()],
-                text: "second comment".to_string(),
-                data: HashMap::new(),
-                timestamp: Utc::now(),
-            },
-        ];
-        let next = materialize_graph(&next_events);
-
-        let delta = compute_delta(&prev, &next);
-
-        // New tasks: only C
-        assert_eq!(delta.new_tasks.len(), 1);
-        assert_eq!(delta.new_tasks[0].id, "C");
-
-        // Status changes: A went Open→InProgress
-        assert_eq!(delta.status_changes.len(), 1);
-        assert_eq!(delta.status_changes[0].task.id, "A");
-        assert_eq!(delta.status_changes[0].prev_status, TaskStatus::Open);
-        assert_eq!(delta.status_changes[0].next_status, TaskStatus::InProgress);
-
-        // New comments: one new comment on B (the second one)
-        assert_eq!(delta.new_comments.len(), 1);
-        assert_eq!(delta.new_comments[0].0, "B");
-        assert_eq!(delta.new_comments[0].1.text, "second comment");
-
-        // New edges: B→C blocked-by (subtask-of already existed)
-        assert_eq!(delta.new_edges.len(), 1);
-        let (from, to, kind) = delta.new_edges[0];
-        assert_eq!(from, "B");
-        assert_eq!(to, "C");
-        assert_eq!(kind, "blocked-by");
-    }
-
-    #[test]
-    fn test_compute_delta_empty_graphs() {
-        let prev = materialize_graph(&[]);
-        let next = materialize_graph(&[]);
-        let delta = compute_delta(&prev, &next);
-
-        assert!(delta.new_tasks.is_empty());
-        assert!(delta.status_changes.is_empty());
-        assert!(delta.new_comments.is_empty());
-        assert!(delta.new_edges.is_empty());
-    }
-
-    #[test]
-    fn test_compute_delta_new_task_comments_included() {
-        // Comments on a brand-new task should appear in new_comments
-        let prev = materialize_graph(&[]);
-        let next_events = vec![
-            make_created("X", "New task"),
-            TaskEvent::CommentAdded {
-                task_ids: vec!["X".to_string()],
-                text: "hello".to_string(),
-                data: HashMap::new(),
-                timestamp: Utc::now(),
-            },
-        ];
-        let next = materialize_graph(&next_events);
-        let delta = compute_delta(&prev, &next);
-
-        assert_eq!(delta.new_tasks.len(), 1);
-        // prev has 0 comments for X (task doesn't exist), so all comments are new
-        assert_eq!(delta.new_comments.len(), 1);
-        assert_eq!(delta.new_comments[0].1.text, "hello");
+        assert!(candidates.is_empty(), "Removed link should not trigger autorun");
     }
 }

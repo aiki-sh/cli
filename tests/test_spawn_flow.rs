@@ -10,6 +10,7 @@
 /// 7. Spawned-by link in show output
 /// 8. Idempotency (re-close doesn't duplicate)
 /// 9. {{spawner.approved}} defaults to "false" when parent lacks approved data
+
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use std::process::Command;
@@ -78,10 +79,7 @@ fn aiki_task_output(path: &std::path::Path, args: &[&str]) -> String {
 fn extract_short_id(output: &str) -> String {
     for line in output.lines() {
         if let Some(rest) = line.strip_prefix("Added ") {
-            let id: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_lowercase())
-                .collect();
+            let id: String = rest.chars().take_while(|c| c.is_ascii_lowercase()).collect();
             return id;
         }
     }
@@ -106,7 +104,7 @@ fn test_spawn_on_close_basic() {
     init_aiki_repo(temp_dir.path());
 
     // Create a simple template for spawning
-    let templates_dir = temp_dir.path().join(".aiki/tasks");
+    let templates_dir = temp_dir.path().join(".aiki/templates");
     create_template(
         &templates_dir,
         "test",
@@ -140,9 +138,7 @@ This task spawns another on close.
     aiki_task(temp_dir.path(), &["start", &spawner_id]).success();
     aiki_task(temp_dir.path(), &["close", "--summary", "Done"])
         .success()
-        .stdout(predicate::str::contains(
-            "Spawned task from template test/spawned-task",
-        ));
+        .stdout(predicate::str::contains("Spawned task from template test/spawned-task"));
 }
 
 #[test]
@@ -150,7 +146,7 @@ fn test_spawn_condition_false_no_spawn() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    let templates_dir = temp_dir.path().join(".aiki/tasks");
+    let templates_dir = temp_dir.path().join(".aiki/templates");
     create_template(
         &templates_dir,
         "test",
@@ -191,7 +187,7 @@ fn test_spawn_condition_not_approved() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    let templates_dir = temp_dir.path().join(".aiki/tasks");
+    let templates_dir = temp_dir.path().join(".aiki/templates");
     create_template(
         &templates_dir,
         "test",
@@ -206,7 +202,7 @@ fn test_spawn_condition_not_approved() {
         r#"---
 version: 1.0.0
 spawns:
-  - when: not data.approved
+  - when: not approved
     task:
       template: test/fix
 ---
@@ -219,22 +215,14 @@ Review and set approved.
     // Create task and set approved=false
     let output = aiki_task_output(
         temp_dir.path(),
-        &[
-            "add",
-            "--template",
-            "test/review",
-            "--data",
-            "approved=false",
-        ],
+        &["add", "--template", "test/review", "--data", "approved=false"],
     );
     let task_id = extract_short_id(&output);
 
     aiki_task(temp_dir.path(), &["start", &task_id]).success();
     aiki_task(temp_dir.path(), &["close", "--summary", "Found issues"])
         .success()
-        .stdout(predicate::str::contains(
-            "Spawned task from template test/fix",
-        ));
+        .stdout(predicate::str::contains("Spawned task from template test/fix"));
 }
 
 #[test]
@@ -242,7 +230,7 @@ fn test_spawn_approved_no_spawn() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    let templates_dir = temp_dir.path().join(".aiki/tasks");
+    let templates_dir = temp_dir.path().join(".aiki/templates");
     create_template(
         &templates_dir,
         "test",
@@ -257,7 +245,7 @@ fn test_spawn_approved_no_spawn() {
         r#"---
 version: 1.0.0
 spawns:
-  - when: not data.approved
+  - when: not approved
     task:
       template: test/fix
 ---
@@ -270,13 +258,7 @@ Review and set approved.
     // Create task with approved=true
     let output = aiki_task_output(
         temp_dir.path(),
-        &[
-            "add",
-            "--template",
-            "test/review",
-            "--data",
-            "approved=true",
-        ],
+        &["add", "--template", "test/review", "--data", "approved=true"],
     );
     let task_id = extract_short_id(&output);
 
@@ -293,7 +275,7 @@ fn test_spawn_shows_spawned_by_link() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    let templates_dir = temp_dir.path().join(".aiki/tasks");
+    let templates_dir = temp_dir.path().join(".aiki/templates");
     create_template(
         &templates_dir,
         "test",
@@ -335,7 +317,7 @@ fn test_spawn_subtask_creates_child() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    let templates_dir = temp_dir.path().join(".aiki/tasks");
+    let templates_dir = temp_dir.path().join(".aiki/templates");
     create_template(
         &templates_dir,
         "test",
@@ -390,7 +372,7 @@ fn test_spawn_subtask_precedence_over_task() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    let templates_dir = temp_dir.path().join(".aiki/tasks");
+    let templates_dir = temp_dir.path().join(".aiki/templates");
     create_template(
         &templates_dir,
         "test",
@@ -439,7 +421,9 @@ Has both task and subtask spawns.
         .stdout(predicate::str::contains(
             "Spawned subtask from template test/child",
         ))
-        .stdout(predicate::str::contains("Spawned task from template test/standalone").not());
+        .stdout(
+            predicate::str::contains("Spawned task from template test/standalone").not(),
+        );
 }
 
 #[test]
@@ -447,7 +431,7 @@ fn test_spawn_priority_inheritance() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    let templates_dir = temp_dir.path().join(".aiki/tasks");
+    let templates_dir = temp_dir.path().join(".aiki/templates");
     create_template(
         &templates_dir,
         "test",
@@ -473,7 +457,10 @@ Spawns a task that should inherit p1 priority.
 "#,
     );
 
-    let output = aiki_task_output(temp_dir.path(), &["add", "--template", "test/p1-spawner"]);
+    let output = aiki_task_output(
+        temp_dir.path(),
+        &["add", "--template", "test/p1-spawner"],
+    );
     let task_id = extract_short_id(&output);
 
     aiki_task(temp_dir.path(), &["start", &task_id]).success();
@@ -494,7 +481,7 @@ fn test_spawn_wont_do_no_spawn() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    let templates_dir = temp_dir.path().join(".aiki/tasks");
+    let templates_dir = temp_dir.path().join(".aiki/templates");
     create_template(
         &templates_dir,
         "test",
@@ -541,7 +528,7 @@ fn test_spawn_approved_defaults_false_in_template_substitution() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    let templates_dir = temp_dir.path().join(".aiki/tasks");
+    let templates_dir = temp_dir.path().join(".aiki/templates");
 
     // Spawned task template that uses {{spawner.approved}} in its body
     create_template(
@@ -600,11 +587,7 @@ This spawner has no approved field in its data.
         .find(|word| word.chars().all(|c| c.is_ascii_lowercase()) && word.len() >= 7)
         .expect("Should find short task ID in line")
         .to_string();
-    assert!(
-        !fix_id.is_empty(),
-        "Should extract fix task ID from: {}",
-        fix_line
-    );
+    assert!(!fix_id.is_empty(), "Should extract fix task ID from: {}", fix_line);
 
     let show_output = aiki_task_output(temp_dir.path(), &["show", &fix_id, "--with-instructions"]);
     assert!(

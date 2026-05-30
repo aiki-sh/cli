@@ -6,20 +6,29 @@
 //! - Shows build/epic status via the `show` subcommand
 //! - Supports async (background) execution
 
+use std::collections::HashMap;
 use std::env;
+use std::io::IsTerminal;
 use std::path::Path;
 
 use clap::Subcommand;
 
 use super::OutputFormat;
+use super::epic::find_or_create_epic;
+use crate::agents::AgentType;
+use crate::config::get_aiki_binary_path;
 use crate::error::{AikiError, Result};
-use crate::plans::PlanGraph;
-use crate::tasks::{materialize_graph, read_events, Task};
-use crate::workflow::build::{self, BuildOpts};
+use crate::plans::{parse_plan_metadata, PlanGraph};
+use crate::tasks::id::{is_task_id, is_task_id_prefix};
+use crate::tasks::runner::{task_run, task_run_async, TaskRunOptions};
+use crate::tasks::md::MdBuilder;
+use crate::tasks::{
+    find_task, get_subtasks, materialize_graph, read_events, write_event, Task,
+    TaskEvent, TaskOutcome, TaskStatus,
+};
 
 /// Build subcommands
 #[derive(Subcommand)]
-#[command(disable_help_subcommand = true)]
 pub enum BuildSubcommands {
     /// Show build/epic status for a plan
     Show {
@@ -46,124 +55,341 @@ pub struct BuildArgs {
     #[arg(long)]
     pub restart: bool,
 
-    /// Custom decompose template (default: decompose)
-    #[arg(long = "decompose-template")]
-    pub decompose_template: Option<String>,
-
-    /// Custom loop template (default: loop)
-    #[arg(long = "loop-template")]
-    pub loop_template: Option<String>,
+    /// Build template to use (default: aiki/build)
+    #[arg(long)]
+    pub template: Option<String>,
 
     /// Agent for build orchestration (default: claude-code)
     #[arg(long)]
     pub agent: Option<String>,
-
-    /// Shorthand for --agent claude-code
-    #[arg(long, group = "agent_shorthand", conflicts_with = "agent")]
-    pub claude: bool,
-    /// Shorthand for --agent codex
-    #[arg(long, group = "agent_shorthand", conflicts_with = "agent")]
-    pub codex: bool,
-    /// Shorthand for --agent cursor
-    #[arg(long, group = "agent_shorthand", conflicts_with = "agent")]
-    pub cursor: bool,
-    /// Shorthand for --agent gemini
-    #[arg(long, group = "agent_shorthand", conflicts_with = "agent")]
-    pub gemini: bool,
-
-    /// Run review after build
-    #[arg(long, short = 'r')]
-    pub review: bool,
-
-    /// Run review after build with custom template (implies --review)
-    #[arg(long = "review-template")]
-    pub review_template: Option<String>,
-
-    /// Run review+fix after build (implies --review)
-    #[arg(long, short = 'f')]
-    pub fix: bool,
-
-    /// Run review+fix after build with custom fix plan template (implies --fix)
-    #[arg(long = "fix-template")]
-    pub fix_template: Option<String>,
-
-    /// Agent for coding/fixing tasks (default: claude-code)
-    #[arg(long)]
-    pub coder: Option<String>,
-
-    /// Agent for review tasks (default: opposite of coder)
-    #[arg(long)]
-    pub reviewer: Option<String>,
-
-    /// Internal: continue an async build from a previously created epic
-    #[arg(long = "_continue-async", hide = true)]
-    pub continue_async: Option<String>,
-
-    /// Output format (e.g., `id` for bare task IDs on stdout)
-    #[arg(long, short = 'o', value_name = "FORMAT")]
-    pub output: Option<OutputFormat>,
 
     /// Subcommand (show)
     #[command(subcommand)]
     pub subcommand: Option<BuildSubcommands>,
 }
 
-impl crate::workflow::HasRunKind for BuildArgs {
-    fn continue_async(&self) -> Option<&str> {
-        self.continue_async.as_deref()
-    }
-    fn run_async(&self) -> bool {
-        self.run_async
-    }
-}
-
 /// Run the build command
 pub fn run(args: BuildArgs) -> Result<()> {
-    use crate::session::flags::resolve_agent_shorthand;
-    let agent = resolve_agent_shorthand(args.agent.clone(), args.claude, args.codex, args.cursor, args.gemini);
+    let cwd = env::current_dir().map_err(|_| {
+        AikiError::InvalidArgument("Failed to get current directory".to_string())
+    })?;
 
-    let cwd = env::current_dir()
-        .map_err(|_| AikiError::InvalidArgument("Failed to get current directory".to_string()))?;
-
-    if let Some(subcommand) = &args.subcommand {
+    if let Some(subcommand) = args.subcommand {
         return match subcommand {
-            BuildSubcommands::Show { plan_path, output } => run_show(&cwd, plan_path, output.clone()),
+            BuildSubcommands::Show { plan_path, output } => run_show(&cwd, &plan_path, output),
         };
     }
 
-    let opts = BuildOpts::from_args(&args, agent)?;
-    build::run(&cwd, &opts)?;
+    let target = args.target.ok_or_else(|| {
+        AikiError::InvalidArgument(
+            "No plan path or epic ID provided. Usage: aiki build <plan-path-or-epic-id>"
+                .to_string(),
+        )
+    })?;
+
+    if is_task_id(&target) || is_task_id_prefix(&target) {
+        run_build_epic(&cwd, &target, args.run_async, args.template, args.agent)
+    } else {
+        run_build_plan(
+            &cwd,
+            &target,
+            args.restart,
+            args.run_async,
+            args.template,
+            args.agent,
+        )
+    }
+}
+
+/// Build from a plan path — deterministic find-or-create.
+///
+/// 1. Validate plan file exists and is .md
+/// 2. Clean up stale builds for this plan
+/// 3. Check for existing epic (deterministic: no interactive prompts)
+/// 4. Create build task
+/// 5. Run build task (sync or async)
+/// 6. Output results
+fn run_build_plan(
+    cwd: &Path,
+    plan_path: &str,
+    restart: bool,
+    run_async: bool,
+    template_name: Option<String>,
+    agent: Option<String>,
+) -> Result<()> {
+    // Validate plan file exists and is .md
+    validate_plan_path(cwd, plan_path)?;
+
+    // Check if plan is a draft
+    let full_path = if plan_path.starts_with('/') {
+        std::path::PathBuf::from(plan_path)
+    } else {
+        cwd.join(plan_path)
+    };
+    let metadata = parse_plan_metadata(&full_path);
+    if metadata.draft {
+        return Err(AikiError::InvalidArgument(
+            "Cannot build draft plan. Remove `draft: true` from frontmatter first.".to_string(),
+        ));
+    }
+
+    // Parse agent if provided
+    let agent_type = if let Some(ref agent_str) = agent {
+        Some(
+            AgentType::from_str(agent_str)
+                .ok_or_else(|| AikiError::UnknownAgentType(agent_str.clone()))?,
+        )
+    } else {
+        None
+    };
+
+    // Clean up stale builds for this plan
+    cleanup_stale_builds(cwd, plan_path)?;
+
+    // Load current tasks to check for existing epics
+    let events = read_events(cwd)?;
+    let graph = materialize_graph(&events);
+    let plan_graph = PlanGraph::build(&graph);
+
+    // Deterministic epic lookup (no interactive prompts)
+    let existing_epic = plan_graph.find_epic_for_plan(plan_path, &graph);
+
+    let epic_id = if restart {
+        // --restart: close existing epic and create fresh
+        if let Some(epic) = existing_epic {
+            if epic.status != TaskStatus::Closed {
+                undo_completed_subtasks(cwd, &epic.id)?;
+                close_epic(cwd, &epic.id)?;
+            }
+        }
+        None
+    } else {
+        match existing_epic {
+            Some(epic) if epic.status != TaskStatus::Closed => {
+                // Valid incomplete epic — use it (deterministic, no prompt)
+                let subtasks = get_subtasks(&graph, &epic.id);
+                if subtasks.is_empty() {
+                    // Invalid epic (no subtasks) — close and create new
+                    close_epic_as_invalid(cwd, &epic.id)?;
+                    None
+                } else {
+                    Some(epic.id.clone())
+                }
+            }
+            _ => None, // No epic or closed epic — create new
+        }
+    };
+
+    // Ensure we always have an epic before creating the build task.
+    // If no existing epic was found, create one via the decompose agent.
+    let epic_id = match epic_id {
+        Some(id) => id,
+        None => find_or_create_epic(cwd, plan_path)?,
+    };
+
+    // Check if epic is blocked before creating build task
+    let events = read_events(cwd)?;
+    let graph = materialize_graph(&events);
+    check_epic_blockers(&graph, &epic_id)?;
+
+    // Create build task
+    let template = template_name.as_deref().unwrap_or("aiki/build");
+    let assignee = agent_type
+        .as_ref()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| Some("claude-code".to_string()));
+
+    let build_task_id =
+        create_build_task(cwd, plan_path, Some(&epic_id), template, assignee)?;
+
+    let display_epic_id = epic_id.as_str();
+
+    // Run build task
+    if run_async {
+        let options = if let Some(agent) = agent_type {
+            TaskRunOptions::new().with_agent(agent)
+        } else {
+            TaskRunOptions::new()
+        };
+        let _handle = task_run_async(cwd, &build_task_id, options)?;
+        output_build_async(&build_task_id, display_epic_id)?;
+
+        // Output machine-readable to stdout if piped
+        if !std::io::stdout().is_terminal() {
+            println!(
+                "<aiki_build build_id=\"{}\" epic_id=\"{}\"/>",
+                build_task_id, display_epic_id
+            );
+        }
+    } else {
+        output_build_started(&build_task_id, display_epic_id)?;
+
+        let options = if let Some(agent) = agent_type {
+            TaskRunOptions::new().with_agent(agent)
+        } else {
+            TaskRunOptions::new()
+        };
+        task_run(cwd, &build_task_id, options)?;
+
+        // After build completes, re-read tasks to get final state
+        let events = read_events(cwd)?;
+        let graph = materialize_graph(&events);
+        let plan_graph = PlanGraph::build(&graph);
+
+        // Find the epic task (may have been created during the build)
+        let final_epic = plan_graph.find_epic_for_plan(plan_path, &graph);
+        let final_epic_id = final_epic
+            .map(|p| p.id.as_str())
+            .unwrap_or(display_epic_id);
+
+        let subtasks = final_epic
+            .map(|p| get_subtasks(&graph, &p.id))
+            .unwrap_or_default();
+        let subtask_refs: Vec<&Task> = subtasks.into_iter().collect();
+        output_build_completed(&build_task_id, final_epic_id, &subtask_refs)?;
+
+        // Output machine-readable to stdout if piped
+        if !std::io::stdout().is_terminal() {
+            println!(
+                "<aiki_build build_id=\"{}\" epic_id=\"{}\"/>",
+                build_task_id, final_epic_id
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Build from an existing epic ID
+///
+/// 1. Find epic task, verify it exists
+/// 2. Get plan path from epic's data
+/// 3. Create build task with data.epic and data.plan
+/// 4. Run build task (sync or async)
+/// 5. Output results
+fn run_build_epic(
+    cwd: &Path,
+    epic_id: &str,
+    run_async: bool,
+    template_name: Option<String>,
+    agent: Option<String>,
+) -> Result<()> {
+    // Parse agent if provided
+    let agent_type = if let Some(ref agent_str) = agent {
+        Some(
+            AgentType::from_str(agent_str)
+                .ok_or_else(|| AikiError::UnknownAgentType(agent_str.clone()))?,
+        )
+    } else {
+        None
+    };
+
+    // Find epic task (resolve prefix to canonical ID)
+    let events = read_events(cwd)?;
+    let graph = materialize_graph(&events);
+    let epic = find_task(&graph.tasks, epic_id)?;
+    let epic_id = epic.id.as_str();
+
+    // Check if epic is blocked before creating build task
+    check_epic_blockers(&graph, epic_id)?;
+
+    let plan_path = epic
+        .data
+        .get("plan")
+        .cloned()
+        .ok_or_else(|| {
+            AikiError::InvalidArgument(format!(
+                "Epic task {} missing data.plan. Cannot create build task without a plan path.",
+                epic_id
+            ))
+        })?;
+
+    // Create build task
+    let template = template_name.as_deref().unwrap_or("aiki/build");
+    let assignee = agent_type
+        .as_ref()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| Some("claude-code".to_string()));
+
+    let build_task_id = create_build_task(
+        cwd,
+        &plan_path,
+        Some(epic_id),
+        template,
+        assignee,
+    )?;
+
+    // Run build task
+    if run_async {
+        let options = if let Some(agent) = agent_type {
+            TaskRunOptions::new().with_agent(agent)
+        } else {
+            TaskRunOptions::new()
+        };
+        let _handle = task_run_async(cwd, &build_task_id, options)?;
+        output_build_async(&build_task_id, epic_id)?;
+
+        // Output machine-readable to stdout if piped
+        if !std::io::stdout().is_terminal() {
+            println!(
+                "<aiki_build build_id=\"{}\" epic_id=\"{}\"/>",
+                build_task_id, epic_id
+            );
+        }
+    } else {
+        output_build_started(&build_task_id, epic_id)?;
+
+        let options = if let Some(agent) = agent_type {
+            TaskRunOptions::new().with_agent(agent)
+        } else {
+            TaskRunOptions::new()
+        };
+        task_run(cwd, &build_task_id, options)?;
+
+        // After build completes, re-read tasks to get final state
+        let events = read_events(cwd)?;
+        let graph = materialize_graph(&events);
+
+        let subtasks = get_subtasks(&graph, epic_id);
+        output_build_completed(&build_task_id, epic_id, &subtasks)?;
+
+        // Output machine-readable to stdout if piped
+        if !std::io::stdout().is_terminal() {
+            println!(
+                "<aiki_build build_id=\"{}\" epic_id=\"{}\"/>",
+                build_task_id, epic_id
+            );
+        }
+    }
 
     Ok(())
 }
 
 /// Show build/epic status for a plan
 fn run_show(cwd: &Path, plan_path: &str, output_format: Option<OutputFormat>) -> Result<()> {
-    use crate::workflow::build::output_build_status;
-    use crate::workflow::WorkflowContext;
+    let events = read_events(cwd)?;
+    let graph = materialize_graph(&events);
+    let plan_graph = PlanGraph::build(&graph);
+
+    // Find epic via PlanGraph
+    let epic = plan_graph.find_epic_for_plan(plan_path, &graph).ok_or_else(|| {
+        AikiError::InvalidArgument(format!("No epic found for plan: {}", plan_path))
+    })?;
+
+    // Find build tasks associated with this plan
+    let build_tasks: Vec<&Task> = graph
+        .tasks
+        .values()
+        .filter(|t| {
+            t.task_type.as_deref() == Some("orchestrator")
+                && t.data.get("plan").map(|s| s.as_str()) == Some(plan_path)
+        })
+        .collect();
 
     match output_format {
         Some(OutputFormat::Id) => {
-            let events = read_events(cwd)?;
-            let graph = materialize_graph(&events);
-            let plan_graph = PlanGraph::build(&graph);
-
-            let epic = plan_graph
-                .resolve_epic_for_plan(plan_path, &graph)?
-                .ok_or_else(|| {
-                    AikiError::InvalidArgument(format!("No epic found for plan: {}", plan_path))
-                })?;
-
-            let build_tasks: Vec<&Task> = graph
-                .tasks
-                .values()
-                .filter(|t| {
-                    t.task_type.as_deref() == Some("orchestrator")
-                        && t.data.get("plan").map(|s| s.as_str()) == Some(plan_path)
-                })
-                .collect();
-
             if build_tasks.is_empty() {
+                // No builds yet -- emit the epic ID as fallback
                 println!("{}", epic.id);
             } else {
                 for build in &build_tasks {
@@ -172,22 +398,377 @@ fn run_show(cwd: &Path, plan_path: &str, output_format: Option<OutputFormat>) ->
             }
         }
         None => {
-            let ctx = WorkflowContext {
-                task_id: None,
-                plan_path: Some(plan_path.to_string()),
-                cwd: cwd.to_path_buf(),
-                output: crate::workflow::WorkflowOutput::new(crate::workflow::OutputKind::Text),
-                opts: crate::workflow::WorkflowOpts::default(),
-                review_id: None,
-                scope: None,
-                assignee: None,
-                iteration: 0,
-                notify_rx: None,
-                task_names: std::collections::HashMap::new(),
-            };
-            output_build_status(&ctx, &None);
+            let subtasks = get_subtasks(&graph, &epic.id);
+            output_build_show(epic, &subtasks, &build_tasks)?;
         }
     }
+
+    Ok(())
+}
+
+/// Validate that the plan path is a .md file and exists
+fn validate_plan_path(cwd: &Path, plan_path: &str) -> Result<()> {
+    if !plan_path.ends_with(".md") {
+        return Err(AikiError::InvalidArgument(
+            "Plan file must be markdown (.md)".to_string(),
+        ));
+    }
+
+    let full_path = if plan_path.starts_with('/') {
+        std::path::PathBuf::from(plan_path)
+    } else {
+        cwd.join(plan_path)
+    };
+
+    if !full_path.exists() {
+        return Err(AikiError::InvalidArgument(format!(
+            "Plan file not found: {}",
+            plan_path
+        )));
+    }
+
+    if !full_path.is_file() {
+        return Err(AikiError::InvalidArgument(format!(
+            "Not a file: {}",
+            plan_path
+        )));
+    }
+
+    Ok(())
+}
+
+/// Clean up stale build tasks for this plan.
+///
+/// Finds any in_progress or open build tasks with `data.plan` matching the plan path
+/// and closes them as wont_do with a comment.
+fn cleanup_stale_builds(cwd: &Path, plan_path: &str) -> Result<()> {
+    let events = read_events(cwd)?;
+    let tasks = materialize_graph(&events).tasks;
+
+    let stale_builds: Vec<String> = tasks
+        .values()
+        .filter(|t| {
+            t.task_type.as_deref() == Some("orchestrator")
+                && t.data.get("plan").map(|s| s.as_str()) == Some(plan_path)
+                && (t.status == TaskStatus::InProgress || t.status == TaskStatus::Open)
+        })
+        .map(|t| t.id.clone())
+        .collect();
+
+    for build_id in &stale_builds {
+        let comment_event = TaskEvent::CommentAdded {
+            task_ids: vec![build_id.clone()],
+            text: "Stale build cleaned up".to_string(),
+            data: std::collections::HashMap::new(),
+            timestamp: chrono::Utc::now(),
+        };
+        write_event(cwd, &comment_event)?;
+
+        let close_event = TaskEvent::Closed {
+            task_ids: vec![build_id.clone()],
+            outcome: TaskOutcome::WontDo,
+            summary: Some("Stale build cleaned up".to_string()),
+            turn_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        write_event(cwd, &close_event)?;
+    }
+
+    Ok(())
+}
+
+/// Undo file changes made by completed subtasks of an epic.
+///
+/// Invokes `aiki task undo <epic-id> --completed` to revert changes before
+/// closing the epic. If no completed subtasks exist, this is a no-op.
+fn undo_completed_subtasks(cwd: &Path, epic_id: &str) -> Result<()> {
+    let output = std::process::Command::new(get_aiki_binary_path())
+        .current_dir(cwd)
+        .args(["task", "undo", epic_id, "--completed"])
+        .output()
+        .map_err(|e| {
+            AikiError::JjCommandFailed(format!("Failed to run task undo: {}", e))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // If there are no completed subtasks, that's fine - nothing to undo
+        if stderr.contains("no completed subtasks") || stderr.contains("NoCompletedSubtasks") {
+            return Ok(());
+        }
+        return Err(AikiError::JjCommandFailed(format!(
+            "task undo failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    // Forward undo output to stderr so user sees what was reverted
+    let stderr_output = String::from_utf8_lossy(&output.stderr);
+    if !stderr_output.is_empty() {
+        eprint!("{}", stderr_output);
+    }
+
+    Ok(())
+}
+
+/// Close an existing epic as wont_do
+fn close_epic(cwd: &Path, epic_id: &str) -> Result<()> {
+    let timestamp = chrono::Utc::now();
+
+    // Add comment before closing
+    let comment_event = TaskEvent::CommentAdded {
+        task_ids: vec![epic_id.to_string()],
+        text: "Closed by --restart".to_string(),
+        data: std::collections::HashMap::new(),
+        timestamp: timestamp - chrono::Duration::milliseconds(1),
+    };
+    write_event(cwd, &comment_event)?;
+
+    let close_event = TaskEvent::Closed {
+        task_ids: vec![epic_id.to_string()],
+        outcome: TaskOutcome::WontDo,
+        summary: Some("Closed by --restart".to_string()),
+        turn_id: None,
+        timestamp,
+    };
+    write_event(cwd, &close_event)?;
+    Ok(())
+}
+
+/// Create a build task from template.
+///
+/// The build task orchestrates epic execution (if needed) and execution of subtasks.
+/// It stores `data.plan` and optionally `data.epic` to link back to the plan and epic.
+fn create_build_task(
+    cwd: &Path,
+    plan_path: &str,
+    epic_id: Option<&str>,
+    template_name: &str,
+    assignee: Option<String>,
+) -> Result<String> {
+    use super::task::{create_from_template, TemplateTaskParams};
+
+    let mut data = HashMap::new();
+    data.insert("plan".to_string(), plan_path.to_string());
+    if let Some(epic) = epic_id {
+        data.insert("epic".to_string(), epic.to_string());
+    }
+
+    let params = TemplateTaskParams {
+        template_name: template_name.to_string(),
+        data,
+        sources: vec![format!("file:{}", plan_path)],
+        assignee: assignee.or_else(|| Some("claude-code".to_string())),
+        ..Default::default()
+    };
+
+    let task_id = create_from_template(cwd, params)?;
+
+    // Emit link events for the relationships (dual-write with data attributes)
+    let events = crate::tasks::storage::read_events(cwd)?;
+    let graph = crate::tasks::graph::materialize_graph(&events);
+
+    // orchestrator orchestrates the epic (if one exists)
+    if let Some(epic) = epic_id {
+        crate::tasks::storage::write_link_event(cwd, &graph, "orchestrates", &task_id, epic)?;
+    }
+
+    Ok(task_id)
+}
+
+/// Check if an epic is blocked by unresolved dependencies.
+///
+/// Returns an error if the epic has `depends-on` links to tasks that are not yet
+/// Closed with Done outcome. This prevents starting a build on a blocked epic.
+fn check_epic_blockers(
+    graph: &crate::tasks::graph::TaskGraph,
+    epic_id: &str,
+) -> Result<()> {
+    let blocker_ids: Vec<&str> = graph
+        .edges
+        .targets(epic_id, "depends-on")
+        .iter()
+        .filter(|tid| {
+            graph.tasks.get(tid.as_str()).map_or(true, |t| {
+                !(t.status == TaskStatus::Closed
+                    && t.closed_outcome == Some(TaskOutcome::Done))
+            })
+        })
+        .map(|s| s.as_str())
+        .collect();
+
+    if !blocker_ids.is_empty() {
+        let blocker_names: Vec<String> = blocker_ids
+            .iter()
+            .map(|id| {
+                let name = graph
+                    .tasks
+                    .get(*id)
+                    .map(|t| t.name.as_str())
+                    .unwrap_or("unknown");
+                let short = &id[..id.len().min(8)];
+                format!("{} ({})", short, name)
+            })
+            .collect();
+        return Err(AikiError::InvalidArgument(format!(
+            "Epic {} is blocked by unresolved dependencies: {}",
+            &epic_id[..epic_id.len().min(8)],
+            blocker_names.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
+/// Close an epic as invalid (no subtasks created).
+fn close_epic_as_invalid(cwd: &Path, epic_id: &str) -> Result<()> {
+    let close_event = TaskEvent::Closed {
+        task_ids: vec![epic_id.to_string()],
+        outcome: TaskOutcome::WontDo,
+        summary: Some("No subtasks created — epic invalid".to_string()),
+        turn_id: None,
+        timestamp: chrono::Utc::now(),
+    };
+    write_event(cwd, &close_event)?;
+    Ok(())
+}
+
+/// Output build started message to stderr
+fn output_build_started(build_id: &str, epic_id: &str) -> Result<()> {
+    let content = format!(
+        "## Build Started\n- **Build ID:** {}\n- **Epic ID:** {}\n",
+        build_id, epic_id
+    );
+    let md = MdBuilder::new("build").build(&content, &[], &[]);
+    eprintln!("{}", md);
+    Ok(())
+}
+
+/// Output build completed message to stderr
+fn output_build_completed(build_id: &str, epic_id: &str, subtasks: &[&Task]) -> Result<()> {
+    let mut content = format!(
+        "## Build Completed\n- **Build ID:** {}\n- **Epic ID:** {}\n- **Subtasks:** {}\n\n",
+        build_id, epic_id, subtasks.len()
+    );
+
+    for (i, subtask) in subtasks.iter().enumerate() {
+        let status = if subtask.status == TaskStatus::Closed {
+            "done"
+        } else {
+            "pending"
+        };
+        content.push_str(&format!("{}. {} ({})\n", i + 1, &subtask.name, status));
+    }
+
+    let md = MdBuilder::new("build").build(&content, &[], &[]);
+    eprintln!("{}", md);
+    Ok(())
+}
+
+/// Output build async started message to stderr
+fn output_build_async(build_id: &str, epic_id: &str) -> Result<()> {
+    let content = format!(
+        "## Build Started\n- **Build ID:** {}\n- **Epic ID:** {}\n- Build started in background.\n",
+        build_id, epic_id
+    );
+    let md = MdBuilder::new("build").build(&content, &[], &[]);
+    eprintln!("{}", md);
+    Ok(())
+}
+
+/// Output build show (detailed status display)
+fn output_build_show(epic: &Task, subtasks: &[&Task], build_tasks: &[&Task]) -> Result<()> {
+    let completed = subtasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Closed)
+        .count();
+    let total = subtasks.len();
+
+    let status_str = match epic.status {
+        TaskStatus::Open => "open",
+        TaskStatus::InProgress => "in_progress",
+        TaskStatus::Stopped => "stopped",
+        TaskStatus::Closed => "closed",
+    };
+
+    let outcome_str = epic
+        .closed_outcome
+        .as_ref()
+        .map(|o| format!("- **Outcome:** {}\n", o))
+        .unwrap_or_default();
+
+    let plan_str = epic
+        .data
+        .get("plan")
+        .map(|s| format!("- **Plan:** {}\n", s))
+        .unwrap_or_default();
+
+    let mut content = format!(
+        "## Epic: {}\n- **ID:** {}\n- **Status:** {}\n{}{}",
+        &epic.name, &epic.id, status_str, outcome_str, plan_str
+    );
+
+    // Add progress summary
+    content.push_str(&format!("- **Progress:** {}/{}\n", completed, total));
+
+    // Add subtask list
+    if !subtasks.is_empty() {
+        content.push_str("\n### Subtasks\n| # | ID | Status | Outcome | Name |\n|---|-----|--------|---------|------|\n");
+        for (i, subtask) in subtasks.iter().enumerate() {
+            let sub_status = match subtask.status {
+                TaskStatus::Open => "open",
+                TaskStatus::InProgress => "in_progress",
+                TaskStatus::Stopped => "stopped",
+                TaskStatus::Closed => "closed",
+            };
+
+            let sub_outcome = subtask
+                .closed_outcome
+                .as_ref()
+                .map(|o| o.to_string())
+                .unwrap_or_default();
+
+            content.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                i + 1, &subtask.id, sub_status, sub_outcome, &subtask.name
+            ));
+        }
+    }
+
+    // Add build history
+    if !build_tasks.is_empty() {
+        content.push_str("\n### Builds\n| ID | Status | Outcome | Name |\n|-----|--------|---------|------|\n");
+        for build in build_tasks {
+            let build_status = match build.status {
+                TaskStatus::Open => "open",
+                TaskStatus::InProgress => "in_progress",
+                TaskStatus::Stopped => "stopped",
+                TaskStatus::Closed => "closed",
+            };
+
+            let build_outcome = build
+                .closed_outcome
+                .as_ref()
+                .map(|o| o.to_string())
+                .unwrap_or_default();
+
+            content.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                &build.id, build_status, build_outcome, &build.name
+            ));
+        }
+    }
+
+    // Add sources
+    if !epic.sources.is_empty() {
+        content.push_str("\n### Sources\n");
+        for source in &epic.sources {
+            content.push_str(&format!("- {}\n", source));
+        }
+    }
+
+    let md = MdBuilder::new("build-show").build(&content, &[], &[]);
+    eprintln!("{}", md);
 
     Ok(())
 }
@@ -196,10 +777,8 @@ fn run_show(cwd: &Path, plan_path: &str, output_format: Option<OutputFormat>) ->
 mod tests {
     use super::*;
     use crate::tasks::graph::{EdgeStore, TaskGraph};
-    use crate::tasks::id::is_task_id;
+    use crate::tasks::TaskPriority;
     use crate::tasks::types::FastHashMap;
-    use crate::tasks::{TaskOutcome, TaskPriority, TaskStatus};
-    use crate::epic::check_epic_blockers;
     use std::collections::HashMap;
 
     fn make_task(id: &str, name: &str, status: TaskStatus) -> Task {
@@ -213,6 +792,7 @@ mod tests {
             assignee: None,
             sources: Vec::new(),
             template: None,
+            working_copy: None,
             instructions: None,
             data: HashMap::new(),
             created_at: chrono::Utc::now(),
@@ -221,10 +801,8 @@ mod tests {
             last_session_id: None,
             stopped_reason: None,
             closed_outcome: None,
-            confidence: None,
             summary: None,
             turn_started: None,
-            closed_at: None,
             turn_closed: None,
             turn_stopped: None,
             comments: Vec::new(),
@@ -242,14 +820,6 @@ mod tests {
         task
     }
 
-    fn empty_graph() -> TaskGraph {
-        TaskGraph {
-            tasks: FastHashMap::default(),
-            edges: EdgeStore::new(),
-            slug_index: FastHashMap::default(),
-        }
-    }
-
     fn make_graph(tasks: FastHashMap<String, Task>, edges: EdgeStore) -> TaskGraph {
         TaskGraph {
             tasks,
@@ -262,9 +832,9 @@ mod tests {
     fn find_epic_for_plan_via_graph<'a>(
         graph: &'a TaskGraph,
         plan_path: &str,
-    ) -> anyhow::Result<Option<&'a Task>> {
+    ) -> Option<&'a Task> {
         let sg = PlanGraph::build(graph);
-        sg.resolve_epic_for_plan(plan_path, graph)
+        sg.find_epic_for_plan(plan_path, graph)
     }
 
     // --- find_epic_for_plan tests ---
@@ -272,9 +842,7 @@ mod tests {
     #[test]
     fn test_find_epic_for_plan_none() {
         let graph = make_graph(FastHashMap::default(), EdgeStore::new());
-        assert!(find_epic_for_plan_via_graph(&graph, "ops/now/feature.md")
-            .unwrap()
-            .is_none());
+        assert!(find_epic_for_plan_via_graph(&graph, "ops/now/feature.md").is_none());
     }
 
     #[test]
@@ -287,7 +855,7 @@ mod tests {
         edges.add("epic1", "file:ops/now/feature.md", "implements-plan");
 
         let graph = make_graph(tasks, edges);
-        let result = find_epic_for_plan_via_graph(&graph, "ops/now/feature.md").unwrap();
+        let result = find_epic_for_plan_via_graph(&graph, "ops/now/feature.md");
         assert!(result.is_some());
         assert_eq!(result.unwrap().id, "epic1");
     }
@@ -302,13 +870,11 @@ mod tests {
         edges.add("epic1", "file:ops/now/other.md", "implements-plan");
 
         let graph = make_graph(tasks, edges);
-        assert!(find_epic_for_plan_via_graph(&graph, "ops/now/feature.md")
-            .unwrap()
-            .is_none());
+        assert!(find_epic_for_plan_via_graph(&graph, "ops/now/feature.md").is_none());
     }
 
     #[test]
-    fn test_find_epic_for_plan_returns_ambiguity_error() {
+    fn test_find_epic_for_plan_most_recent() {
         let mut tasks = FastHashMap::default();
 
         let mut task1 = make_task("epic_old", "Epic: Old", TaskStatus::Closed);
@@ -323,11 +889,9 @@ mod tests {
         edges.add("epic_new", "file:ops/now/feature.md", "implements-plan");
 
         let graph = make_graph(tasks, edges);
-        let err = find_epic_for_plan_via_graph(&graph, "ops/now/feature.md").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("Multiple epics implement file:ops/now/feature.md"));
-        assert!(msg.contains("epic_old (Epic: Old)"));
-        assert!(msg.contains("epic_new (Epic: New)"));
+        let result = find_epic_for_plan_via_graph(&graph, "ops/now/feature.md");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, "epic_new");
     }
 
     // --- cleanup_stale_builds helper logic tests ---
@@ -338,8 +902,12 @@ mod tests {
         let mut data = HashMap::new();
         data.insert("plan".to_string(), "ops/now/feature.md".to_string());
 
-        let mut task =
-            make_task_with_data("build1", "Build: feature", TaskStatus::InProgress, data);
+        let mut task = make_task_with_data(
+            "build1",
+            "Build: feature",
+            TaskStatus::InProgress,
+            data,
+        );
         task.task_type = Some("orchestrator".to_string());
         tasks.insert("build1".to_string(), task);
 
@@ -364,7 +932,12 @@ mod tests {
         let mut data = HashMap::new();
         data.insert("plan".to_string(), "ops/now/feature.md".to_string());
 
-        let mut task = make_task_with_data("build2", "Build: feature", TaskStatus::Open, data);
+        let mut task = make_task_with_data(
+            "build2",
+            "Build: feature",
+            TaskStatus::Open,
+            data,
+        );
         task.task_type = Some("orchestrator".to_string());
         tasks.insert("build2".to_string(), task);
 
@@ -388,7 +961,12 @@ mod tests {
         let mut data = HashMap::new();
         data.insert("plan".to_string(), "ops/now/feature.md".to_string());
 
-        let mut task = make_task_with_data("build3", "Build: feature", TaskStatus::Closed, data);
+        let mut task = make_task_with_data(
+            "build3",
+            "Build: feature",
+            TaskStatus::Closed,
+            data,
+        );
         task.task_type = Some("orchestrator".to_string());
         tasks.insert("build3".to_string(), task);
 
@@ -411,7 +989,12 @@ mod tests {
         let mut data = HashMap::new();
         data.insert("plan".to_string(), "ops/now/other.md".to_string());
 
-        let mut task = make_task_with_data("build4", "Build: other", TaskStatus::InProgress, data);
+        let mut task = make_task_with_data(
+            "build4",
+            "Build: other",
+            TaskStatus::InProgress,
+            data,
+        );
         task.task_type = Some("orchestrator".to_string());
         tasks.insert("build4".to_string(), task);
 
@@ -435,7 +1018,12 @@ mod tests {
         data.insert("plan".to_string(), "ops/now/feature.md".to_string());
 
         // Not a build task (no task_type or different type)
-        let task = make_task_with_data("not_build", "Something else", TaskStatus::InProgress, data);
+        let task = make_task_with_data(
+            "not_build",
+            "Something else",
+            TaskStatus::InProgress,
+            data,
+        );
         tasks.insert("not_build".to_string(), task);
 
         let stale_builds: Vec<String> = tasks
@@ -483,51 +1071,147 @@ mod tests {
         assert!(!is_task_id("Mvslrspmoynoxyyywqyutmovxpvztkls"));
     }
 
-    // --- Build show output formatting tests ---
+    // --- validate_plan_path tests ---
 
     #[test]
-    fn test_output_build_status_no_panic_with_missing_plan() {
-        use crate::workflow::build::output_build_status;
-        use crate::workflow::WorkflowContext;
-
-        // output_build_status should gracefully handle missing epic (no panic)
-        let ctx = WorkflowContext {
-            task_id: None,
-            plan_path: Some("nonexistent/plan.md".to_string()),
-            cwd: std::path::PathBuf::from("/tmp"),
-            output: crate::workflow::WorkflowOutput::new(crate::workflow::OutputKind::Text),
-            opts: crate::workflow::WorkflowOpts::default(),
-            review_id: None,
-            scope: None,
-            assignee: None,
-            iteration: 0,
-            notify_rx: None,
-            task_names: std::collections::HashMap::new(),
-        };
-        output_build_status(&ctx, &None);
-        output_build_status(&ctx, &Some(crate::commands::OutputFormat::Id));
+    fn test_validate_plan_path_not_md() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let result = validate_plan_path(temp_dir.path(), "not-markdown.txt");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be markdown"));
     }
 
     #[test]
-    fn test_output_build_status_no_panic_without_plan_path() {
-        use crate::workflow::build::output_build_status;
-        use crate::workflow::WorkflowContext;
+    fn test_validate_plan_path_not_found() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let result = validate_plan_path(temp_dir.path(), "nonexistent.md");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Plan file not found"));
+    }
 
-        // No plan_path → early return, no panic
-        let ctx = WorkflowContext {
-            task_id: None,
-            plan_path: None,
-            cwd: std::path::PathBuf::from("/tmp"),
-            output: crate::workflow::WorkflowOutput::new(crate::workflow::OutputKind::Text),
-            opts: crate::workflow::WorkflowOpts::default(),
-            review_id: None,
-            scope: None,
-            assignee: None,
-            iteration: 0,
-            notify_rx: None,
-            task_names: std::collections::HashMap::new(),
-        };
-        output_build_status(&ctx, &None);
+    #[test]
+    fn test_validate_plan_path_exists() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let plan_file = temp_dir.path().join("my-plan.md");
+        std::fs::write(&plan_file, "# My Plan").unwrap();
+        let result = validate_plan_path(temp_dir.path(), "my-plan.md");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_plan_path_absolute() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let plan_file = temp_dir.path().join("absolute-plan.md");
+        std::fs::write(&plan_file, "# Plan").unwrap();
+        let result = validate_plan_path(temp_dir.path(), &plan_file.to_string_lossy());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_plan_path_directory() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let dir_path = temp_dir.path().join("subdir.md");
+        std::fs::create_dir_all(&dir_path).unwrap();
+        let result = validate_plan_path(temp_dir.path(), "subdir.md");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Not a file"));
+    }
+
+    // --- Build show output formatting tests ---
+
+    #[test]
+    fn test_output_build_started_format() {
+        // Just verify it does not panic
+        let result = output_build_started("build123", "epic456");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_output_build_completed_no_subtasks() {
+        let subtasks: Vec<&Task> = vec![];
+        let result = output_build_completed("build123", "epic456", &subtasks);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_output_build_completed_with_subtasks() {
+        let task1 = make_task("sub1", "Implement auth", TaskStatus::Closed);
+        let task2 = make_task("sub2", "Add tests", TaskStatus::Open);
+        let subtasks: Vec<&Task> = vec![&task1, &task2];
+        let result = output_build_completed("build123", "epic456", &subtasks);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_output_build_async_format() {
+        let result = output_build_async("build123", "epic456");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_output_build_show_basic() {
+        let mut data = HashMap::new();
+        data.insert("plan".to_string(), "ops/now/feature.md".to_string());
+        let epic = make_task_with_data("epic1", "Epic: Feature", TaskStatus::Open, data);
+        let subtasks: Vec<&Task> = vec![];
+        let build_tasks: Vec<&Task> = vec![];
+        let result = output_build_show(&epic, &subtasks, &build_tasks);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_output_build_show_with_subtasks_and_builds() {
+        let mut data = HashMap::new();
+        data.insert("plan".to_string(), "ops/now/feature.md".to_string());
+        let mut epic = make_task_with_data("epic1", "Epic: Feature", TaskStatus::InProgress, data);
+        epic.sources = vec!["file:ops/now/feature.md".to_string()];
+
+        let sub1 = make_task("sub1", "Step 1", TaskStatus::Closed);
+        let sub2 = make_task("sub2", "Step 2", TaskStatus::InProgress);
+        let subtasks: Vec<&Task> = vec![&sub1, &sub2];
+
+        let mut build_data = HashMap::new();
+        build_data.insert("plan".to_string(), "ops/now/feature.md".to_string());
+        let mut build = make_task_with_data(
+            "build1",
+            "Build: feature",
+            TaskStatus::Closed,
+            build_data,
+        );
+        build.task_type = Some("orchestrator".to_string());
+        build.closed_outcome = Some(TaskOutcome::Done);
+        let build_tasks: Vec<&Task> = vec![&build];
+
+        let result = output_build_show(&epic, &subtasks, &build_tasks);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_output_build_show_closed_epic_with_outcome() {
+        let mut data = HashMap::new();
+        data.insert("plan".to_string(), "ops/now/feature.md".to_string());
+        let mut epic = make_task_with_data("epic1", "Epic: Feature", TaskStatus::Closed, data);
+        epic.closed_outcome = Some(TaskOutcome::Done);
+
+        let subtasks: Vec<&Task> = vec![];
+        let build_tasks: Vec<&Task> = vec![];
+        let result = output_build_show(&epic, &subtasks, &build_tasks);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_xml_escaping_in_output() {
+        // Verify XML special characters are properly escaped
+        let task = make_task("sub1", "Fix <angle> & \"quote\" 'apos'", TaskStatus::Open);
+        let subtasks: Vec<&Task> = vec![&task];
+        let result = output_build_completed("build<1>", "epic&2", &subtasks);
+        assert!(result.is_ok());
     }
 
     // --- OutputFormat tests ---
@@ -551,764 +1235,5 @@ mod tests {
         use clap::ValueEnum;
         let parsed = OutputFormat::from_str("unknown_format", false);
         assert!(parsed.is_err());
-    }
-
-    // --- Build args tests ---
-
-    #[test]
-    fn test_build_args_no_loop_or_lanes_flags() {
-        let args = BuildArgs {
-            target: Some("test.md".to_string()),
-            run_async: false,
-            restart: false,
-            decompose_template: None,
-            loop_template: None,
-            agent: None,
-            claude: false,
-            codex: false,
-            cursor: false,
-            gemini: false,
-            review: false,
-            review_template: None,
-            fix: false,
-            fix_template: None,
-            coder: None,
-            reviewer: None,
-            continue_async: None,
-            output: None,
-            subcommand: None,
-        };
-        assert!(!args.run_async);
-        assert!(!args.restart);
-    }
-
-    #[test]
-    fn test_loop_template_override_via_flag() {
-        let args = BuildArgs {
-            target: Some("test.md".to_string()),
-            run_async: false,
-            restart: false,
-            decompose_template: None,
-            loop_template: Some("custom/loop".to_string()),
-            agent: None,
-            claude: false,
-            codex: false,
-            cursor: false,
-            gemini: false,
-            review: false,
-            review_template: None,
-            fix: false,
-            fix_template: None,
-            coder: None,
-            reviewer: None,
-            continue_async: None,
-            output: None,
-            subcommand: None,
-        };
-        assert_eq!(args.loop_template.as_deref(), Some("custom/loop"));
-    }
-
-    #[test]
-    fn test_decompose_template_override_via_flag() {
-        let args = BuildArgs {
-            target: Some("test.md".to_string()),
-            run_async: false,
-            restart: false,
-            decompose_template: Some("my/decompose".to_string()),
-            loop_template: None,
-            agent: None,
-            claude: false,
-            codex: false,
-            cursor: false,
-            gemini: false,
-            review: false,
-            review_template: None,
-            fix: false,
-            fix_template: None,
-            coder: None,
-            reviewer: None,
-            continue_async: None,
-            output: None,
-            subcommand: None,
-        };
-        assert_eq!(args.decompose_template.as_deref(), Some("my/decompose"));
-    }
-
-    #[test]
-    fn test_fix_template_implies_review() {
-        let args = BuildArgs {
-            target: Some("test.md".to_string()),
-            run_async: false,
-            restart: false,
-            decompose_template: None,
-            loop_template: None,
-            agent: None,
-            claude: false,
-            codex: false,
-            cursor: false,
-            gemini: false,
-            review: false,
-            review_template: None,
-            fix: false,
-            fix_template: Some("fix".to_string()),
-            coder: None,
-            reviewer: None,
-            continue_async: None,
-            output: None,
-            subcommand: None,
-        };
-        // Resolve like run() does
-        let fix_template = args.fix_template.or(if args.fix {
-            Some("fix".to_string())
-        } else {
-            None
-        });
-        let review_template = args.review_template.clone();
-        let review = review_template.is_some() || args.review || fix_template.is_some();
-        assert!(review);
-        assert!(review_template.is_none()); // No explicit template — create_review picks default
-        assert!(fix_template.is_some());
-    }
-
-    #[test]
-    fn test_fix_bool_implies_review() {
-        let args = BuildArgs {
-            target: Some("test.md".to_string()),
-            run_async: false,
-            restart: false,
-            decompose_template: None,
-            loop_template: None,
-            agent: None,
-            claude: false,
-            codex: false,
-            cursor: false,
-            gemini: false,
-            review: false,
-            review_template: None,
-            fix: true,
-            fix_template: None,
-            coder: None,
-            reviewer: None,
-            continue_async: None,
-            output: None,
-            subcommand: None,
-        };
-        // Resolve like run() does
-        let fix_template = args.fix_template.or(if args.fix {
-            Some("fix".to_string())
-        } else {
-            None
-        });
-        let review_template = args.review_template.clone();
-        let review = review_template.is_some() || args.review || fix_template.is_some();
-        assert!(review);
-        assert!(review_template.is_none()); // No explicit template — create_review picks default
-        assert!(fix_template.is_some());
-    }
-
-    #[test]
-    fn test_review_without_fix() {
-        let args = BuildArgs {
-            target: Some("test.md".to_string()),
-            run_async: false,
-            restart: false,
-            decompose_template: None,
-            loop_template: None,
-            agent: None,
-            claude: false,
-            codex: false,
-            cursor: false,
-            gemini: false,
-            review: true,
-            review_template: None,
-            fix: false,
-            fix_template: None,
-            coder: None,
-            reviewer: None,
-            continue_async: None,
-            output: None,
-            subcommand: None,
-        };
-        let fix_template = args.fix_template.or(if args.fix {
-            Some("fix".to_string())
-        } else {
-            None
-        });
-        let review_template = args.review_template.clone();
-        let review = review_template.is_some() || args.review || fix_template.is_some();
-        assert!(review);
-        assert!(review_template.is_none()); // No explicit template — create_review picks default
-        assert!(fix_template.is_none());
-    }
-
-    #[test]
-    fn test_review_with_custom_template() {
-        let args = BuildArgs {
-            target: Some("test.md".to_string()),
-            run_async: false,
-            restart: false,
-            decompose_template: None,
-            loop_template: None,
-            agent: None,
-            claude: false,
-            codex: false,
-            cursor: false,
-            gemini: false,
-            review: false,
-            review_template: Some("my/review".to_string()),
-            fix: false,
-            fix_template: None,
-            coder: None,
-            reviewer: None,
-            continue_async: None,
-            output: None,
-            subcommand: None,
-        };
-        assert_eq!(args.review_template.as_deref(), Some("my/review"));
-    }
-
-    #[test]
-    fn test_fix_and_async_allowed() {
-        let args = BuildArgs {
-            target: Some("test.md".to_string()),
-            run_async: true,
-            restart: false,
-            decompose_template: None,
-            loop_template: None,
-            agent: None,
-            claude: false,
-            codex: false,
-            cursor: false,
-            gemini: false,
-            review: false,
-            review_template: None,
-            fix: false,
-            fix_template: Some("fix".to_string()),
-            coder: None,
-            reviewer: None,
-            continue_async: None,
-            output: None,
-            subcommand: None,
-        };
-        // --fix + --async is allowed (task-based loops)
-        assert!(args.run_async);
-        assert!(args.fix_template.is_some());
-    }
-
-    #[test]
-    fn test_no_review_no_fix() {
-        let args = BuildArgs {
-            target: Some("test.md".to_string()),
-            run_async: false,
-            restart: false,
-            decompose_template: None,
-            loop_template: None,
-            agent: None,
-            claude: false,
-            codex: false,
-            cursor: false,
-            gemini: false,
-            review: false,
-            review_template: None,
-            fix: false,
-            fix_template: None,
-            coder: None,
-            reviewer: None,
-            continue_async: None,
-            output: None,
-            subcommand: None,
-        };
-        let fix_template = args.fix_template.or(if args.fix {
-            Some("fix".to_string())
-        } else {
-            None
-        });
-        let review_template = args.review_template.clone();
-        let review = review_template.is_some() || args.review || fix_template.is_some();
-        assert!(!review);
-        assert!(review_template.is_none());
-        assert!(fix_template.is_none());
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Pre-refactor behavioral contract tests for build orchestration
-    // ═══════════════════════════════════════════════════════════════════
-    //
-    // These tests lock down the CONTRACT of build behaviors that must
-    // survive the workflow refactor. They test decision logic, not I/O.
-
-    // --- check_epic_blockers contract ---
-
-    #[test]
-    fn test_check_epic_blockers_no_deps_passes() {
-        let mut tasks = FastHashMap::default();
-        tasks.insert(
-            "epic1".to_string(),
-            make_task("epic1", "Epic", TaskStatus::InProgress),
-        );
-        let graph = make_graph(tasks, EdgeStore::new());
-        assert!(check_epic_blockers(&graph, "epic1").is_ok());
-    }
-
-    #[test]
-    fn test_check_epic_blockers_resolved_dep_passes() {
-        let mut tasks = FastHashMap::default();
-        tasks.insert(
-            "epic1".to_string(),
-            make_task("epic1", "Epic", TaskStatus::InProgress),
-        );
-        let mut blocker = make_task("dep1", "Dep", TaskStatus::Closed);
-        blocker.closed_outcome = Some(TaskOutcome::Done);
-        tasks.insert("dep1".to_string(), blocker);
-
-        let mut edges = EdgeStore::new();
-        edges.add("epic1", "dep1", "depends-on");
-
-        let graph = make_graph(tasks, edges);
-        assert!(check_epic_blockers(&graph, "epic1").is_ok());
-    }
-
-    #[test]
-    fn test_check_epic_blockers_unresolved_dep_fails() {
-        let mut tasks = FastHashMap::default();
-        tasks.insert(
-            "epic1".to_string(),
-            make_task("epic1", "Epic", TaskStatus::InProgress),
-        );
-        tasks.insert(
-            "dep1".to_string(),
-            make_task("dep1", "Dep", TaskStatus::Open),
-        );
-
-        let mut edges = EdgeStore::new();
-        edges.add("epic1", "dep1", "depends-on");
-
-        let graph = make_graph(tasks, edges);
-        let err = check_epic_blockers(&graph, "epic1");
-        assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("blocked"));
-    }
-
-    #[test]
-    fn test_check_epic_blockers_wontdo_dep_still_blocks() {
-        // A dependency closed as WontDo should still block (only Done unblocks)
-        let mut tasks = FastHashMap::default();
-        tasks.insert(
-            "epic1".to_string(),
-            make_task("epic1", "Epic", TaskStatus::InProgress),
-        );
-        let mut blocker = make_task("dep1", "Dep", TaskStatus::Closed);
-        blocker.closed_outcome = Some(TaskOutcome::WontDo);
-        tasks.insert("dep1".to_string(), blocker);
-
-        let mut edges = EdgeStore::new();
-        edges.add("epic1", "dep1", "depends-on");
-
-        let graph = make_graph(tasks, edges);
-        let err = check_epic_blockers(&graph, "epic1");
-        assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("blocked"));
-    }
-
-    #[test]
-    fn test_check_epic_blockers_mixed_deps() {
-        // One resolved, one unresolved — should still block
-        let mut tasks = FastHashMap::default();
-        tasks.insert(
-            "epic1".to_string(),
-            make_task("epic1", "Epic", TaskStatus::InProgress),
-        );
-
-        let mut resolved = make_task("dep1", "Resolved", TaskStatus::Closed);
-        resolved.closed_outcome = Some(TaskOutcome::Done);
-        tasks.insert("dep1".to_string(), resolved);
-
-        tasks.insert(
-            "dep2".to_string(),
-            make_task("dep2", "Unresolved", TaskStatus::InProgress),
-        );
-
-        let mut edges = EdgeStore::new();
-        edges.add("epic1", "dep1", "depends-on");
-        edges.add("epic1", "dep2", "depends-on");
-
-        let graph = make_graph(tasks, edges);
-        let err = check_epic_blockers(&graph, "epic1");
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_check_epic_blockers_missing_dep_task_blocks() {
-        // A depends-on edge pointing to a non-existent task should block
-        let mut tasks = FastHashMap::default();
-        tasks.insert(
-            "epic1".to_string(),
-            make_task("epic1", "Epic", TaskStatus::InProgress),
-        );
-
-        let mut edges = EdgeStore::new();
-        edges.add("epic1", "nonexistent", "depends-on");
-
-        let graph = make_graph(tasks, edges);
-        let err = check_epic_blockers(&graph, "epic1");
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_check_epic_blockers_suggests_restart() {
-        // Error message should mention --restart as a workaround
-        let mut tasks = FastHashMap::default();
-        tasks.insert(
-            "epic1".to_string(),
-            make_task("epic1", "Epic", TaskStatus::InProgress),
-        );
-        tasks.insert(
-            "dep1".to_string(),
-            make_task("dep1", "Dep", TaskStatus::Open),
-        );
-
-        let mut edges = EdgeStore::new();
-        edges.add("epic1", "dep1", "depends-on");
-
-        let graph = make_graph(tasks, edges);
-        let err = check_epic_blockers(&graph, "epic1").unwrap_err();
-        assert!(err.to_string().contains("--restart"));
-    }
-
-    // --- Epic resume decision matrix ---
-    //
-    // These test the branching logic at lines 313-340 of run_build_plan.
-    // We extract the decision into a helper and test all branches.
-
-    /// Simulates the epic resume decision matrix from run_build_plan.
-    /// Returns: (should_create_new, should_close_existing)
-    fn epic_resume_decision(
-        restart: bool,
-        existing_epic: Option<(&Task, bool)>, // (epic, has_subtasks)
-    ) -> (bool, bool) {
-        if restart {
-            let should_close = existing_epic
-                .map(|(e, _)| e.status != TaskStatus::Closed)
-                .unwrap_or(false);
-            return (true, should_close);
-        }
-        match existing_epic {
-            Some((epic, _)) if epic.status == TaskStatus::Closed => (true, false),
-            Some((_, true)) => (false, false), // Valid incomplete epic — reuse
-            Some((_, false)) => (true, true),  // Invalid epic (no subtasks) — close and create new
-            None => (true, false),             // No epic — create new
-        }
-    }
-
-    #[test]
-    fn test_epic_resume_no_existing_creates_new() {
-        let (create_new, close_existing) = epic_resume_decision(false, None);
-        assert!(create_new);
-        assert!(!close_existing);
-    }
-
-    #[test]
-    fn test_epic_resume_restart_always_creates_new() {
-        let epic = make_task("epic1", "Epic", TaskStatus::InProgress);
-        let (create_new, close_existing) = epic_resume_decision(true, Some((&epic, true)));
-        assert!(create_new);
-        assert!(close_existing);
-    }
-
-    #[test]
-    fn test_epic_resume_restart_closed_epic_no_close() {
-        let epic = make_task("epic1", "Epic", TaskStatus::Closed);
-        let (create_new, close_existing) = epic_resume_decision(true, Some((&epic, false)));
-        assert!(create_new);
-        assert!(!close_existing); // Already closed, no need to close again
-    }
-
-    #[test]
-    fn test_epic_resume_valid_incomplete_reuses() {
-        let epic = make_task("epic1", "Epic", TaskStatus::InProgress);
-        let (create_new, _) = epic_resume_decision(false, Some((&epic, true)));
-        assert!(!create_new); // Reuse existing
-    }
-
-    #[test]
-    fn test_epic_resume_invalid_epic_no_subtasks_closes_and_creates() {
-        let epic = make_task("epic1", "Epic", TaskStatus::Open);
-        let (create_new, close_existing) = epic_resume_decision(false, Some((&epic, false)));
-        assert!(create_new);
-        assert!(close_existing);
-    }
-
-    #[test]
-    fn test_epic_resume_closed_epic_creates_new() {
-        let epic = make_task("epic1", "Epic", TaskStatus::Closed);
-        let (create_new, close_existing) = epic_resume_decision(false, Some((&epic, false)));
-        assert!(create_new);
-        assert!(!close_existing); // Already closed
-    }
-
-    #[test]
-    fn test_epic_resume_restart_no_existing_creates_new() {
-        let (create_new, close_existing) = epic_resume_decision(true, None);
-        assert!(create_new);
-        assert!(!close_existing);
-    }
-
-    // --- Build flag resolution contract ---
-    // These verify that the --fix / --review / --fix-template flag
-    // resolution logic produces the correct (review, has_fix) pair.
-
-    fn resolve_build_flags(
-        review: bool,
-        review_template: Option<&str>,
-        fix: bool,
-        fix_template: Option<&str>,
-    ) -> (bool, bool) {
-        let fix_template = fix_template.map(|s| s.to_string()).or(if fix {
-            Some("fix".to_string())
-        } else {
-            None
-        });
-        let review = review_template.is_some() || review || fix_template.is_some();
-        let has_fix = fix_template.is_some();
-        (review, has_fix)
-    }
-
-    #[test]
-    fn test_build_flags_bare_build() {
-        let (review, has_fix) = resolve_build_flags(false, None, false, None);
-        assert!(!review);
-        assert!(!has_fix);
-    }
-
-    #[test]
-    fn test_build_flags_review_only() {
-        let (review, has_fix) = resolve_build_flags(true, None, false, None);
-        assert!(review);
-        assert!(!has_fix);
-    }
-
-    #[test]
-    fn test_build_flags_fix_implies_review() {
-        let (review, has_fix) = resolve_build_flags(false, None, true, None);
-        assert!(review);
-        assert!(has_fix);
-    }
-
-    #[test]
-    fn test_build_flags_fix_template_implies_both() {
-        let (review, has_fix) = resolve_build_flags(false, None, false, Some("custom/fix"));
-        assert!(review);
-        assert!(has_fix);
-    }
-
-    #[test]
-    fn test_build_flags_review_template_only() {
-        let (review, has_fix) = resolve_build_flags(false, Some("custom/review"), false, None);
-        assert!(review);
-        assert!(!has_fix);
-    }
-
-    #[test]
-    fn test_build_flags_all_flags() {
-        let (review, has_fix) =
-            resolve_build_flags(true, Some("custom/review"), true, Some("custom/fix"));
-        assert!(review);
-        assert!(has_fix);
-    }
-
-    // --- Stale build detection contract (pure logic) ---
-
-    fn find_stale_builds(tasks: &FastHashMap<String, Task>, plan_path: &str) -> Vec<String> {
-        tasks
-            .values()
-            .filter(|t| {
-                t.task_type.as_deref() == Some("orchestrator")
-                    && t.data.get("plan").map(|s| s.as_str()) == Some(plan_path)
-                    && (t.status == TaskStatus::InProgress || t.status == TaskStatus::Open)
-            })
-            .map(|t| t.id.clone())
-            .collect()
-    }
-
-    #[test]
-    fn test_stale_build_multiple_matches() {
-        let mut tasks = FastHashMap::default();
-        let plan = "ops/now/feature.md";
-
-        for (id, status) in [("b1", TaskStatus::InProgress), ("b2", TaskStatus::Open)] {
-            let mut data = HashMap::new();
-            data.insert("plan".to_string(), plan.to_string());
-            let mut task = make_task_with_data(id, "Build", status, data);
-            task.task_type = Some("orchestrator".to_string());
-            tasks.insert(id.to_string(), task);
-        }
-
-        // Add a closed one that should NOT be stale
-        let mut data = HashMap::new();
-        data.insert("plan".to_string(), plan.to_string());
-        let mut closed = make_task_with_data("b3", "Build", TaskStatus::Closed, data);
-        closed.task_type = Some("orchestrator".to_string());
-        tasks.insert("b3".to_string(), closed);
-
-        let stale = find_stale_builds(&tasks, plan);
-        assert_eq!(stale.len(), 2);
-        assert!(stale.contains(&"b1".to_string()));
-        assert!(stale.contains(&"b2".to_string()));
-    }
-
-    #[test]
-    fn test_stale_build_ignores_different_plan() {
-        let mut tasks = FastHashMap::default();
-        let mut data = HashMap::new();
-        data.insert("plan".to_string(), "ops/now/other.md".to_string());
-        let mut task = make_task_with_data("b1", "Build", TaskStatus::InProgress, data);
-        task.task_type = Some("orchestrator".to_string());
-        tasks.insert("b1".to_string(), task);
-
-        let stale = find_stale_builds(&tasks, "ops/now/feature.md");
-        assert!(stale.is_empty());
-    }
-
-    #[test]
-    fn test_stale_build_ignores_non_orchestrator() {
-        let mut tasks = FastHashMap::default();
-        let mut data = HashMap::new();
-        data.insert("plan".to_string(), "ops/now/feature.md".to_string());
-        let task = make_task_with_data("b1", "Regular task", TaskStatus::InProgress, data);
-        tasks.insert("b1".to_string(), task);
-
-        let stale = find_stale_builds(&tasks, "ops/now/feature.md");
-        assert!(stale.is_empty());
-    }
-
-    // --- Draft plan rejection contract ---
-
-    #[test]
-    fn test_draft_plan_blocks_build() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let plan_file = temp_dir.path().join("draft-plan.md");
-        std::fs::write(&plan_file, "---\ndraft: true\n---\n# My Plan\n").unwrap();
-        let metadata = crate::plans::parse_plan_metadata(&plan_file);
-        assert!(
-            metadata.draft,
-            "Plan with draft: true should be detected as draft"
-        );
-    }
-
-    #[test]
-    fn test_non_draft_plan_allowed() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let plan_file = temp_dir.path().join("ready-plan.md");
-        std::fs::write(&plan_file, "---\ndraft: false\n---\n# My Plan\n").unwrap();
-        let metadata = crate::plans::parse_plan_metadata(&plan_file);
-        assert!(
-            !metadata.draft,
-            "Plan with draft: false should not be draft"
-        );
-    }
-
-    #[test]
-    fn test_no_frontmatter_plan_not_draft() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let plan_file = temp_dir.path().join("no-fm.md");
-        std::fs::write(&plan_file, "# Simple Plan\n\nNo frontmatter here.\n").unwrap();
-        let metadata = crate::plans::parse_plan_metadata(&plan_file);
-        assert!(
-            !metadata.draft,
-            "Plan without frontmatter should not be draft"
-        );
-    }
-
-    // --- close_epic_as_invalid contract ---
-
-    #[test]
-    fn test_close_epic_as_invalid_uses_wontdo() {
-        // Verify the event construction: outcome must be WontDo
-        let outcome = TaskOutcome::WontDo;
-        assert!(
-            matches!(outcome, TaskOutcome::WontDo),
-            "Invalid epic closure must use WontDo outcome"
-        );
-    }
-
-    // --- Pre-refactor behavioral safety net tests ---
-
-    /// Draft plans cannot be built — run_build_plan rejects draft: true.
-    #[test]
-    fn test_draft_plan_rejected() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let plan_file = temp_dir.path().join("draft-plan.md");
-        std::fs::write(&plan_file, "---\ndraft: true\n---\n# Plan\n").unwrap();
-        let metadata = crate::plans::parse_plan_metadata(&plan_file);
-        assert!(metadata.draft, "Draft plan must be detected and rejected");
-    }
-
-    /// When an existing epic already has subtasks, reuse it (skip decompose).
-    /// The epic_resume_decision returns create_new=false when subtasks exist.
-    #[test]
-    fn test_epic_resume_skips_decompose_when_subtasks_exist() {
-        let epic = make_task("epic1", "Epic", TaskStatus::InProgress);
-        let has_subtasks = true;
-        let (create_new, close_existing) = epic_resume_decision(false, Some((&epic, has_subtasks)));
-        assert!(
-            !create_new,
-            "Should reuse existing epic when subtasks exist (skip decompose)"
-        );
-        assert!(!close_existing, "Should not close a valid in-progress epic");
-    }
-
-    /// --restart closes the existing in-progress epic before creating a new one.
-    #[test]
-    fn test_restart_closes_existing_epic() {
-        let epic = make_task("epic1", "Epic", TaskStatus::InProgress);
-        let (create_new, close_existing) = epic_resume_decision(true, Some((&epic, true)));
-        assert!(create_new, "--restart must create a new epic");
-        assert!(
-            close_existing,
-            "--restart must close the existing in-progress epic"
-        );
-    }
-
-    /// When the build target is an epic ID (task ID), the plan path is not
-    /// validated — run_build_epic does not call validate_plan_path. We verify
-    /// the routing: a task ID target takes the epic path, not the plan path.
-    #[test]
-    fn test_build_epic_id_skips_plan_validation() {
-        let epic_id = "mvslrspmoynoxyyywqyutmovxpvztkls";
-        assert!(is_task_id(epic_id), "Should be recognized as task ID");
-        // run_build_epic does NOT call validate_plan_path — verified by code
-        // inspection. This test locks down the routing decision: task IDs must
-        // take the epic path where no plan file validation occurs.
-        let plan_path = "nonexistent/path/to/plan.md";
-        assert!(
-            !is_task_id(plan_path),
-            "Plan path must NOT be routed as epic ID"
-        );
-    }
-
-    // --- Review + fix integration contract ---
-
-    /// has_actionable_issues returns true when issue_count > 0.
-    #[test]
-    fn test_has_review_issues_logic() {
-        let mut task = make_task("review1", "Review", TaskStatus::Closed);
-        task.data.insert("issue_count".to_string(), "3".to_string());
-        let has_issues = crate::reviews::has_actionable_issues(&task);
-        assert!(
-            has_issues,
-            "issue_count=3 should indicate actionable issues"
-        );
-    }
-
-    /// has_actionable_issues returns false when issue_count is 0.
-    #[test]
-    fn test_no_review_issues_logic() {
-        let mut task = make_task("review2", "Review", TaskStatus::Closed);
-        task.data.insert("issue_count".to_string(), "0".to_string());
-        let has_issues = crate::reviews::has_actionable_issues(&task);
-        assert!(
-            !has_issues,
-            "issue_count=0 should indicate no actionable issues"
-        );
     }
 }

@@ -1,8 +1,7 @@
 //! Reference scanning for plugin dependencies.
 //!
-//! Scans YAML and markdown files for plugin references: three-part template
-//! references (`ns/plugin/template`) and two-part include/composition
-//! references (`ns/plugin`).
+//! Scans YAML and markdown files for three-part template references
+//! (`ns/plugin/template`) and extracts unique `PluginRef` pairs.
 
 use std::collections::HashSet;
 use std::fs;
@@ -10,7 +9,7 @@ use std::path::Path;
 
 use super::PluginRef;
 
-/// Scan a directory for plugin references in hooks.yaml and tasks/**/*.md.
+/// Scan a directory for plugin references in hooks.yaml and templates/**/*.md.
 ///
 /// Returns unique `PluginRef` pairs found in active template syntax.
 /// Self-references (matching `self_ref`) are excluded.
@@ -29,8 +28,8 @@ pub fn derive_plugin_refs(dir: &Path, self_ref: Option<&PluginRef>) -> Vec<Plugi
         }
     }
 
-    // Scan tasks/**/*.md recursively
-    let templates_dir = dir.join("tasks");
+    // Scan templates/**/*.md recursively
+    let templates_dir = dir.join("templates");
     if templates_dir.is_dir() {
         scan_templates_dir(&templates_dir, &mut refs);
     }
@@ -65,12 +64,12 @@ fn scan_templates_dir(dir: &Path, refs: &mut HashSet<PluginRef>) {
     }
 }
 
-/// Scan YAML content for plugin references in `template:`, `include:`,
-/// `before:`, and `after:` keys.
+/// Scan YAML content for `template:` values that are three-part references.
 ///
-/// Parses the YAML structure and recursively walks all mappings. This avoids
-/// false positives from block scalars and correctly handles keys in any
-/// nesting position (e.g., list items, nested mappings).
+/// Parses the YAML structure and recursively walks all mappings to find keys
+/// named `template` whose values are strings. This avoids false positives from
+/// block scalars and correctly handles `template:` in any nesting position
+/// (e.g., list items, nested mappings).
 pub fn scan_yaml_for_refs(content: &str) -> Vec<PluginRef> {
     let doc: serde_yaml::Value = match serde_yaml::from_str(content) {
         Ok(v) => v,
@@ -82,12 +81,7 @@ pub fn scan_yaml_for_refs(content: &str) -> Vec<PluginRef> {
     refs
 }
 
-/// Recursively walk a YAML value tree, collecting plugin refs from known keys.
-///
-/// Recognized keys:
-/// - `template:` — three-part ref (`ns/plugin/template`)
-/// - `include:` — list of two-part refs (`ns/plugin`)
-/// - `before:` / `after:` — mappings containing `include:` lists
+/// Recursively walk a YAML value tree, collecting plugin refs from `template:` keys.
 fn collect_template_refs(value: &serde_yaml::Value, refs: &mut Vec<PluginRef>) {
     match value {
         serde_yaml::Value::Mapping(map) => {
@@ -101,10 +95,6 @@ fn collect_template_refs(value: &serde_yaml::Value, refs: &mut Vec<PluginRef>) {
                         }
                         continue;
                     }
-                    if key == "include" {
-                        collect_include_refs(v, refs);
-                        continue;
-                    }
                 }
                 collect_template_refs(v, refs);
             }
@@ -115,21 +105,6 @@ fn collect_template_refs(value: &serde_yaml::Value, refs: &mut Vec<PluginRef>) {
             }
         }
         _ => {}
-    }
-}
-
-/// Collect two-part plugin refs from an `include:` value.
-///
-/// The value is expected to be a sequence of strings (`ns/plugin`).
-fn collect_include_refs(value: &serde_yaml::Value, refs: &mut Vec<PluginRef>) {
-    if let serde_yaml::Value::Sequence(seq) = value {
-        for item in seq {
-            if let serde_yaml::Value::String(s) = item {
-                if let Ok(r) = s.parse::<PluginRef>() {
-                    refs.push(r);
-                }
-            }
-        }
     }
 }
 
@@ -283,7 +258,7 @@ other_key: aiki/core/not-a-template
 
     #[test]
     fn test_scan_yaml_ignores_two_part() {
-        let yaml = "template: review\n";
+        let yaml = "template: aiki/review\n";
         let refs = scan_yaml_for_refs(yaml);
         assert!(refs.is_empty());
     }
@@ -369,8 +344,8 @@ other_key: aiki/core/not-a-template
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
 
-        // Create tasks directory with markdown
-        let tmpl_dir = dir.join("tasks");
+        // Create templates directory with markdown
+        let tmpl_dir = dir.join("templates");
         fs::create_dir_all(&tmpl_dir).unwrap();
         fs::write(
             tmpl_dir.join("review.md"),
@@ -459,90 +434,5 @@ level1:
         assert!(result.contains("before"));
         assert!(result.contains("after"));
         assert!(!result.contains("hidden"));
-    }
-
-    #[test]
-    fn test_scan_yaml_finds_include_refs() {
-        let yaml = r#"
-include:
-  - aiki/default
-  - eslint/standard
-  - mycompany/security
-"#;
-        let refs = scan_yaml_for_refs(yaml);
-        assert_eq!(refs.len(), 3);
-        let names: Vec<String> = refs.iter().map(|r| r.to_string()).collect();
-        assert!(names.contains(&"aiki/default".to_string()));
-        assert!(names.contains(&"eslint/standard".to_string()));
-        assert!(names.contains(&"mycompany/security".to_string()));
-    }
-
-    #[test]
-    fn test_scan_yaml_finds_before_after_include_refs() {
-        let yaml = r#"
-name: aiki/default
-before:
-  include:
-    - aiki/setup
-after:
-  include:
-    - aiki/git-coauthors
-    - aiki/review-loop
-"#;
-        let refs = scan_yaml_for_refs(yaml);
-        assert_eq!(refs.len(), 3);
-        let names: Vec<String> = refs.iter().map(|r| r.to_string()).collect();
-        assert!(names.contains(&"aiki/setup".to_string()));
-        assert!(names.contains(&"aiki/git-coauthors".to_string()));
-        assert!(names.contains(&"aiki/review-loop".to_string()));
-    }
-
-    #[test]
-    fn test_scan_yaml_include_ignores_non_plugin_strings() {
-        let yaml = r#"
-include:
-  - aiki/default
-  - not-a-plugin
-  - too/many/parts/here
-"#;
-        let refs = scan_yaml_for_refs(yaml);
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].to_string(), "aiki/default");
-    }
-
-    #[test]
-    fn test_scan_yaml_mixed_template_and_include() {
-        let yaml = r#"
-include:
-  - eslint/standard
-review:
-  template: aiki/core/review-base
-after:
-  include:
-    - aiki/review-loop
-"#;
-        let refs = scan_yaml_for_refs(yaml);
-        assert_eq!(refs.len(), 3);
-        let names: Vec<String> = refs.iter().map(|r| r.to_string()).collect();
-        assert!(names.contains(&"eslint/standard".to_string()));
-        assert!(names.contains(&"aiki/core".to_string()));
-        assert!(names.contains(&"aiki/review-loop".to_string()));
-    }
-
-    #[test]
-    fn test_derive_plugin_refs_include_dedup() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let dir = tmp.path();
-
-        // Same plugin referenced via include and template
-        fs::write(
-            dir.join("hooks.yaml"),
-            "include:\n  - aiki/core\nreview:\n  template: aiki/core/review\n",
-        )
-        .unwrap();
-
-        let refs = derive_plugin_refs(dir, None);
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].to_string(), "aiki/core");
     }
 }

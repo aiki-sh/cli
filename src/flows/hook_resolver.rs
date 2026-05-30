@@ -2,8 +2,7 @@
 //!
 //! This module handles resolution of flow paths with namespacing:
 //! - `{namespace}/*` - Namespaced flows (e.g., `aiki/*`, `eslint/*`, `prettier/*`)
-//!   - Searches project `.aiki/hooks/{namespace}/` first, then `$AIKI_HOME/hooks/{namespace}/`,
-//!     then installed plugins at `$AIKI_HOME/plugins/{namespace}/`
+//!   - Searches project `.aiki/hooks/{namespace}/` first, then `~/.aiki/hooks/{namespace}/`
 //!
 //! All top-level directories in `.aiki/hooks/` are treated as namespaces.
 //!
@@ -22,7 +21,6 @@ use std::path::{Path, PathBuf};
 
 use super::path_resolver::PathResolver;
 use crate::error::{AikiError, Result};
-use crate::plugins::{self, PluginRef};
 
 /// High-level flow resolver (uses PathResolver + flow-specific logic).
 ///
@@ -30,7 +28,7 @@ use crate::plugins::{self, PluginRef};
 /// - `{namespace}/{name}` - Namespaced flows (e.g., `aiki/*`, `eslint/*`, `prettier/*`)
 ///   - All top-level directories in `.aiki/hooks/` are treated as namespaces
 ///   - `aiki` is just another namespace, not a special case
-///   - Searches: project hooks, user hooks, installed plugins
+///   - Searches project `.aiki/hooks/{namespace}/` first, then `~/.aiki/hooks/{namespace}/`
 ///
 /// # Example
 ///
@@ -51,6 +49,18 @@ pub struct HookResolver {
 }
 
 impl HookResolver {
+    /// Create a new HookResolver by discovering project root.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AikiError::NotInAikiProject` if no `.aiki/` directory is found.
+    #[allow(dead_code)] // Part of HookResolver API
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            path_resolver: PathResolver::new()?,
+        })
+    }
+
     /// Create a new HookResolver starting search from a specific directory.
     ///
     /// This is useful for testing or when you need to resolve paths from
@@ -67,8 +77,16 @@ impl HookResolver {
 
     /// Get the discovered project root directory.
     #[must_use]
+    #[allow(dead_code)] // Part of HookResolver API
     pub fn project_root(&self) -> &Path {
         self.path_resolver.project_root()
+    }
+
+    /// Get the home directory.
+    #[must_use]
+    #[allow(dead_code)] // Part of HookResolver API
+    pub fn home_dir(&self) -> &Path {
+        self.path_resolver.home_dir()
     }
 
     /// Resolve a flow path to an absolute, canonical PathBuf.
@@ -86,7 +104,7 @@ impl HookResolver {
     ///
     /// | Format | Search Order |
     /// |--------|--------------|
-    /// | `{namespace}/{name}` | 1. Project `.aiki/hooks/{namespace}/{name}.yml`<br>2. User `$AIKI_HOME/hooks/{namespace}/{name}.yml`<br>3. Installed `$AIKI_HOME/plugins/{namespace}/{name}/hooks.yaml`<br>4. Auto-fetch from GitHub, then re-check installed path |
+    /// | `{namespace}/{name}` | 1. Project `.aiki/hooks/{namespace}/{name}.yml`<br>2. User `~/.aiki/hooks/{namespace}/{name}.yml` |
     ///
     /// All top-level directories in `.aiki/hooks/` are treated as namespaces.
     /// Examples: `aiki/quick-lint`, `eslint/check-rules`, `prettier/format`, `mycompany/workflows`
@@ -138,16 +156,14 @@ impl HookResolver {
     ///
     /// Search order:
     /// 1. `{project}/.aiki/hooks/{namespace}/{name}.yml`
-    /// 2. `$AIKI_HOME/hooks/{namespace}/{name}.yml`
-    /// 3. `$AIKI_HOME/plugins/{namespace}/{name}/hooks.yaml`
-    /// 4. Auto-fetch from GitHub, then re-check installed path
+    /// 2. `~/.aiki/hooks/{namespace}/{name}.yml`
     ///
     /// # Arguments
     ///
     /// * `namespace` - The namespace (e.g., "aiki", "eslint", "prettier")
     /// * `name` - The flow name within the namespace (may contain slashes for nesting)
     fn resolve_namespaced_flow(&self, namespace: &str, name: &str) -> Result<PathBuf> {
-        // 1. Try project first: {project}/.aiki/hooks/{ns}/{name}.yml
+        // Try project first
         let project_path = self
             .path_resolver
             .project_root()
@@ -160,86 +176,16 @@ impl HookResolver {
             return Ok(project_path);
         }
 
-        // 2. Fall back to user: $AIKI_HOME/hooks/{ns}/{name}.yml
-        let user_path = crate::global::global_aiki_dir()
-            .join("hooks")
+        // Fall back to user
+        let user_path = self
+            .path_resolver
+            .home_dir()
+            .join(".aiki/hooks")
             .join(namespace)
             .join(name);
         let user_path = Self::add_yml_extension(&user_path);
 
-        if user_path.exists() {
-            return Ok(user_path);
-        }
-
-        // 3. Installed plugin: $AIKI_HOME/plugins/{ns}/{name}/hooks.yaml
-        let installed_plugin_path = crate::global::global_aiki_dir()
-            .join("plugins")
-            .join(namespace)
-            .join(name)
-            .join("hooks.yaml");
-
-        if installed_plugin_path.exists() {
-            return Ok(installed_plugin_path);
-        }
-
-        // 4. Auto-fetch: try to install the plugin from GitHub, then re-check
-        let plugin_ref: PluginRef = format!("{namespace}/{name}").parse()?;
-        let plugins_base = plugins::plugins_base_dir()?;
-        let plugin_name = format!("{namespace}/{name}");
-
-        // 4a. Check for a persisted fetch-failure marker (written by a prior
-        //     event in this session). Avoids repeated network calls and warning
-        //     spam across events.
-        if let Some(reason) = plugins::check_fetch_failed(&plugin_ref, &plugins_base) {
-            return Err(AikiError::AutoFetchCached {
-                plugin: plugin_name,
-                reason,
-            });
-        }
-
-        match plugins::install(&plugin_ref, &plugins_base, Some(self.project_root()), None) {
-            Err(e) => {
-                let reason = e.to_string();
-                plugins::mark_fetch_failed(&plugin_ref, &plugins_base, &reason);
-                return Err(AikiError::AutoFetchFailed {
-                    plugin: plugin_name,
-                    reason,
-                });
-            }
-            Ok(ref report) if !report.failed.is_empty() => {
-                let (failed_ref, failed_msg) = &report.failed[0];
-                let reason = if failed_ref.to_string() == plugin_name {
-                    failed_msg.clone()
-                } else {
-                    format!(
-                        "transitive dependency {} could not be fetched ({})",
-                        failed_ref, failed_msg
-                    )
-                };
-                plugins::mark_fetch_failed(&plugin_ref, &plugins_base, &reason);
-                return Err(AikiError::AutoFetchFailed {
-                    plugin: plugin_name,
-                    reason,
-                });
-            }
-            Ok(_) => {}
-        }
-
-        let installed_path = plugins_base
-            .join(namespace)
-            .join(name)
-            .join("hooks.yaml");
-
-        if installed_path.exists() {
-            return Ok(installed_path);
-        }
-
-        let reason = "auto-fetch succeeded but hooks.yaml missing".to_string();
-        plugins::mark_fetch_failed(&plugin_ref, &plugins_base, &reason);
-        Err(AikiError::AutoFetchFailed {
-            plugin: plugin_name,
-            reason,
-        })
+        Ok(user_path)
     }
 
     /// Add .yml extension if not already present.
@@ -367,12 +313,7 @@ version: "1"
         let resolver = HookResolver::with_start_dir(temp_dir.path()).unwrap();
 
         let result = resolver.resolve("aiki/nonexistent");
-        assert!(matches!(
-            result,
-            Err(AikiError::AutoFetchFailed { .. })
-                | Err(AikiError::AutoFetchCached { .. })
-                | Err(AikiError::HookNotFound { .. })
-        ));
+        assert!(matches!(result, Err(AikiError::HookNotFound { .. })));
     }
 
     #[test]
@@ -419,211 +360,5 @@ version: "1"
         let resolved = resolver.resolve("aiki/test.yaml").unwrap();
 
         assert!(resolved.to_string_lossy().ends_with(".yaml"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Auto-fetch tests
-    // -----------------------------------------------------------------------
-
-    /// Mutex + env override for AIKI_HOME (serializes tests that modify env).
-    static AIKI_HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_temp_aiki_home<F, R>(aiki_home: &Path, f: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        struct RestoreEnv(Option<String>);
-        impl Drop for RestoreEnv {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("AIKI_HOME", v),
-                    None => std::env::remove_var("AIKI_HOME"),
-                }
-            }
-        }
-
-        let _lock = AIKI_HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let _restore = RestoreEnv(std::env::var("AIKI_HOME").ok());
-        std::env::set_var("AIKI_HOME", aiki_home);
-        f()
-    }
-
-    #[test]
-    fn test_auto_fetch_triggered_for_uninstalled_plugin() {
-        let temp_dir = create_test_project();
-        let aiki_home = TempDir::new().unwrap();
-
-        // No plugin installed, auto-fetch will be attempted but fail (no network)
-        let result = with_temp_aiki_home(aiki_home.path(), || {
-            let resolver = HookResolver::with_start_dir(temp_dir.path()).unwrap();
-            resolver.resolve("fake/nonexistent")
-        });
-
-        assert!(
-            matches!(result, Err(AikiError::AutoFetchFailed { .. })),
-            "Uninstalled plugin should trigger auto-fetch and return AutoFetchFailed, got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_auto_fetch_error_includes_plugin_name() {
-        let temp_dir = create_test_project();
-        let aiki_home = TempDir::new().unwrap();
-
-        let result = with_temp_aiki_home(aiki_home.path(), || {
-            let resolver = HookResolver::with_start_dir(temp_dir.path()).unwrap();
-            resolver.resolve("myorg/myplugin")
-        });
-
-        match result {
-            Err(AikiError::AutoFetchFailed { plugin, .. }) => {
-                assert_eq!(plugin, "myorg/myplugin");
-            }
-            other => panic!(
-                "Expected AutoFetchFailed with plugin name, got: {:?}",
-                other
-            ),
-        }
-    }
-
-    #[test]
-    fn test_installed_plugin_hooks_yaml_found() {
-        let temp_dir = create_test_project();
-        let aiki_home = TempDir::new().unwrap();
-
-        // Install a fake plugin with hooks.yaml under AIKI_HOME
-        let plugin_dir = aiki_home
-            .path()
-            .join("plugins")
-            .join("testns")
-            .join("testplug");
-        fs::create_dir_all(plugin_dir.join(".git")).unwrap();
-        let hooks_path = plugin_dir.join("hooks.yaml");
-        fs::write(&hooks_path, "name: Test\nversion: '1'\n").unwrap();
-
-        let result = with_temp_aiki_home(aiki_home.path(), || {
-            let resolver = HookResolver::with_start_dir(temp_dir.path()).unwrap();
-            resolver.resolve("testns/testplug")
-        });
-
-        assert!(
-            result.is_ok(),
-            "Should resolve to installed plugin hooks.yaml, got: {:?}",
-            result
-        );
-        let resolved = result.unwrap();
-        assert!(
-            resolved.to_string_lossy().contains("hooks.yaml"),
-            "Resolved path should point to hooks.yaml: {}",
-            resolved.display()
-        );
-    }
-
-    #[test]
-    fn test_project_override_takes_priority_over_installed_plugin() {
-        let temp_dir = create_test_project();
-        let aiki_home = TempDir::new().unwrap();
-
-        // Create project-level hook
-        let project_hook = temp_dir.path().join(".aiki/hooks/testns/testplug.yml");
-        fs::create_dir_all(project_hook.parent().unwrap()).unwrap();
-        create_flow_file(&project_hook, "Project Override");
-
-        // Also install the plugin
-        let plugin_dir = aiki_home
-            .path()
-            .join("plugins")
-            .join("testns")
-            .join("testplug");
-        fs::create_dir_all(plugin_dir.join(".git")).unwrap();
-        fs::write(plugin_dir.join("hooks.yaml"), "name: Plugin\nversion: '1'\n").unwrap();
-
-        let result = with_temp_aiki_home(aiki_home.path(), || {
-            let resolver = HookResolver::with_start_dir(temp_dir.path()).unwrap();
-            resolver.resolve("testns/testplug")
-        });
-
-        assert!(result.is_ok());
-        let resolved = result.unwrap();
-        // Should resolve to project hook, not the plugin
-        assert!(
-            resolved.to_string_lossy().contains(".aiki/hooks"),
-            "Project override should take priority. Got: {}",
-            resolved.display()
-        );
-    }
-
-    #[test]
-    fn test_user_override_takes_priority_over_installed_plugin() {
-        let temp_dir = create_test_project();
-        let aiki_home = TempDir::new().unwrap();
-
-        // Create user-level hook at AIKI_HOME/hooks/testns/testplug.yml
-        let user_hook = aiki_home.path().join("hooks/testns/testplug.yml");
-        fs::create_dir_all(user_hook.parent().unwrap()).unwrap();
-        create_flow_file(&user_hook, "User Override");
-
-        // Also install the plugin
-        let plugin_dir = aiki_home
-            .path()
-            .join("plugins")
-            .join("testns")
-            .join("testplug");
-        fs::create_dir_all(plugin_dir.join(".git")).unwrap();
-        fs::write(plugin_dir.join("hooks.yaml"), "name: Plugin\nversion: '1'\n").unwrap();
-
-        let result = with_temp_aiki_home(aiki_home.path(), || {
-            let resolver = HookResolver::with_start_dir(temp_dir.path()).unwrap();
-            resolver.resolve("testns/testplug")
-        });
-
-        assert!(result.is_ok());
-        let resolved = result.unwrap();
-        // Should resolve to user hook, not the plugin
-        assert!(
-            resolved.to_string_lossy().contains("hooks/testns"),
-            "User override should take priority over installed plugin. Got: {}",
-            resolved.display()
-        );
-    }
-
-    #[test]
-    fn test_auto_fetch_hooks_yaml_missing_after_install() {
-        let temp_dir = create_test_project();
-        let aiki_home = TempDir::new().unwrap();
-
-        // Pre-install a plugin WITHOUT hooks.yaml (e.g., template-only plugin)
-        let plugin_dir = aiki_home
-            .path()
-            .join("plugins")
-            .join("tplonly")
-            .join("nofile");
-        fs::create_dir_all(plugin_dir.join(".git")).unwrap();
-        fs::write(plugin_dir.join("plugin.yaml"), "name: No Hooks\n").unwrap();
-        // Note: no hooks.yaml
-
-        // The resolver will find the installed plugin dir but hooks.yaml is missing.
-        // It will skip step 3 (hooks.yaml doesn't exist) and proceed to step 4 (auto-fetch).
-        // Auto-fetch will see the plugin is already installed and skip cloning.
-        // Then it checks for hooks.yaml again — still missing → AutoFetchFailed.
-        let result = with_temp_aiki_home(aiki_home.path(), || {
-            let resolver = HookResolver::with_start_dir(temp_dir.path()).unwrap();
-            resolver.resolve("tplonly/nofile")
-        });
-
-        match result {
-            Err(AikiError::AutoFetchFailed { reason, .. }) => {
-                assert!(
-                    reason.contains("hooks.yaml missing"),
-                    "Should mention hooks.yaml missing, got: {}",
-                    reason
-                );
-            }
-            other => panic!(
-                "Expected AutoFetchFailed about hooks.yaml, got: {:?}",
-                other
-            ),
-        }
     }
 }

@@ -205,7 +205,6 @@ pub fn run(agent: String, bin: Option<String>, agent_args: Vec<String>) -> Resul
     let mut agent = Command::new(&command)
         .args(&command_args)
         .env("AIKI_ENABLED", "true")
-        .env("AIKI_ACP_PROXY", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -429,8 +428,7 @@ pub fn run(agent: String, bin: Option<String>, agent_args: Vec<String>) -> Resul
                                 }
 
                                 // Extract agent_pid for PID-based session detection
-                                if let Some(pid) = params.get("agent_pid").and_then(|v| v.as_u64())
-                                {
+                                if let Some(pid) = params.get("agent_pid").and_then(|v| v.as_u64()) {
                                     agent_pid = Some(pid as u32);
                                     debug_log(|| {
                                         format!("ACP Proxy: Extracted agent_pid: {}", pid)
@@ -451,9 +449,7 @@ pub fn run(agent: String, bin: Option<String>, agent_args: Vec<String>) -> Resul
                             eprintln!(
                                 "[DEBUG session/load] request_id={:?} params.sessionId={:?}",
                                 msg.id,
-                                msg.params
-                                    .as_ref()
-                                    .and_then(|p| p.get("sessionId").and_then(|v| v.as_str()))
+                                msg.params.as_ref().and_then(|p| p.get("sessionId").and_then(|v| v.as_str()))
                             );
                             // Extract working directory from session requests
                             if let Some(params) = &msg.params {
@@ -485,7 +481,8 @@ pub fn run(agent: String, bin: Option<String>, agent_args: Vec<String>) -> Resul
                                 // DEBUG: Log session/prompt for duplicate session investigation
                                 eprintln!(
                                     "[DEBUG session/prompt] sessionId={} request_id={:?}",
-                                    session_id_str, msg.id
+                                    session_id_str,
+                                    msg.id
                                 );
 
                                 if !session_id_str.is_empty() {
@@ -636,10 +633,7 @@ pub fn run(agent: String, bin: Option<String>, agent_args: Vec<String>) -> Resul
                             format!("[acp] Reset autoreply counter for session: {}", session_id)
                         });
                     }
-                    StateMessage::TrackNewSession {
-                        request_id,
-                        agent_pid,
-                    } => {
+                    StateMessage::TrackNewSession { request_id, agent_pid } => {
                         // Track session/new request to match with response
                         session_new_requests.insert(JsonRpcId::from_value(&request_id), agent_pid);
                     }
@@ -787,9 +781,7 @@ pub fn run(agent: String, bin: Option<String>, agent_args: Vec<String>) -> Resul
                         eprintln!(
                             "[DEBUG Agent→IDE] method={} sessionId={:?}",
                             method,
-                            msg.params
-                                .as_ref()
-                                .and_then(|p| p.get("sessionId").and_then(|v| v.as_str()))
+                            msg.params.as_ref().and_then(|p| p.get("sessionId").and_then(|v| v.as_str()))
                         );
                     }
                     // Handle session/request_permission - fire change.permission_asked for file-modifying tools
@@ -908,7 +900,6 @@ pub fn run(agent: String, bin: Option<String>, agent_args: Vec<String>) -> Resul
             cwd: working_dir.clone(),
             timestamp: chrono::Utc::now(),
             reason: "connection_close".to_string(),
-            tokens: None,
         });
         if let Err(e) = event_bus::dispatch(event) {
             debug_log(|| format!("[acp] Failed to fire session.ended on close: {}", e));
@@ -1024,10 +1015,7 @@ mod tests {
 
     #[test]
     fn test_parse_agent_type_valid() {
-        assert!(matches!(
-            parse_agent_type("claude"),
-            Ok(AgentType::ClaudeCode)
-        ));
+        assert!(matches!(parse_agent_type("claude"), Ok(AgentType::ClaudeCode)));
         assert!(matches!(
             parse_agent_type("claude-code"),
             Ok(AgentType::ClaudeCode)
@@ -2273,10 +2261,7 @@ mod tests {
             shutdown.store(true, Ordering::Relaxed);
 
             let exited_cleanly = handle.join().expect("watchdog thread panicked");
-            assert!(
-                exited_cleanly,
-                "Watchdog should have exited due to shutdown flag"
-            );
+            assert!(exited_cleanly, "Watchdog should have exited due to shutdown flag");
         }
     }
 }

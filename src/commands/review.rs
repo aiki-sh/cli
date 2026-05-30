@@ -2,7 +2,7 @@
 //!
 //! This module provides the `aiki review` command which:
 //! - Creates a review task with subtasks (digest, review)
-//! - Runs the review task (default: blocking, --async: async, --start: hand off)
+//! - Runs the review task (default: completion, --async: async, --start: hand off)
 //! - Supports different review scopes (task ID or session)
 //! - Lists review tasks (list subcommand)
 //! - Shows review task details (show subcommand)
@@ -10,44 +10,142 @@
 use clap::Subcommand;
 use std::collections::HashMap;
 use std::env;
-use std::path::Path;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 
-use crate::output_utils;
-
-use crate::commands::OutputFormat;
+use crate::agents::{determine_reviewer, AgentType};
 use crate::error::{AikiError, Result};
-use crate::reviews::{get_issue_comments, Location};
-use crate::reviews::{is_review_task, issue_count};
-#[cfg(test)]
-use crate::tasks::looks_like_task_id;
+use crate::session::find_active_session;
+use crate::tasks::runner::{task_run, task_run_async, TaskRunOptions};
+use crate::tasks::templates::create_review_task_from_template;
 use crate::tasks::md::MdBuilder;
-use crate::tasks::{find_task, materialize_graph, read_events, Task, TaskStatus};
-use crate::workflow::review::ReviewOpts;
+use crate::tasks::{
+    find_task, get_current_scope_set, get_in_progress, get_ready_queue_for_scope_set,
+    materialize_graph, read_events, reassign_task, start_task_core, write_link_event,
+    write_link_event_with_autorun, Task, TaskComment, TaskStatus,
+};
 
-/// Parse and validate a severity value for clap's value_parser.
-fn parse_severity(s: &str) -> std::result::Result<String, String> {
-    match s {
-        "high" | "medium" | "low" => Ok(s.to_string()),
-        _ => Err(format!(
-            "invalid severity '{}': must be high, medium, or low",
-            s
-        )),
+/// What kind of review scope this is
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewScopeKind {
+    Task,
+    Plan,
+    Code,
+    Session,
+}
+
+impl ReviewScopeKind {
+    /// Convert to string representation for serialization
+    pub fn as_str(&self) -> &str {
+        match self {
+            ReviewScopeKind::Task => "task",
+            ReviewScopeKind::Plan => "plan",
+            ReviewScopeKind::Code => "code",
+            ReviewScopeKind::Session => "session",
+        }
+    }
+
+    /// Parse from string representation
+    pub fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "task" => Ok(ReviewScopeKind::Task),
+            "plan" => Ok(ReviewScopeKind::Plan),
+            "code" => Ok(ReviewScopeKind::Code),
+            "session" => Ok(ReviewScopeKind::Session),
+            _ => Err(AikiError::UnknownReviewScope(s.to_string())),
+        }
+    }
+}
+
+/// What is being reviewed and how
+#[derive(Debug, Clone)]
+pub struct ReviewScope {
+    pub kind: ReviewScopeKind,
+    /// Task ID or file path depending on kind
+    pub id: String,
+    /// Task IDs for session reviews (empty otherwise)
+    pub task_ids: Vec<String>,
+}
+
+impl ReviewScope {
+    /// Get display name (computed from kind and id)
+    pub fn name(&self) -> String {
+        match self.kind {
+            ReviewScopeKind::Task => format!("Task ({})", &self.id),
+            ReviewScopeKind::Plan => {
+                let filename = Path::new(&self.id)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&self.id);
+                format!("Plan ({})", filename)
+            }
+            ReviewScopeKind::Code => {
+                let filename = Path::new(&self.id)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&self.id);
+                format!("Code ({})", filename)
+            }
+            ReviewScopeKind::Session => "Session".to_string(),
+        }
+    }
+
+    /// Serialize to task data HashMap for persistence
+    pub fn to_data(&self) -> HashMap<String, String> {
+        let mut data = HashMap::new();
+        data.insert("scope.kind".into(), self.kind.as_str().into());
+        data.insert("scope.id".into(), self.id.clone());
+        data.insert("scope.name".into(), self.name());
+        if !self.task_ids.is_empty() {
+            data.insert("scope.task_ids".into(), self.task_ids.join(","));
+        }
+        data
+    }
+
+    /// Deserialize from task data HashMap
+    pub fn from_data(data: &HashMap<String, String>) -> Result<Self> {
+        let kind_str = data.get("scope.kind").ok_or_else(|| {
+            AikiError::InvalidArgument("Missing scope.kind in review task data".into())
+        })?;
+        let kind = ReviewScopeKind::from_str(kind_str)?;
+
+        // scope.id is required for non-Session scopes (Task, Plan, Code)
+        let id = match kind {
+            ReviewScopeKind::Session => {
+                data.get("scope.id").cloned().unwrap_or_default()
+            }
+            _ => {
+                data.get("scope.id")
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .ok_or_else(|| {
+                        AikiError::InvalidArgument(format!(
+                            "Missing scope.id in review task data (required for {:?} scope kind)",
+                            kind_str
+                        ))
+                    })?
+            }
+        };
+
+        Ok(Self {
+            kind,
+            id,
+            task_ids: data
+                .get("scope.task_ids")
+                .map(|s| s.split(',').map(String::from).collect())
+                .unwrap_or_default(),
+        })
     }
 }
 
 /// Review subcommands (for list, show, and issue management)
 #[derive(Subcommand)]
-#[command(disable_help_subcommand = true)]
 pub enum ReviewSubcommands {
     /// List review tasks
     List {
         /// Show all reviews (not just open)
         #[arg(long)]
         all: bool,
-
-        /// Limit the number of results shown
-        #[arg(long, short = 'n')]
-        number: Option<usize>,
     },
 
     /// Show review task details
@@ -65,7 +163,6 @@ pub enum ReviewSubcommands {
 
 /// Subcommands for managing review issues
 #[derive(Subcommand)]
-#[command(disable_help_subcommand = true)]
 pub enum ReviewIssueSubcommands {
     /// Add an issue to a review
     Add {
@@ -73,27 +170,11 @@ pub enum ReviewIssueSubcommands {
         review_id: String,
         /// Description of the issue
         text: String,
-        /// Issue severity: high, medium, or low (default: medium)
-        #[arg(long, value_parser = parse_severity)]
-        severity: Option<String>,
-        /// File location (path, path:line, or path:line-end). Repeatable.
-        #[arg(long = "file")]
-        files: Vec<String>,
-        /// Shorthand for --severity high
-        #[arg(long, conflicts_with = "severity")]
-        high: bool,
-        /// Shorthand for --severity low
-        #[arg(long, conflicts_with = "severity")]
-        low: bool,
     },
     /// List issues on a review
     List {
         /// The review task ID
         review_id: String,
-
-        /// Limit the number of results shown
-        #[arg(long, short = 'n')]
-        number: Option<usize>,
     },
 }
 
@@ -107,13 +188,9 @@ pub struct ReviewArgs {
     #[arg(long)]
     pub code: bool,
 
-    /// Auto-fix issues after review
-    #[arg(long, short = 'f')]
+    /// Review and auto-fix issues in one command
+    #[arg(long)]
     pub fix: bool,
-
-    /// Auto-fix with custom template (implies --fix)
-    #[arg(long = "fix-template")]
-    pub fix_template: Option<String>,
 
     /// Run review asynchronously (return immediately)
     #[arg(long = "async")]
@@ -123,7 +200,7 @@ pub struct ReviewArgs {
     #[arg(long)]
     pub start: bool,
 
-    /// Task template to use (default: scope-specific, e.g. review/task)
+    /// Task template to use (default: aiki/review)
     #[arg(long)]
     pub template: Option<String>,
 
@@ -131,103 +208,481 @@ pub struct ReviewArgs {
     #[arg(long)]
     pub agent: Option<String>,
 
-    /// Shorthand for --agent claude-code
-    #[arg(long, group = "agent_shorthand", conflicts_with = "agent")]
-    pub claude: bool,
-    /// Shorthand for --agent codex
-    #[arg(long, group = "agent_shorthand", conflicts_with = "agent")]
-    pub codex: bool,
-    /// Shorthand for --agent cursor
-    #[arg(long, group = "agent_shorthand", conflicts_with = "agent")]
-    pub cursor: bool,
-    /// Shorthand for --agent gemini
-    #[arg(long, group = "agent_shorthand", conflicts_with = "agent")]
-    pub gemini: bool,
-
-    /// Agent for coding/fixing tasks (default: claude-code)
-    #[arg(long)]
-    pub coder: Option<String>,
-
     /// Enable autorun (auto-start this review when its target closes)
     #[arg(long)]
     pub autorun: bool,
-
-    /// Output format (e.g., `id` for bare task ID on stdout)
-    #[arg(long, short = 'o', value_name = "FORMAT")]
-    pub output: Option<OutputFormat>,
-
-    /// Internal: continue an async review+fix from a previously created review task
-    #[arg(long = "_continue-async", hide = true)]
-    pub continue_async: Option<String>,
 
     /// Subcommand (list or show)
     #[command(subcommand)]
     pub subcommand: Option<ReviewSubcommands>,
 }
 
-impl crate::workflow::HasRunKind for ReviewArgs {
-    fn continue_async(&self) -> Option<&str> {
-        self.continue_async.as_deref()
-    }
-    fn run_async(&self) -> bool {
-        self.run_async
-    }
-    fn start(&self) -> bool {
-        self.start
-    }
-}
-
 /// Run the review command
-pub fn run(mut args: ReviewArgs) -> Result<()> {
-    use crate::session::flags::resolve_agent_shorthand;
-    args.agent = resolve_agent_shorthand(args.agent, args.claude, args.codex, args.cursor, args.gemini)
-        .map(|a| a.as_str().to_string());
-
+pub fn run(args: ReviewArgs) -> Result<()> {
     let cwd = env::current_dir()
         .map_err(|_| AikiError::InvalidArgument("Failed to get current directory".to_string()))?;
 
     // If a subcommand is provided, dispatch to it
     if let Some(subcommand) = args.subcommand {
         return match subcommand {
-            ReviewSubcommands::List { all, number } => list_reviews(&cwd, all, number),
+            ReviewSubcommands::List { all } => list_reviews(&cwd, all),
             ReviewSubcommands::Show { task_id } => show_review(&cwd, &task_id),
             ReviewSubcommands::Issue { command } => match command {
-                ReviewIssueSubcommands::Add {
-                    review_id,
-                    text,
-                    severity,
-                    files,
-                    high,
-                    low,
-                } => run_issue_add(&cwd, &review_id, &text, severity, &files, high, low),
-                ReviewIssueSubcommands::List { review_id, number } => {
-                    run_issue_list(&cwd, &review_id, number)
+                ReviewIssueSubcommands::Add { review_id, text } => {
+                    run_issue_add(&cwd, &review_id, &text)
                 }
+                ReviewIssueSubcommands::List { review_id } => run_issue_list(&cwd, &review_id),
             },
         };
     }
 
-    let opts = ReviewOpts::from_args(&args)?;
-    crate::workflow::review::run(&cwd, &opts)?;
+    // Otherwise, run the create/review flow with top-level args
+    run_review(
+        &cwd,
+        args.target,
+        args.code,
+        args.fix,
+        args.run_async,
+        args.start,
+        args.template,
+        args.agent,
+        args.autorun,
+    )
+}
+
+/// Parameters for creating a review task
+#[derive(Debug, Clone)]
+pub struct CreateReviewParams {
+    /// Pre-resolved review scope (caller detects target type)
+    pub scope: ReviewScope,
+    /// Override the reviewer agent
+    pub agent_override: Option<String>,
+    /// Template to use (default: aiki/review)
+    pub template: Option<String>,
+    /// Whether to auto-fix issues (sets data.options.fix)
+    pub fix: bool,
+    /// Enable autorun on the validates link (default: false, opt-in only)
+    pub autorun: bool,
+}
+
+/// Result of creating a review task
+#[derive(Debug, Clone)]
+pub struct CreateReviewResult {
+    /// The created review task ID
+    pub review_task_id: String,
+    /// The review scope (typed, replaces loose scope_name/scope_id)
+    pub scope: ReviewScope,
+    /// The assigned reviewer
+    pub assignee: Option<String>,
+}
+
+/// Check if a string looks like it could be a task ID, prefix, or subtask ID.
+///
+/// Task IDs are 32 lowercase letters (a-z only). Prefixes are shorter
+/// but follow the same pattern. Subtask IDs append `.N` suffixes
+/// (e.g., `abcdef.1`, `abcdef.1.2`). This is a heuristic used by
+/// detect_target to distinguish task IDs from file paths.
+fn looks_like_task_id(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    // Split off optional subtask suffix (e.g., "abc.1.2" → root "abc")
+    let root = s.split('.').next().unwrap_or(s);
+    // Root must be non-empty lowercase letters
+    if root.is_empty() || !root.chars().all(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    // Every part after the root must be a non-empty digit sequence
+    let mut parts = s.split('.');
+    parts.next(); // skip root
+    parts.all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Detect the review target from the CLI argument and flags.
+///
+/// Returns a `ReviewScope` and optionally a worker agent string (for task targets).
+/// The `cwd` is needed to resolve file paths and load tasks.
+pub fn detect_target(
+    cwd: &Path,
+    arg: Option<&str>,
+    code: bool,
+) -> Result<(ReviewScope, Option<String>)> {
+    match arg {
+        None => {
+            if code {
+                return Err(AikiError::InvalidArgument(
+                    "--code flag only applies to file targets".to_string(),
+                ));
+            }
+
+            // Session scope — collect closed tasks from current session
+            let events = read_events(cwd)?;
+            let tasks = materialize_graph(&events).tasks;
+            let session = find_active_session(cwd);
+
+            let (session_id, session_agent) = match &session {
+                Some(s) => (
+                    Some(s.session_id.clone()),
+                    Some(s.agent_type.as_str().to_string()),
+                ),
+                None => (None, None),
+            };
+
+            let closed_tasks: Vec<Task> = tasks
+                .values()
+                .filter(|t| {
+                    t.status == TaskStatus::Closed
+                        && match (&t.last_session_id, &session_id) {
+                            (Some(task_session), Some(current_session)) => {
+                                task_session == current_session
+                            }
+                            (_, None) => true,
+                            (None, Some(_)) => false,
+                        }
+                })
+                .cloned()
+                .collect();
+
+            if closed_tasks.is_empty() {
+                output_nothing_to_review()?;
+                return Err(AikiError::NothingToReview);
+            }
+
+            let task_ids: Vec<String> = closed_tasks.iter().map(|t| t.id.clone()).collect();
+            let fallback_id = {
+                let mut ids = task_ids.clone();
+                ids.sort();
+                let hash_input = ids.join(",");
+                uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, hash_input.as_bytes()).to_string()
+            };
+            let scope = ReviewScope {
+                kind: ReviewScopeKind::Session,
+                id: session_id.unwrap_or(fallback_id),
+                task_ids,
+            };
+            Ok((scope, session_agent))
+        }
+
+        Some(s) if s.ends_with(".md") && PathBuf::from(s).exists() => {
+            let kind = if code {
+                ReviewScopeKind::Code
+            } else {
+                ReviewScopeKind::Plan
+            };
+            Ok((
+                ReviewScope {
+                    kind,
+                    id: s.to_string(),
+                    task_ids: vec![],
+                },
+                None,
+            ))
+        }
+
+        Some(s) if s.ends_with(".md") => {
+            Err(AikiError::InvalidArgument(format!("File not found: {}", s)))
+        }
+
+        Some(s) if looks_like_task_id(s) => {
+            if code {
+                return Err(AikiError::InvalidArgument(
+                    "--code flag only applies to file targets".to_string(),
+                ));
+            }
+
+            let events = read_events(cwd)?;
+            let tasks = materialize_graph(&events).tasks;
+            let task = find_task(&tasks, s)?;
+            let worker = task.assignee.as_deref().map(|s| s.to_string());
+            let scope = ReviewScope {
+                kind: ReviewScopeKind::Task,
+                id: task.id.clone(),
+                task_ids: vec![],
+            };
+            Ok((scope, worker))
+        }
+
+        Some(s) if Path::new(s).exists() => {
+            Err(AikiError::InvalidArgument(
+                "File review only supports .md files currently".to_string(),
+            ))
+        }
+
+        Some(s) => {
+            Err(AikiError::InvalidArgument(format!("Target not found: {}", s)))
+        }
+    }
+}
+
+/// Core review creation logic. Used by both CLI and flow action.
+///
+/// This function creates the review task with subtasks but does NOT
+/// start or run the task. The caller is responsible for the execution mode.
+/// The scope must be pre-resolved by the caller (via `detect_target()` for CLI,
+/// or directly constructed for flow actions).
+pub fn create_review(cwd: &Path, params: CreateReviewParams) -> Result<CreateReviewResult> {
+    let scope = params.scope;
+
+    // Determine worker for reviewer assignment (for task scope)
+    let worker = match scope.kind {
+        ReviewScopeKind::Task => {
+            let events = read_events(cwd)?;
+            let tasks = materialize_graph(&events).tasks;
+            let task = find_task(&tasks, &scope.id)?;
+            task.assignee.as_deref().map(|s| s.to_string())
+        }
+        ReviewScopeKind::Session => {
+            find_active_session(cwd)
+                .map(|s| s.agent_type.as_str().to_string())
+        }
+        _ => None,
+    };
+
+    // Determine assignee for review task
+    let assignee = params
+        .agent_override
+        .or_else(|| Some(determine_reviewer(worker.as_deref())));
+
+    // Create review task with subtasks from template
+    let template = params.template.as_deref().unwrap_or("aiki/review");
+    let mut scope_data = scope.to_data();
+
+    // Add options data
+    if params.fix {
+        scope_data.insert("options.fix".to_string(), "true".to_string());
+    }
+
+    // Build sources for lineage (not routing)
+    let sources = match scope.kind {
+        ReviewScopeKind::Task => vec![format!("task:{}", scope.id)],
+        ReviewScopeKind::Plan | ReviewScopeKind::Code => {
+            vec![format!("file:{}", scope.id)]
+        }
+        _ => vec![],
+    };
+
+    let review_id = create_review_task_from_template(
+        cwd,
+        &scope_data,
+        &sources,
+        &assignee,
+        template,
+    )?;
+
+    // Emit validates link for task-scoped reviews: review validates the original task
+    // Autorun is opt-in only (--autorun flag); default is no autorun
+    if scope.kind == ReviewScopeKind::Task {
+        let events = read_events(cwd)?;
+        let graph = materialize_graph(&events);
+        let autorun = if params.autorun { Some(true) } else { None };
+        write_link_event_with_autorun(cwd, &graph, "validates", &review_id, &scope.id, autorun)?;
+    }
+
+    Ok(CreateReviewResult {
+        review_task_id: review_id,
+        scope,
+        assignee,
+    })
+}
+
+/// Core review implementation
+fn run_review(
+    cwd: &Path,
+    target: Option<String>,
+    code: bool,
+    fix: bool,
+    run_async: bool,
+    start: bool,
+    template_name: Option<String>,
+    agent: Option<String>,
+    autorun: bool,
+) -> Result<()> {
+    // Parse agent if provided
+    let agent_override = if let Some(ref agent_str) = agent {
+        let agent_type = AgentType::from_str(agent_str)
+            .ok_or_else(|| AikiError::UnknownAgentType(agent_str.clone()))?;
+        Some(agent_type.as_str().to_string())
+    } else {
+        None
+    };
+
+    // Detect target and resolve scope at CLI layer
+    let (scope, _worker) = match detect_target(cwd, target.as_deref(), code) {
+        Ok(r) => r,
+        Err(AikiError::NothingToReview) => {
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
+    // --fix is not supported for session reviews
+    if fix && scope.kind == ReviewScopeKind::Session {
+        return Err(AikiError::InvalidArgument(
+            "--fix is not supported for session reviews".to_string(),
+        ));
+    }
+
+    // Create review task using shared logic
+    let result = match create_review(
+        cwd,
+        CreateReviewParams {
+            scope,
+            agent_override,
+            template: template_name,
+            fix,
+            autorun,
+        },
+    ) {
+        Ok(r) => r,
+        Err(AikiError::NothingToReview) => {
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
+    let review_id = result.review_task_id;
+
+    // Re-read tasks to include newly created review task
+    let events = read_events(cwd)?;
+    let graph = materialize_graph(&events);
+    let tasks = &graph.tasks;
+    let scope_set = get_current_scope_set(&graph);
+    let in_progress: Vec<&Task> = get_in_progress(tasks).into_iter().collect();
+    let ready = get_ready_queue_for_scope_set(&graph, &scope_set);
+
+    let scope = &result.scope;
+
+    // Handle execution mode
+    if start {
+        // Reassign task to current agent (caller takes over)
+        if let Some(session) = find_active_session(cwd) {
+            reassign_task(cwd, &review_id, session.agent_type.as_str())?;
+        }
+        // Start task using core logic (validates, auto-stops, emits events)
+        start_task_core(cwd, &[review_id.clone()])?;
+        output_review_started(&review_id, scope, &in_progress, &ready)?;
+    } else if run_async {
+        // Run async and return immediately
+        let options = TaskRunOptions::new();
+        task_run_async(cwd, &review_id, options)?;
+        output_review_async(&review_id, scope)?;
+        // Output task ID to stdout if piped
+        if !std::io::stdout().is_terminal() {
+            println!("{}", review_id);
+        }
+    } else {
+        // Run to completion (default)
+        let options = TaskRunOptions::new();
+        task_run(cwd, &review_id, options)?;
+        output_review_completed(&review_id, scope)?;
+        // Output task ID to stdout if piped
+        if !std::io::stdout().is_terminal() {
+            println!("{}", review_id);
+        }
+    }
+
     Ok(())
 }
 
+/// Output message when there's nothing to review
+fn output_nothing_to_review() -> Result<()> {
+    use super::output::{CommandOutput, format_command_output};
+    let output = CommandOutput {
+        heading: "Approved",
+        task_id: "",
+        scope: None,
+        status: "Nothing to review - no closed tasks in session.",
+        issues: None,
+        hint: None,
+    };
+    let content = format_command_output(&output);
+    let md = MdBuilder::new("review").build(&content, &[], &[]);
+    eprintln!("{}", md);
+    Ok(())
+}
+
+/// Output review started message (for --start mode)
+fn output_review_started(review_id: &str, scope: &ReviewScope, in_progress: &[&Task], ready: &[&Task]) -> Result<()> {
+    use super::output::{CommandOutput, format_command_output};
+    let output = CommandOutput {
+        heading: "Review Started",
+        task_id: review_id,
+        scope: Some(scope),
+        status: "Review task started. You are now reviewing.",
+        issues: None,
+        hint: None,
+    };
+    let content = format_command_output(&output);
+    let md = MdBuilder::new("review").build(&content, in_progress, ready);
+    eprintln!("{}", md);
+
+    // Output task ID to stdout if piped
+    if !std::io::stdout().is_terminal() {
+        println!("{}", review_id);
+    }
+
+    Ok(())
+}
+
+/// Output review async message (for --async mode)
+fn output_review_async(review_id: &str, scope: &ReviewScope) -> Result<()> {
+    use super::output::{CommandOutput, format_command_output};
+    let output = CommandOutput {
+        heading: "Review Started",
+        task_id: review_id,
+        scope: Some(scope),
+        status: "Review started in background.",
+        issues: None,
+        hint: None,
+    };
+    let content = format_command_output(&output);
+    let md = MdBuilder::new("review").build(&content, &[], &[]);
+    eprintln!("{}", md);
+    Ok(())
+}
+
+/// Output review completed message (for blocking mode)
+fn output_review_completed(review_id: &str, scope: &ReviewScope) -> Result<()> {
+    use super::output::{CommandOutput, format_command_output};
+    // Only show fix hint for scopes that support fixing
+    let hint = if scope.kind == ReviewScopeKind::Session {
+        None
+    } else {
+        Some(format!("Run `aiki fix {}` to remediate.", review_id))
+    };
+    let output = CommandOutput {
+        heading: "Review Completed",
+        task_id: review_id,
+        scope: Some(scope),
+        status: "Review completed.",
+        issues: None,
+        hint,
+    };
+    let content = format_command_output(&output);
+    let md = MdBuilder::new("review").build(&content, &[], &[]);
+    eprintln!("{}", md);
+    Ok(())
+}
+
+/// Get all issue comments from a task (comments where data.issue == "true").
+///
+/// This is the canonical function for filtering issue comments — used by both
+/// `aiki review issue list` and `aiki fix`.
+pub fn get_issue_comments(task: &Task) -> Vec<&TaskComment> {
+    task.comments
+        .iter()
+        .filter(|c| c.data.get("issue").map(|v| v == "true").unwrap_or(false))
+        .collect()
+}
+
 /// Add an issue to a review task
-fn run_issue_add(
-    cwd: &Path,
-    review_id: &str,
-    text: &str,
-    severity: Option<String>,
-    files: &[String],
-    high: bool,
-    low: bool,
-) -> Result<()> {
+fn run_issue_add(cwd: &Path, review_id: &str, text: &str) -> Result<()> {
     let events = read_events(cwd)?;
     let tasks = materialize_graph(&events).tasks;
     let task = find_task(&tasks, review_id)?;
 
     // Validate it's a review task
-    if !is_review_task(task) {
+    if !super::fix::is_review_task(task) {
         return Err(AikiError::InvalidArgument(format!(
             "Task {} is not a review task.",
             review_id
@@ -246,93 +701,43 @@ fn run_issue_add(
     let mut data = HashMap::new();
     data.insert("issue".to_string(), "true".to_string());
 
-    // Resolve severity: --high/--low shorthands, explicit --severity, or default
-    let resolved_severity = if high {
-        "high"
-    } else if low {
-        "low"
-    } else {
-        severity.as_deref().unwrap_or("medium")
-    };
-    data.insert("severity".to_string(), resolved_severity.to_string());
-
-    // Parse and store file locations
-    if !files.is_empty() {
-        let locations: Vec<Location> = files
-            .iter()
-            .map(|f| Location::parse(f))
-            .collect::<Result<Vec<_>>>()?;
-
-        if locations.len() == 1 {
-            let loc = &locations[0];
-            data.insert("path".to_string(), loc.path.clone());
-            if let Some(start) = loc.start_line {
-                data.insert("start_line".to_string(), start.to_string());
-            }
-            if let Some(end) = loc.end_line {
-                data.insert("end_line".to_string(), end.to_string());
-            }
-        } else {
-            let parts: Vec<String> = locations.iter().map(|l| l.to_string()).collect();
-            data.insert("locations".to_string(), parts.join(","));
-        }
-    }
-
     super::task::comment_on_task(cwd, &task.id, text, data)?;
 
-    output_utils::emit(|| format!("Added issue to review {}", review_id));
+    eprintln!("Added issue to review {}", review_id);
     Ok(())
 }
 
 /// List issues on a review task
-fn run_issue_list(cwd: &Path, review_id: &str, number: Option<usize>) -> Result<()> {
+fn run_issue_list(cwd: &Path, review_id: &str) -> Result<()> {
     let events = read_events(cwd)?;
-    let graph = materialize_graph(&events);
-    let task = find_task(&graph.tasks, review_id)?;
+    let tasks = materialize_graph(&events).tasks;
+    let task = find_task(&tasks, review_id)?;
 
     // Validate it's a review task
-    if !is_review_task(task) {
+    if !super::fix::is_review_task(task) {
         return Err(AikiError::InvalidArgument(format!(
             "Task {} is not a review task.",
             review_id
         )));
     }
 
-    let mut issues = get_issue_comments(task);
-    if let Some(n) = number {
-        issues.truncate(n);
-    }
+    let issues = get_issue_comments(task);
+
     if issues.is_empty() {
-        output_utils::emit(|| "No issues found.\n".to_string());
-    } else {
-        output_utils::emit(|| {
-            let mut out = format!("{} issues:\n", issues.len());
-            for (i, issue) in issues.iter().enumerate() {
-                let severity = issue
-                    .data
-                    .get("severity")
-                    .map(|s| s.as_str())
-                    .unwrap_or("medium");
-                out.push_str(&format!("  {}. [{}] {}\n", i + 1, severity, issue.text));
-                // Show file locations if present
-                if let Some(files) = issue.data.get("files") {
-                    for file in files.split(',') {
-                        let file = file.trim();
-                        if !file.is_empty() {
-                            out.push_str(&format!("     {}\n", file));
-                        }
-                    }
-                }
-            }
-            out
-        });
+        eprintln!("No issues found on review {}", review_id);
+        return Ok(());
+    }
+
+    for comment in &issues {
+        let id = comment.id.as_deref().unwrap_or("unknown");
+        eprintln!("{}\t{}", id, &comment.text);
     }
 
     Ok(())
 }
 
 /// List review tasks
-fn list_reviews(cwd: &Path, all: bool, number: Option<usize>) -> Result<()> {
+fn list_reviews(cwd: &Path, all: bool) -> Result<()> {
     let events = read_events(cwd)?;
     let tasks = materialize_graph(&events).tasks;
 
@@ -349,49 +754,52 @@ fn list_reviews(cwd: &Path, all: bool, number: Option<usize>) -> Result<()> {
     // Sort by created_at (most recent first)
     reviews.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-    // Apply --number truncation
-    if let Some(n) = number {
-        reviews.truncate(n);
-    }
-
     if reviews.is_empty() {
-        output_utils::emit(|| {
-            let content = if all {
-                "No review tasks found.\n"
-            } else {
-                "No open review tasks. Use --all to see closed reviews.\n"
-            };
-            MdBuilder::new().build(content)
-        });
+        let content = if all {
+            "No review tasks found.\n"
+        } else {
+            "No open review tasks. Use --all to see closed reviews.\n"
+        };
+        let md = MdBuilder::new("review-list").build(content, &[], &[]);
+        eprintln!("{}", md);
         return Ok(());
     }
 
-    output_utils::emit(|| {
-        let mut content = String::from("## Reviews\n| ID | Status | Outcome | Issues | Name |\n|----|--------|---------|--------|------|\n");
-        for review in &reviews {
-            let status_str = match review.status {
-                TaskStatus::Open => "open",
-                TaskStatus::Reserved => "reserved",
-                TaskStatus::InProgress => "in_progress",
-                TaskStatus::Stopped => "stopped",
-                TaskStatus::Closed => "closed",
-            };
+    // Format review list
+    let mut content = String::from("## Reviews\n| ID | Status | Outcome | Issues | Name |\n|----|--------|---------|--------|------|\n");
+    for review in &reviews {
+        let status_str = match review.status {
+            TaskStatus::Open => "open",
+            TaskStatus::InProgress => "in_progress",
+            TaskStatus::Stopped => "stopped",
+            TaskStatus::Closed => "closed",
+        };
 
-            let outcome_str = review
-                .closed_outcome
-                .as_ref()
-                .map(|o| format!("{:?}", o).to_lowercase())
-                .unwrap_or_default();
+        let outcome_str = review
+            .closed_outcome
+            .as_ref()
+            .map(|o| format!("{:?}", o).to_lowercase())
+            .unwrap_or_default();
 
-            let ic = issue_count(&review);
+        let issue_count = if let Some(count) = review.data.get("issues_found") {
+            count.parse::<usize>().unwrap_or(review.comments.len())
+        } else {
+            // Backward compat: fall back to comment count
+            review.comments.len()
+        };
 
-            content.push_str(&format!(
-                "| {} | {} | {} | {} | {} |\n",
-                &review.id, status_str, outcome_str, ic, &review.name
-            ));
-        }
-        MdBuilder::new().build(&content)
-    });
+        content.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            &review.id,
+            status_str,
+            outcome_str,
+            issue_count,
+            &review.name
+        ));
+    }
+
+    let md = MdBuilder::new("review-list").build(&content, &[], &[]);
+    eprintln!("{}", md);
 
     Ok(())
 }
@@ -399,9 +807,9 @@ fn list_reviews(cwd: &Path, all: bool, number: Option<usize>) -> Result<()> {
 /// Show review task details
 fn show_review(cwd: &Path, task_id: &str) -> Result<()> {
     let events = read_events(cwd)?;
-    let graph = materialize_graph(&events);
+    let tasks = materialize_graph(&events).tasks;
 
-    let task = find_task(&graph.tasks, task_id)?;
+    let task = find_task(&tasks, task_id)?;
 
     // Verify it's a review task
     if task.task_type.as_deref() != Some("review") {
@@ -411,43 +819,101 @@ fn show_review(cwd: &Path, task_id: &str) -> Result<()> {
         )));
     }
 
-    let issues = get_issue_comments(task);
     let status_str = match task.status {
         TaskStatus::Open => "open",
-        TaskStatus::Reserved => "reserved",
         TaskStatus::InProgress => "in_progress",
         TaskStatus::Stopped => "stopped",
         TaskStatus::Closed => "closed",
     };
-    let scope_kind = task
-        .data
-        .get("scope.kind")
-        .map(|s| s.as_str())
-        .unwrap_or("unknown");
-    let scope_id = task.data.get("scope.id").map(|s| s.as_str()).unwrap_or("");
 
-    output_utils::emit(|| {
-        let mut out = format!("Review: {}\n", task_id);
-        out.push_str(&format!("Status: {}\n", status_str));
-        out.push_str(&format!("Scope: {} {}\n", scope_kind, scope_id));
-        if let Some(agent) = task.agent_label() {
-            out.push_str(&format!("Agent: {}\n", agent));
+    let outcome_str = task
+        .closed_outcome
+        .as_ref()
+        .map(|o| format!("{:?}", o).to_lowercase())
+        .unwrap_or_default();
+
+    let assignee_str = task
+        .assignee
+        .as_ref()
+        .map(|a| format!("- **Assignee:** {}\n", a))
+        .unwrap_or_default();
+
+    // Build content
+    let mut content = format!(
+        "## Review: {}\n- **ID:** {}\n- **Status:** {}\n",
+        &task.name, &task.id, status_str
+    );
+    if !outcome_str.is_empty() {
+        content.push_str(&format!("- **Outcome:** {}\n", outcome_str));
+    }
+    content.push_str(&assignee_str);
+
+    // Add sources if any
+    if !task.sources.is_empty() {
+        content.push_str("\n### Sources\n");
+        for source in &task.sources {
+            content.push_str(&format!("- {}\n", source));
         }
-        if issues.is_empty() {
-            out.push_str("Result: approved\n");
-        } else {
-            out.push_str(&format!("Issues: {}\n", issues.len()));
-            for (i, issue) in issues.iter().enumerate() {
-                let severity = issue
-                    .data
-                    .get("severity")
-                    .map(|s| s.as_str())
-                    .unwrap_or("medium");
-                out.push_str(&format!("  {}. [{}] {}\n", i + 1, severity, issue.text));
+    }
+
+    // Add issues and comments
+    if task.data.contains_key("issues_found") {
+        // Structured: show issues separately from regular comments
+        let issues = get_issue_comments(task);
+        if !issues.is_empty() {
+            content.push_str("\n### Issues\n");
+            for (idx, comment) in issues.iter().enumerate() {
+                content.push_str(&format!("{}. {}\n", idx + 1, &comment.text));
             }
         }
-        out
-    });
+        let regular: Vec<&TaskComment> = task
+            .comments
+            .iter()
+            .filter(|c| c.data.get("issue").map(|v| v != "true").unwrap_or(true))
+            .collect();
+        if !regular.is_empty() {
+            content.push_str("\n### Comments\n");
+            for comment in &regular {
+                content.push_str(&format!("- {}\n", &comment.text));
+            }
+        }
+    } else if !task.comments.is_empty() {
+        // Backward compat: show all comments as issues
+        content.push_str("\n### Issues\n");
+        for (idx, comment) in task.comments.iter().enumerate() {
+            content.push_str(&format!("{}. {}\n", idx + 1, &comment.text));
+        }
+    }
+
+    // Find followup tasks (tasks sourced from this review's comments)
+    let followups: Vec<&Task> = tasks
+        .values()
+        .filter(|t| {
+            t.sources.iter().any(|s| {
+                s.starts_with(&format!("comment:{}", task.id))
+                    || s.starts_with(&format!("task:{}", task.id))
+            })
+        })
+        .collect();
+
+    if !followups.is_empty() {
+        content.push_str("\n### Followups\n");
+        for followup in &followups {
+            let fu_status = match followup.status {
+                TaskStatus::Open => "open",
+                TaskStatus::InProgress => "in_progress",
+                TaskStatus::Stopped => "stopped",
+                TaskStatus::Closed => "closed",
+            };
+            content.push_str(&format!(
+                "- **{}** [{}] {}\n",
+                &followup.id, fu_status, &followup.name
+            ));
+        }
+    }
+
+    let md = MdBuilder::new("review-show").build(&content, &[], &[]);
+    eprintln!("{}", md);
 
     Ok(())
 }
@@ -456,47 +922,32 @@ fn show_review(cwd: &Path, task_id: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    use crate::agents::{determine_reviewer_with, AgentType};
-    use crate::reviews::{
-        detect_target, format_locations, parse_locations, ReviewScope, ReviewScopeKind,
-    };
-    use crate::tasks::TaskComment;
-
     #[test]
-    fn test_determine_reviewer_empty_list_errors() {
-        let result = determine_reviewer_with(None, &[]);
-        assert!(result.is_err());
+    fn test_determine_reviewer_opposite_claude() {
+        // Worker is claude-code, reviewer should be codex
+        let result = determine_reviewer(Some("claude-code"));
+        assert_eq!(result, "codex".to_string());
     }
 
     #[test]
-    fn test_determine_reviewer_single_agent_no_worker() {
-        let agents = [AgentType::ClaudeCode];
-        let result = determine_reviewer_with(None, &agents).unwrap();
-        assert_eq!(result, "claude-code");
+    fn test_determine_reviewer_opposite_codex() {
+        // Worker is codex, reviewer should be claude-code
+        let result = determine_reviewer(Some("codex"));
+        assert_eq!(result, "claude-code".to_string());
     }
 
     #[test]
-    fn test_determine_reviewer_single_agent_matching_worker() {
-        // Self-review when only the worker agent is available
-        let agents = [AgentType::ClaudeCode];
-        let result = determine_reviewer_with(Some("claude-code"), &agents).unwrap();
-        assert_eq!(result, "claude-code");
+    fn test_determine_reviewer_default() {
+        // No worker, default to codex
+        let result = determine_reviewer(None);
+        assert_eq!(result, "codex".to_string());
     }
 
     #[test]
-    fn test_determine_reviewer_two_agents_cross_review() {
-        let agents = [AgentType::ClaudeCode, AgentType::Codex];
-        // Worker is claude-code → reviewer should be codex
-        let result = determine_reviewer_with(Some("claude-code"), &agents).unwrap();
-        assert_eq!(result, "codex");
-    }
-
-    #[test]
-    fn test_determine_reviewer_unknown_worker() {
-        let agents = [AgentType::ClaudeCode, AgentType::Codex];
-        // Unknown worker → returns first available
-        let result = determine_reviewer_with(Some("unknown-agent"), &agents).unwrap();
-        assert_eq!(result, "claude-code");
+    fn test_determine_reviewer_unknown_agent() {
+        // Unknown worker, default to codex
+        let result = determine_reviewer(Some("unknown-agent"));
+        assert_eq!(result, "codex".to_string());
     }
 
     // ReviewScopeKind tests
@@ -511,22 +962,10 @@ mod tests {
 
     #[test]
     fn test_scope_kind_from_str() {
-        assert_eq!(
-            ReviewScopeKind::from_str("task").unwrap(),
-            ReviewScopeKind::Task
-        );
-        assert_eq!(
-            ReviewScopeKind::from_str("plan").unwrap(),
-            ReviewScopeKind::Plan
-        );
-        assert_eq!(
-            ReviewScopeKind::from_str("code").unwrap(),
-            ReviewScopeKind::Code
-        );
-        assert_eq!(
-            ReviewScopeKind::from_str("session").unwrap(),
-            ReviewScopeKind::Session
-        );
+        assert_eq!(ReviewScopeKind::from_str("task").unwrap(), ReviewScopeKind::Task);
+        assert_eq!(ReviewScopeKind::from_str("plan").unwrap(), ReviewScopeKind::Plan);
+        assert_eq!(ReviewScopeKind::from_str("code").unwrap(), ReviewScopeKind::Code);
+        assert_eq!(ReviewScopeKind::from_str("session").unwrap(), ReviewScopeKind::Session);
     }
 
     #[test]
@@ -755,7 +1194,7 @@ mod tests {
     #[test]
     fn test_detect_target_code_flag_task_id() {
         let dir = tempfile::tempdir().unwrap();
-        let result = detect_target(dir.path(), Some("klmnopqr"), true);
+        let result = detect_target(dir.path(), Some("abcdefgh"), true);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -784,15 +1223,22 @@ mod tests {
         // Not a file, not a task ID (has digits and hyphen)
         let result = detect_target(dir.path(), Some("not-a-target-123"), false);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Target not found"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Target not found"));
     }
 
     // looks_like_task_id tests
 
     #[test]
     fn test_looks_like_task_id_valid() {
-        assert!(looks_like_task_id("klmnopqrstuvwxyzklmnopqrstuvwxyz"));
-        assert!(looks_like_task_id("klm")); // prefix (3 chars minimum)
+        assert!(looks_like_task_id("abcdefghijklmnopqrstuvwxyzabcdef"));
+        assert!(looks_like_task_id("abc")); // prefix
+        assert!(looks_like_task_id("x"));
+        assert!(looks_like_task_id("abcdefghijklmnopqrstuvwxyzabcdef.1")); // subtask
+        assert!(looks_like_task_id("abcdefghijklmnopqrstuvwxyzabcdef.1.2")); // nested subtask
+        assert!(looks_like_task_id("abc.3")); // prefix with subtask
     }
 
     #[test]
@@ -800,530 +1246,10 @@ mod tests {
         assert!(!looks_like_task_id("")); // empty
         assert!(!looks_like_task_id("ABC")); // uppercase
         assert!(!looks_like_task_id("abc123")); // digits in root
-        assert!(!looks_like_task_id("abc")); // a-j not in k-z range
         assert!(!looks_like_task_id("ops/now/feature.md")); // path
         assert!(!looks_like_task_id("hello-world")); // hyphen
         assert!(!looks_like_task_id("has spaces")); // spaces
-        assert!(!looks_like_task_id("klm.1")); // dot notation removed
-    }
-
-    // Location tests
-
-    #[test]
-    fn test_location_parse_path_only() {
-        let loc = Location::parse("src/auth.rs").unwrap();
-        assert_eq!(loc.path, "src/auth.rs");
-        assert_eq!(loc.start_line, None);
-        assert_eq!(loc.end_line, None);
-    }
-
-    #[test]
-    fn test_location_parse_path_and_line() {
-        let loc = Location::parse("src/auth.rs:42").unwrap();
-        assert_eq!(loc.path, "src/auth.rs");
-        assert_eq!(loc.start_line, Some(42));
-        assert_eq!(loc.end_line, None);
-    }
-
-    #[test]
-    fn test_location_parse_path_and_range() {
-        let loc = Location::parse("src/auth.rs:42-50").unwrap();
-        assert_eq!(loc.path, "src/auth.rs");
-        assert_eq!(loc.start_line, Some(42));
-        assert_eq!(loc.end_line, Some(50));
-    }
-
-    #[test]
-    fn test_location_parse_empty() {
-        assert!(Location::parse("").is_err());
-        assert!(Location::parse("  ").is_err());
-    }
-
-    #[test]
-    fn test_location_parse_zero_line() {
-        assert!(Location::parse("src/auth.rs:0").is_err());
-    }
-
-    #[test]
-    fn test_location_parse_end_before_start() {
-        assert!(Location::parse("src/auth.rs:50-42").is_err());
-    }
-
-    #[test]
-    fn test_location_display_path_only() {
-        let loc = Location {
-            path: "src/auth.rs".into(),
-            start_line: None,
-            end_line: None,
-        };
-        assert_eq!(loc.to_string(), "src/auth.rs");
-    }
-
-    #[test]
-    fn test_location_display_with_line() {
-        let loc = Location {
-            path: "src/auth.rs".into(),
-            start_line: Some(42),
-            end_line: None,
-        };
-        assert_eq!(loc.to_string(), "src/auth.rs:42");
-    }
-
-    #[test]
-    fn test_location_display_with_range() {
-        let loc = Location {
-            path: "src/auth.rs".into(),
-            start_line: Some(42),
-            end_line: Some(50),
-        };
-        assert_eq!(loc.to_string(), "src/auth.rs:42-50");
-    }
-
-    #[test]
-    fn test_location_display_same_start_end() {
-        let loc = Location {
-            path: "src/auth.rs".into(),
-            start_line: Some(42),
-            end_line: Some(42),
-        };
-        assert_eq!(loc.to_string(), "src/auth.rs:42");
-    }
-
-    #[test]
-    fn test_parse_locations_empty() {
-        let data = HashMap::new();
-        assert!(parse_locations(&data).is_empty());
-    }
-
-    #[test]
-    fn test_parse_locations_single_path_only() {
-        let mut data = HashMap::new();
-        data.insert("path".into(), "src/auth.rs".into());
-        let locs = parse_locations(&data);
-        assert_eq!(locs.len(), 1);
-        assert_eq!(locs[0].path, "src/auth.rs");
-        assert_eq!(locs[0].start_line, None);
-    }
-
-    #[test]
-    fn test_parse_locations_single_with_lines() {
-        let mut data = HashMap::new();
-        data.insert("path".into(), "src/auth.rs".into());
-        data.insert("start_line".into(), "42".into());
-        data.insert("end_line".into(), "50".into());
-        let locs = parse_locations(&data);
-        assert_eq!(locs.len(), 1);
-        assert_eq!(locs[0].start_line, Some(42));
-        assert_eq!(locs[0].end_line, Some(50));
-    }
-
-    #[test]
-    fn test_parse_locations_multi() {
-        let mut data = HashMap::new();
-        data.insert(
-            "locations".into(),
-            "src/auth.rs:42-50,src/main.rs:108".into(),
-        );
-        let locs = parse_locations(&data);
-        assert_eq!(locs.len(), 2);
-        assert_eq!(locs[0].path, "src/auth.rs");
-        assert_eq!(locs[1].path, "src/main.rs");
-    }
-
-    #[test]
-    fn test_format_locations_empty() {
-        assert_eq!(format_locations(&[]), "");
-    }
-
-    #[test]
-    fn test_format_locations_single() {
-        let locs = vec![Location {
-            path: "src/auth.rs".into(),
-            start_line: Some(42),
-            end_line: Some(50),
-        }];
-        assert_eq!(format_locations(&locs), "(src/auth.rs:42-50)");
-    }
-
-    #[test]
-    fn test_format_locations_multiple() {
-        let locs = vec![
-            Location {
-                path: "src/auth.rs".into(),
-                start_line: Some(42),
-                end_line: Some(50),
-            },
-            Location {
-                path: "src/main.rs".into(),
-                start_line: Some(108),
-                end_line: None,
-            },
-        ];
-        assert_eq!(
-            format_locations(&locs),
-            "(src/auth.rs:42-50, src/main.rs:108)"
-        );
-    }
-
-    // ── Regression tests for review-fix execution paths ──────────────
-
-    fn make_test_task(id: &str) -> Task {
-        use crate::tasks::{TaskPriority, TaskStatus};
-        Task {
-            id: id.to_string(),
-            name: format!("Task {}", id),
-            slug: None,
-            task_type: None,
-            status: TaskStatus::Open,
-            priority: TaskPriority::P2,
-            assignee: None,
-            sources: Vec::new(),
-            template: None,
-            instructions: None,
-            data: HashMap::new(),
-            created_at: chrono::Utc::now(),
-            started_at: None,
-            claimed_by_session: None,
-            last_session_id: None,
-            stopped_reason: None,
-            closed_outcome: None,
-            confidence: None,
-            summary: None,
-            turn_started: None,
-            closed_at: None,
-            turn_closed: None,
-            turn_stopped: None,
-            comments: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn test_get_issue_comments_empty_task() {
-        let task = make_test_task("review-empty");
-        assert!(get_issue_comments(&task).is_empty());
-    }
-
-    #[test]
-    fn test_get_issue_comments_filters_non_issue_comments() {
-        let mut task = make_test_task("review-mixed");
-        // Regular comment (not an issue)
-        task.comments.push(TaskComment {
-            id: None,
-            text: "Looks good overall".to_string(),
-            timestamp: chrono::Utc::now(),
-            data: HashMap::new(),
-        });
-        // Progress comment
-        let mut progress_data = HashMap::new();
-        progress_data.insert("type".to_string(), "progress".to_string());
-        task.comments.push(TaskComment {
-            id: None,
-            text: "Still reviewing".to_string(),
-            timestamp: chrono::Utc::now(),
-            data: progress_data,
-        });
-        assert!(get_issue_comments(&task).is_empty());
-    }
-
-    #[test]
-    fn test_get_issue_comments_finds_issue_comments() {
-        let mut task = make_test_task("review-issues");
-        // Non-issue comment
-        task.comments.push(TaskComment {
-            id: None,
-            text: "Nice refactor".to_string(),
-            timestamp: chrono::Utc::now(),
-            data: HashMap::new(),
-        });
-        // Issue comment
-        let mut issue_data = HashMap::new();
-        issue_data.insert("issue".to_string(), "true".to_string());
-        issue_data.insert("severity".to_string(), "high".to_string());
-        task.comments.push(TaskComment {
-            id: None,
-            text: "Missing null check in auth handler".to_string(),
-            timestamp: chrono::Utc::now(),
-            data: issue_data,
-        });
-        // Another issue comment
-        let mut issue_data2 = HashMap::new();
-        issue_data2.insert("issue".to_string(), "true".to_string());
-        issue_data2.insert("severity".to_string(), "low".to_string());
-        task.comments.push(TaskComment {
-            id: None,
-            text: "Consider adding docstring".to_string(),
-            timestamp: chrono::Utc::now(),
-            data: issue_data2,
-        });
-
-        let issues = get_issue_comments(&task);
-        assert_eq!(issues.len(), 2);
-        assert_eq!(issues[0].text, "Missing null check in auth handler");
-        assert_eq!(issues[1].text, "Consider adding docstring");
-    }
-
-    #[test]
-    fn test_get_issue_comments_ignores_false_issue_flag() {
-        let mut task = make_test_task("review-false-issue");
-        let mut data = HashMap::new();
-        data.insert("issue".to_string(), "false".to_string());
-        task.comments.push(TaskComment {
-            id: None,
-            text: "Not actually an issue".to_string(),
-            timestamp: chrono::Utc::now(),
-            data,
-        });
-        assert!(get_issue_comments(&task).is_empty());
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Pre-refactor behavioral contract tests for review orchestration
-    // ═══════════════════════════════════════════════════════════════════
-
-    // --- detect_target contract ---
-
-    #[test]
-    fn test_detect_target_md_file_defaults_to_plan_scope() {
-        let dir = tempfile::tempdir().unwrap();
-        let md = dir.path().join("plan.md");
-        std::fs::write(&md, "# Plan").unwrap();
-        let (scope, _) = detect_target(dir.path(), Some(md.to_str().unwrap()), false).unwrap();
-        assert_eq!(scope.kind, ReviewScopeKind::Plan);
-    }
-
-    #[test]
-    fn test_detect_target_md_file_with_code_flag_is_code_scope() {
-        let dir = tempfile::tempdir().unwrap();
-        let md = dir.path().join("code.md");
-        std::fs::write(&md, "# Code").unwrap();
-        let (scope, _) = detect_target(dir.path(), Some(md.to_str().unwrap()), true).unwrap();
-        assert_eq!(scope.kind, ReviewScopeKind::Code);
-    }
-
-    #[test]
-    fn test_detect_target_missing_md_file_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = detect_target(dir.path(), Some("missing.md"), false);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_detect_target_code_flag_without_target_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = detect_target(dir.path(), None, true);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("--code"));
-    }
-
-    #[test]
-    fn test_detect_target_code_flag_with_task_id_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = detect_target(dir.path(), Some("klmnopqr"), true);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("--code"));
-    }
-
-    #[test]
-    fn test_detect_target_non_md_file_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let txt = dir.path().join("file.txt");
-        std::fs::write(&txt, "content").unwrap();
-        let result = detect_target(dir.path(), Some(txt.to_str().unwrap()), false);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains(".md"));
-    }
-
-    // --- looks_like_task_id contract ---
-
-    #[test]
-    fn test_looks_like_task_id_full_id() {
-        assert!(looks_like_task_id("klmnopqrstuvwxyzklmnopqrstuvwxyz"));
-    }
-
-    #[test]
-    fn test_looks_like_task_id_prefix() {
-        assert!(looks_like_task_id("klm"));
-        assert!(looks_like_task_id("xyz")); // 3-char minimum prefix
-    }
-
-    #[test]
-    fn test_looks_like_task_id_rejects_dot_notation() {
-        assert!(!looks_like_task_id("klm.1"));
-        assert!(!looks_like_task_id("klm.1.2"));
-    }
-
-    #[test]
-    fn test_looks_like_task_id_rejects_paths() {
-        assert!(!looks_like_task_id("ops/now/feature.md"));
-        assert!(!looks_like_task_id("./feature.md"));
-        assert!(!looks_like_task_id("/abs/path"));
-    }
-
-    #[test]
-    fn test_looks_like_task_id_rejects_mixed_chars() {
-        assert!(!looks_like_task_id("abc123")); // digits in root
-        assert!(!looks_like_task_id("ABC")); // uppercase
-        assert!(!looks_like_task_id("hello-world")); // hyphen
-        assert!(!looks_like_task_id("")); // empty
         assert!(!looks_like_task_id(".1")); // no root
-        assert!(!looks_like_task_id("klm.")); // trailing dot
-    }
-
-    // --- get_issue_comments contract ---
-
-    #[test]
-    fn test_get_issue_comments_only_returns_true_issues() {
-        use crate::tasks::TaskComment;
-        let mut task = make_test_task("review-filter");
-
-        // Non-issue comment
-        task.comments.push(TaskComment {
-            id: None,
-            text: "Looks good".to_string(),
-            timestamp: chrono::Utc::now(),
-            data: HashMap::new(),
-        });
-
-        // Issue with data.issue="true"
-        let mut issue_data = HashMap::new();
-        issue_data.insert("issue".to_string(), "true".to_string());
-        task.comments.push(TaskComment {
-            id: None,
-            text: "Bug here".to_string(),
-            timestamp: chrono::Utc::now(),
-            data: issue_data,
-        });
-
-        // Comment with data.issue="false" — NOT an issue
-        let mut false_data = HashMap::new();
-        false_data.insert("issue".to_string(), "false".to_string());
-        task.comments.push(TaskComment {
-            id: None,
-            text: "Resolved".to_string(),
-            timestamp: chrono::Utc::now(),
-            data: false_data,
-        });
-
-        let issues = get_issue_comments(&task);
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].text, "Bug here");
-    }
-
-    // --- ReviewScope.name() contract ---
-
-    #[test]
-    fn test_review_scope_name_includes_filename_for_plan() {
-        let scope = ReviewScope {
-            kind: ReviewScopeKind::Plan,
-            id: "ops/now/very/deep/plan.md".to_string(),
-            task_ids: vec![],
-        };
-        assert_eq!(scope.name(), "Plan (plan.md)");
-    }
-
-    #[test]
-    fn test_review_scope_name_session_is_plain() {
-        let scope = ReviewScope {
-            kind: ReviewScopeKind::Session,
-            id: "anything".to_string(),
-            task_ids: vec![],
-        };
-        assert_eq!(scope.name(), "Session");
-    }
-
-    // --- ReviewScopeKind roundtrip contract ---
-
-    #[test]
-    fn test_scope_kind_roundtrip_all_variants() {
-        for kind in [
-            ReviewScopeKind::Task,
-            ReviewScopeKind::Plan,
-            ReviewScopeKind::Code,
-            ReviewScopeKind::Session,
-        ] {
-            let s = kind.as_str();
-            let restored = ReviewScopeKind::from_str(s).unwrap();
-            assert_eq!(restored, kind);
-        }
-    }
-
-    // --- create_review params contract: scope-specific default templates ---
-
-    #[test]
-    fn test_default_template_for_session_scope() {
-        let kind = ReviewScopeKind::Session;
-        let default = match kind {
-            ReviewScopeKind::Session => "review/task".to_string(),
-            _ => format!("review/{}", kind.as_str()),
-        };
-        assert_eq!(default, "review/task");
-    }
-
-    #[test]
-    fn test_default_template_for_task_scope() {
-        let kind = ReviewScopeKind::Task;
-        let default = match kind {
-            ReviewScopeKind::Session => "review/task".to_string(),
-            _ => format!("review/{}", kind.as_str()),
-        };
-        assert_eq!(default, "review/task");
-    }
-
-    #[test]
-    fn test_default_template_for_plan_scope() {
-        let kind = ReviewScopeKind::Plan;
-        let default = match kind {
-            ReviewScopeKind::Session => "review/task".to_string(),
-            _ => format!("review/{}", kind.as_str()),
-        };
-        assert_eq!(default, "review/plan");
-    }
-
-    #[test]
-    fn test_default_template_for_code_scope() {
-        let kind = ReviewScopeKind::Code;
-        let default = match kind {
-            ReviewScopeKind::Session => "review/task".to_string(),
-            _ => format!("review/{}", kind.as_str()),
-        };
-        assert_eq!(default, "review/code");
-    }
-
-    // --- Scope data includes fix options when provided ---
-
-    #[test]
-    fn test_scope_data_stores_fix_options() {
-        let mut scope_data = ReviewScope {
-            kind: ReviewScopeKind::Task,
-            id: "task123".to_string(),
-            task_ids: vec![],
-        }
-        .to_data();
-
-        // Simulate what create_review does when fix_template is provided
-        let fix_template = Some("custom/fix".to_string());
-        if let Some(ref tmpl) = fix_template {
-            scope_data.insert("options.fix".to_string(), "true".to_string());
-            scope_data.insert("options.fix_template".to_string(), tmpl.clone());
-        }
-
-        assert_eq!(scope_data.get("options.fix").unwrap(), "true");
-        assert_eq!(
-            scope_data.get("options.fix_template").unwrap(),
-            "custom/fix"
-        );
-    }
-
-    #[test]
-    fn test_scope_data_no_fix_options_when_none() {
-        let scope_data = ReviewScope {
-            kind: ReviewScopeKind::Task,
-            id: "task123".to_string(),
-            task_ids: vec![],
-        }
-        .to_data();
-
-        assert!(scope_data.get("options.fix").is_none());
-        assert!(scope_data.get("options.fix_template").is_none());
+        assert!(!looks_like_task_id("abc.")); // trailing dot, empty suffix
     }
 }

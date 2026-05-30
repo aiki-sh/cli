@@ -2,10 +2,6 @@
 name = "aiki"
 version = "0.1.0"
 edition = "2021"
-license = "MPL-2.0"
-description = "AI-native task tracking and agent orchestration CLI"
-homepage = "https://github.com/glasner/aiki"
-repository = "https://github.com/glasner/aiki"
 
 [lib]
 name = "aiki"
@@ -44,22 +40,15 @@ sha2 = "0.10"
 hex = "0.4"
 globset = "0.4"
 rand = "0.8"
-include_dir = "0.7"
 regex = "1.0"
 libc = "0.2"
 flate2 = "1.0"
 prost = "0.13"
-crossbeam-channel = "0.5"
 crossterm = "0.28"
 ctrlc = "3.4"
-signal-hook = "0.3"
 ahash = "0.8"
-fd-lock = "4.0"
 hashbrown = "0.14"
-rhai = { version = "1.24", features = ["internals"] }
-ratatui = { version = "0.30", features = ["scrolling-regions"] }
-ratatui-macros = "0.7"
-terminal-colorsaurus = "0.4"
+rhai = "1.24"
 
 [dev-dependencies]
 assert_cmd = "2.0"
@@ -67,15 +56,3 @@ predicates = "3.0"
 tempfile = "3.0"
 criterion = "0.5"
 uuid = { version = "1.0", features = ["v4"] }
-jsonschema = "0.18"
-
-# The profile that 'dist' will build with
-[profile.dist]
-inherits = "release"
-lto = "thin"
-
-
-
-[package.metadata.dist]
-# Homebrew tap to publish formula to
-tap = "glasner/homebrew-tap"

@@ -10,8 +10,6 @@ pub struct AikiSessionStartPayload {
     pub session: AikiSession,
     pub cwd: PathBuf,
     pub timestamp: DateTime<Utc>,
-    #[serde(default)]
-    pub transcript_path: Option<String>,
 }
 
 /// Handle session.started event
@@ -23,11 +21,6 @@ pub fn handle_session_started(payload: AikiSessionStartPayload) -> Result<HookRe
     use super::prelude::execute_hook;
 
     debug_log(|| format!("Session started by {:?}", payload.session.agent_type()));
-
-    // Clear fetch-failure markers from a prior session so plugins are retried.
-    if let Ok(plugins_base) = crate::plugins::plugins_base_dir() {
-        crate::plugins::clear_all_fetch_failed(&plugins_base);
-    }
 
     // Clean up sessions from crashed agents (PID-based)
     prune_dead_pid_sessions();
@@ -58,7 +51,6 @@ pub fn handle_session_started(payload: AikiSessionStartPayload) -> Result<HookRe
         payload.timestamp,
         repo_id.as_deref(),
         Some(&cwd_str),
-        payload.transcript_path.as_deref(),
     ) {
         debug_log(|| format!("Failed to record session start: {}", e));
     }

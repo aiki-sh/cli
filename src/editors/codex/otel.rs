@@ -196,16 +196,13 @@ pub struct SpanEvent {
 // ============================================================================
 
 /// Parsed Codex OTel event
-///
-/// Note: `ConversationStarts` and `UserPrompt` are now superseded by native
-/// Codex hooks (`sessionStart` and `userPromptSubmit`) and are ignored by the
-/// receiver. OTEL remains authoritative for Codex tool-derived file events that
-/// do not have native hook equivalents.
 #[derive(Debug, Clone)]
 pub enum CodexOtelEvent {
-    /// `codex.conversation_starts` - Session started (superseded by native `sessionStart` hook)
-    ConversationStarts { conversation_id: String },
-    /// `codex.user_prompt` - Turn started (superseded by native `userPromptSubmit` hook)
+    /// `codex.conversation_starts` - New session started
+    ConversationStarts {
+        conversation_id: String,
+    },
+    /// `codex.user_prompt` - Turn started (user submitted prompt)
     UserPrompt {
         conversation_id: String,
         prompt: Option<String>,
@@ -216,15 +213,10 @@ pub enum CodexOtelEvent {
         tool_name: Option<String>,
         arguments: Option<String>,
     },
-    /// `codex.tool_decision` - Tool approval/denial before execution
-    ToolDecision {
-        conversation_id: String,
-        tool_name: Option<String>,
-        arguments: Option<String>,
-        decision: Option<String>,
-    },
     /// Unrecognized event (acknowledged but not processed)
-    Unknown { event_name: String },
+    Unknown {
+        event_name: String,
+    },
 }
 
 /// Additional context captured from OTel resource/log attributes.
@@ -234,141 +226,6 @@ pub struct CodexOtelContext {
     pub agent_pid: Option<u32>,
     pub cwd: Option<PathBuf>,
 }
-
-// ============================================================================
-// Tool Classification
-// ============================================================================
-
-/// Classification of Codex tool types for event routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolKind {
-    /// Read operations: read_file, list_dir, grep_files, view_image, MCP reads
-    Read,
-    /// Write operations: apply_patch (the ONLY file-modifying tool)
-    Write,
-    /// Shell operations: shell, shell_command, exec_command, write_stdin
-    Shell,
-    /// Everything else: web_search, update_plan, agent tools, etc.
-    Other,
-}
-
-/// Classify a Codex tool by operation type.
-pub fn classify_tool(tool_name: &str) -> ToolKind {
-    match tool_name {
-        "read_file" | "list_dir" | "grep_files" | "view_image" | "list_mcp_resources"
-        | "read_mcp_resource" => ToolKind::Read,
-        "apply_patch" => ToolKind::Write,
-        "shell" | "shell_command" | "exec_command" | "write_stdin" => ToolKind::Shell,
-        _ => ToolKind::Other,
-    }
-}
-
-/// Parse apply_patch content to extract affected file paths.
-///
-/// The patch format uses headers to indicate operations:
-/// - `*** Add File:` → create new file
-/// - `*** Delete File:` → delete file
-/// - `*** Update File:` → edit file (may include `*** Move to:` for rename)
-///
-/// Returns a list of (operation_type, file_path) pairs where operation_type
-/// is "write", "delete", or "move".
-pub fn parse_apply_patch(patch_content: &str) -> Vec<(&'static str, String)> {
-    let mut results = Vec::new();
-    let mut current_file: Option<String> = None;
-    let mut current_op: Option<&str> = None;
-    let mut move_target: Option<String> = None;
-
-    for line in patch_content.lines() {
-        if let Some(file) = line.strip_prefix("*** Add File: ").or_else(|| line.strip_prefix("*** Add File:")) {
-            // Flush previous
-            if let (Some(op), Some(f)) = (current_op.take(), current_file.take()) {
-                if op == "move" {
-                    if let Some(target) = move_target.take() {
-                        results.push(("move", format!("{}:{}", f, target)));
-                    }
-                } else {
-                    results.push((op, f));
-                }
-            }
-            current_file = Some(file.trim().to_string());
-            current_op = Some("write");
-        } else if let Some(file) = line.strip_prefix("*** Delete File: ").or_else(|| line.strip_prefix("*** Delete File:")) {
-            if let (Some(op), Some(f)) = (current_op.take(), current_file.take()) {
-                if op == "move" {
-                    if let Some(target) = move_target.take() {
-                        results.push(("move", format!("{}:{}", f, target)));
-                    }
-                } else {
-                    results.push((op, f));
-                }
-            }
-            current_file = Some(file.trim().to_string());
-            current_op = Some("delete");
-        } else if let Some(file) = line.strip_prefix("*** Update File: ").or_else(|| line.strip_prefix("*** Update File:")) {
-            if let (Some(op), Some(f)) = (current_op.take(), current_file.take()) {
-                if op == "move" {
-                    if let Some(target) = move_target.take() {
-                        results.push(("move", format!("{}:{}", f, target)));
-                    }
-                } else {
-                    results.push((op, f));
-                }
-            }
-            current_file = Some(file.trim().to_string());
-            current_op = Some("write");
-        } else if let Some(target) = line.strip_prefix("*** Move to: ").or_else(|| line.strip_prefix("*** Move to:")) {
-            move_target = Some(target.trim().to_string());
-            current_op = Some("move");
-        }
-    }
-
-    // Flush final
-    if let (Some(op), Some(f)) = (current_op, current_file) {
-        if op == "move" {
-            if let Some(target) = move_target {
-                results.push(("move", format!("{}:{}", f, target)));
-            }
-        } else {
-            results.push((op, f));
-        }
-    }
-
-    results
-}
-
-/// Extract file path from read tool arguments JSON.
-#[allow(dead_code)]
-pub fn extract_read_path(arguments: &str) -> Option<String> {
-    let json: serde_json::Value = serde_json::from_str(arguments).ok()?;
-    for key in &["path", "file_path", "file", "filename"] {
-        if let Some(serde_json::Value::String(p)) = json.get(key) {
-            return Some(p.clone());
-        }
-    }
-    None
-}
-
-/// Extract patch content from apply_patch arguments JSON.
-pub fn extract_patch_content(arguments: &str) -> Option<String> {
-    let trimmed = arguments.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    if trimmed.starts_with("*** Begin Patch") {
-        return Some(trimmed.to_string());
-    }
-
-    let json: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-    json.get("patch")
-        .or_else(|| json.get("content"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-// ============================================================================
-// OTLP Parsing
-// ============================================================================
 
 /// Parse an OTLP/HTTP protobuf payload into Codex events
 ///
@@ -399,8 +256,8 @@ pub fn parse_otlp_logs(data: &[u8]) -> Vec<(CodexOtelEvent, CodexOtelContext)> {
         for (si, scope_logs) in resource_logs.scope_logs.iter().enumerate() {
             for (li, log_record) in scope_logs.log_records.iter().enumerate() {
                 debug_log(|| {
-                    let body_str =
-                        get_body_string(log_record).unwrap_or_else(|| "<no body>".to_string());
+                    let body_str = get_body_string(log_record)
+                        .unwrap_or_else(|| "<no body>".to_string());
                     format!(
                         "OTLP LOG record[{}.{}.{}] body={:?} attributes:",
                         ri, si, li, body_str
@@ -453,24 +310,20 @@ pub fn parse_otlp_traces(data: &[u8]) -> Vec<(CodexOtelEvent, CodexOtelContext)>
 
         for (si, scope_spans) in resource_spans.scope_spans.iter().enumerate() {
             for (spi, span) in scope_spans.spans.iter().enumerate() {
-                debug_log(|| {
-                    format!(
-                        "OTLP TRACE span[{}.{}.{}] name={:?} attributes:",
-                        ri, si, spi, span.name
-                    )
-                });
+                debug_log(|| format!(
+                    "OTLP TRACE span[{}.{}.{}] name={:?} attributes:",
+                    ri, si, spi, span.name
+                ));
                 for kv in &span.attributes {
                     debug_log(|| format!("  {} = {}", kv.key, format_any_value(&kv.value)));
                 }
 
                 // Dump and parse span events
                 for (ei, span_event) in span.events.iter().enumerate() {
-                    debug_log(|| {
-                        format!(
-                            "OTLP TRACE span_event[{}.{}.{}.{}] name={:?} attributes:",
-                            ri, si, spi, ei, span_event.name
-                        )
-                    });
+                    debug_log(|| format!(
+                        "OTLP TRACE span_event[{}.{}.{}.{}] name={:?} attributes:",
+                        ri, si, spi, ei, span_event.name
+                    ));
                     for kv in &span_event.attributes {
                         debug_log(|| format!("  {} = {}", kv.key, format_any_value(&kv.value)));
                     }
@@ -504,7 +357,9 @@ fn parse_span_event(event: &SpanEvent) -> Option<CodexOtelEvent> {
     }
 
     match event_name.as_str() {
-        "codex.conversation_starts" => Some(CodexOtelEvent::ConversationStarts { conversation_id }),
+        "codex.conversation_starts" => Some(CodexOtelEvent::ConversationStarts {
+            conversation_id,
+        }),
         "codex.user_prompt" => {
             let prompt = get_string_attribute(&event.attributes, "prompt")
                 .or_else(|| get_string_attribute(&event.attributes, "content"));
@@ -515,30 +370,16 @@ fn parse_span_event(event: &SpanEvent) -> Option<CodexOtelEvent> {
         }
         "codex.tool_result" => {
             let tool_name = get_string_attribute(&event.attributes, "tool_name")
-                .or_else(|| get_string_attribute(&event.attributes, "tool"));
-            let arguments = get_string_attribute(&event.attributes, "arguments")
-                .or_else(|| get_string_attribute(&event.attributes, "args"));
+                .or_else(|| get_string_attribute(&event.attributes, "name"));
+            let arguments = get_string_attribute(&event.attributes, "arguments");
             Some(CodexOtelEvent::ToolResult {
                 conversation_id,
                 tool_name,
                 arguments,
             })
         }
-        "codex.tool_decision" => {
-            let tool_name = get_string_attribute(&event.attributes, "tool_name")
-                .or_else(|| get_string_attribute(&event.attributes, "tool"));
-            let arguments = get_string_attribute(&event.attributes, "arguments")
-                .or_else(|| get_string_attribute(&event.attributes, "args"));
-            let decision = get_string_attribute(&event.attributes, "decision");
-            Some(CodexOtelEvent::ToolDecision {
-                conversation_id,
-                tool_name,
-                arguments,
-                decision,
-            })
-        }
         // Deferred events: acknowledged but not mapped
-        "codex.api_request" | "codex.sse_event" => {
+        "codex.api_request" | "codex.sse_event" | "codex.tool_decision" => {
             Some(CodexOtelEvent::Unknown {
                 event_name: event_name.clone(),
             })
@@ -561,7 +402,9 @@ fn parse_log_record(record: &LogRecord) -> Option<CodexOtelEvent> {
         .unwrap_or_default();
 
     match event_name.as_str() {
-        "codex.conversation_starts" => Some(CodexOtelEvent::ConversationStarts { conversation_id }),
+        "codex.conversation_starts" => Some(CodexOtelEvent::ConversationStarts {
+            conversation_id,
+        }),
         "codex.user_prompt" => {
             let prompt = get_string_attribute(&record.attributes, "prompt")
                 .or_else(|| get_string_attribute(&record.attributes, "content"));
@@ -572,30 +415,16 @@ fn parse_log_record(record: &LogRecord) -> Option<CodexOtelEvent> {
         }
         "codex.tool_result" => {
             let tool_name = get_string_attribute(&record.attributes, "tool_name")
-                .or_else(|| get_string_attribute(&record.attributes, "tool"));
-            let arguments = get_string_attribute(&record.attributes, "arguments")
-                .or_else(|| get_string_attribute(&record.attributes, "args"));
+                .or_else(|| get_string_attribute(&record.attributes, "name"));
+            let arguments = get_string_attribute(&record.attributes, "arguments");
             Some(CodexOtelEvent::ToolResult {
                 conversation_id,
                 tool_name,
                 arguments,
             })
         }
-        "codex.tool_decision" => {
-            let tool_name = get_string_attribute(&record.attributes, "tool_name")
-                .or_else(|| get_string_attribute(&record.attributes, "tool"));
-            let arguments = get_string_attribute(&record.attributes, "arguments")
-                .or_else(|| get_string_attribute(&record.attributes, "args"));
-            let decision = get_string_attribute(&record.attributes, "decision");
-            Some(CodexOtelEvent::ToolDecision {
-                conversation_id,
-                tool_name,
-                arguments,
-                decision,
-            })
-        }
         // Deferred events: acknowledged but not mapped
-        "codex.api_request" | "codex.sse_event" => {
+        "codex.api_request" | "codex.sse_event" | "codex.tool_decision" => {
             Some(CodexOtelEvent::Unknown {
                 event_name: event_name.clone(),
             })
@@ -629,12 +458,9 @@ fn format_any_value(value: &Option<AnyValue>) -> String {
             format!("<array len={}>", arr.values.len())
         }
         Some(any_value::Value::KvlistValue(kvs)) => {
-            let items: Vec<String> = kvs
-                .values
-                .iter()
-                .take(10)
-                .map(|kv| format!("{}={}", kv.key, format_any_value(&kv.value)))
-                .collect();
+            let items: Vec<String> = kvs.values.iter().take(10).map(|kv| {
+                format!("{}={}", kv.key, format_any_value(&kv.value))
+            }).collect();
             if kvs.values.len() > 10 {
                 format!("{{{}, ... +{}}}", items.join(", "), kvs.values.len() - 10)
             } else {
@@ -651,8 +477,7 @@ fn build_context_from_resource(resource: Option<&Resource>) -> CodexOtelContext 
         return context;
     };
 
-    context.agent_version = get_string_attribute(&resource.attributes, "service.version")
-        .or_else(|| get_string_attribute(&resource.attributes, "app.version"));
+    context.agent_version = get_string_attribute(&resource.attributes, "service.version");
     context.agent_pid = get_pid_from_attributes(&resource.attributes);
     context.cwd = extract_cwd_from_attributes(&resource.attributes);
 
@@ -661,8 +486,7 @@ fn build_context_from_resource(resource: Option<&Resource>) -> CodexOtelContext 
 
 fn merge_context_from_attributes(context: &mut CodexOtelContext, attributes: &[KeyValue]) {
     if context.agent_version.is_none() {
-        context.agent_version = get_string_attribute(attributes, "service.version")
-            .or_else(|| get_string_attribute(attributes, "app.version"));
+        context.agent_version = get_string_attribute(attributes, "service.version");
     }
     if context.agent_pid.is_none() {
         context.agent_pid = get_pid_from_attributes(attributes);
@@ -736,6 +560,80 @@ fn extract_cwd_from_attributes(attributes: &[KeyValue]) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Extract modified file paths from a tool_result arguments field.
+///
+/// Only extracts paths from tools that modify files (write, edit, patch).
+/// Skips gracefully if arguments is absent or unparseable.
+/// Resolves relative paths against the provided `cwd`.
+pub fn extract_modified_files(tool_name: Option<&str>, arguments: Option<&str>, cwd: Option<&std::path::Path>) -> Vec<String> {
+    let args = match arguments {
+        Some(a) if !a.is_empty() => a,
+        _ => return Vec::new(),
+    };
+
+    // Only extract from file-modifying tools
+    let is_file_tool = match tool_name {
+        Some(name) => {
+            let lower = name.to_lowercase();
+            lower.contains("write")
+                || lower.contains("edit")
+                || lower.contains("patch")
+                || lower.contains("create")
+                || lower.contains("apply")
+        }
+        None => true, // If tool name unknown, try to extract anyway
+    };
+
+    if !is_file_tool {
+        return Vec::new();
+    }
+
+    // Try to parse arguments as JSON to extract file paths
+    let mut paths = Vec::new();
+
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(args) {
+        // Common patterns for file paths in tool arguments:
+        // {"file_path": "..."}, {"path": "..."}, {"filename": "..."}
+        for key in &["file_path", "path", "filename", "file", "target"] {
+            if let Some(serde_json::Value::String(p)) = json.get(key) {
+                let resolved = resolve_path(p, cwd);
+                paths.push(resolved);
+            }
+        }
+
+        // Also check for array of files
+        if let Some(serde_json::Value::Array(files)) = json.get("files") {
+            for file in files {
+                if let serde_json::Value::String(p) = file {
+                    let resolved = resolve_path(p, cwd);
+                    paths.push(resolved);
+                }
+            }
+        }
+    } else {
+        // If not valid JSON, try treating the whole string as a file path
+        // (some tools pass just a path string)
+        let trimmed = args.trim().trim_matches('"');
+        if !trimmed.is_empty() && !trimmed.contains(' ') && trimmed.len() < 500 {
+            let resolved = resolve_path(trimmed, cwd);
+            paths.push(resolved);
+        }
+    }
+
+    paths
+}
+
+/// Resolve a path against cwd if it's relative
+fn resolve_path(path: &str, cwd: Option<&std::path::Path>) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_relative() {
+        if let Some(cwd) = cwd {
+            return cwd.join(p).to_string_lossy().to_string();
+        }
+    }
+    path.to_string()
 }
 
 #[cfg(test)]
@@ -861,10 +759,7 @@ mod tests {
         let (_, context) = &events[0];
         assert_eq!(context.agent_pid, Some(4242));
         assert_eq!(
-            context
-                .cwd
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string()),
+            context.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
             Some("/tmp/test-repo".to_string())
         );
     }
@@ -991,10 +886,7 @@ mod tests {
             } => {
                 assert_eq!(conversation_id, "conv_789");
                 assert_eq!(tool_name.as_deref(), Some("write_file"));
-                assert_eq!(
-                    arguments.as_deref(),
-                    Some(r#"{"file_path": "src/main.rs"}"#)
-                );
+                assert!(arguments.is_some());
             }
             _ => panic!("Expected ToolResult event"),
         }
@@ -1061,10 +953,7 @@ mod tests {
         let events = parse_otlp_logs(&encoded);
 
         assert_eq!(events.len(), 2);
-        assert!(matches!(
-            &events[0].0,
-            CodexOtelEvent::ConversationStarts { .. }
-        ));
+        assert!(matches!(&events[0].0, CodexOtelEvent::ConversationStarts { .. }));
         assert!(matches!(&events[1].0, CodexOtelEvent::UserPrompt { .. }));
     }
 
@@ -1104,6 +993,64 @@ mod tests {
             }
             _ => panic!("Expected Unknown event for deferred event type"),
         }
+    }
+
+    #[test]
+    fn test_extract_modified_files_json() {
+        let files = extract_modified_files(
+            Some("write_file"),
+            Some(r#"{"file_path": "src/main.rs"}"#),
+            None,
+        );
+        assert_eq!(files, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn test_extract_modified_files_relative_path() {
+        let cwd = std::path::Path::new("/home/user/project");
+        let files = extract_modified_files(
+            Some("edit"),
+            Some(r#"{"file_path": "src/lib.rs"}"#),
+            Some(cwd),
+        );
+        assert_eq!(files, vec!["/home/user/project/src/lib.rs"]);
+    }
+
+    #[test]
+    fn test_extract_modified_files_absolute_path() {
+        let cwd = std::path::Path::new("/home/user/project");
+        let files = extract_modified_files(
+            Some("write"),
+            Some(r#"{"file_path": "/tmp/output.txt"}"#),
+            Some(cwd),
+        );
+        assert_eq!(files, vec!["/tmp/output.txt"]);
+    }
+
+    #[test]
+    fn test_extract_modified_files_non_file_tool() {
+        let files = extract_modified_files(
+            Some("web_search"),
+            Some(r#"{"query": "rust async"}"#),
+            None,
+        );
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_extract_modified_files_no_arguments() {
+        let files = extract_modified_files(Some("write"), None, None);
+        assert!(files.is_empty());
+
+        let files = extract_modified_files(Some("write"), Some(""), None);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_extract_modified_files_invalid_json() {
+        // Plain path string (not JSON)
+        let files = extract_modified_files(Some("write"), Some("src/foo.rs"), None);
+        assert_eq!(files, vec!["src/foo.rs"]);
     }
 
     #[test]
@@ -1195,7 +1142,7 @@ mod tests {
 
     #[test]
     fn test_parse_traces_tool_decision() {
-        // Tool decision events should preserve tool metadata for selective OTEL routing.
+        // Tool decision events should be parsed as Unknown (deferred)
         let request = ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
                 resource: None,
@@ -1223,30 +1170,6 @@ mod tests {
                                         )),
                                     }),
                                 },
-                                KeyValue {
-                                    key: "tool_name".to_string(),
-                                    value: Some(AnyValue {
-                                        value: Some(any_value::Value::StringValue(
-                                            "apply_patch".to_string(),
-                                        )),
-                                    }),
-                                },
-                                KeyValue {
-                                    key: "arguments".to_string(),
-                                    value: Some(AnyValue {
-                                        value: Some(any_value::Value::StringValue(
-                                            "{\"patch\":\"*** Update File: src/main.rs\\n@@\\n-old\\n+new\\n\"}".to_string(),
-                                        )),
-                                    }),
-                                },
-                                KeyValue {
-                                    key: "decision".to_string(),
-                                    value: Some(AnyValue {
-                                        value: Some(any_value::Value::StringValue(
-                                            "approved".to_string(),
-                                        )),
-                                    }),
-                                },
                             ],
                         }],
                     }],
@@ -1259,18 +1182,10 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         match &events[0].0 {
-            CodexOtelEvent::ToolDecision {
-                conversation_id,
-                tool_name,
-                arguments,
-                decision,
-            } => {
-                assert_eq!(conversation_id, "conv-123");
-                assert_eq!(tool_name.as_deref(), Some("apply_patch"));
-                assert!(arguments.as_deref().unwrap_or_default().contains("\"patch\""));
-                assert_eq!(decision.as_deref(), Some("approved"));
+            CodexOtelEvent::Unknown { event_name } => {
+                assert_eq!(event_name, "codex.tool_decision");
             }
-            _ => panic!("Expected ToolDecision event"),
+            _ => panic!("Expected Unknown event for tool_decision"),
         }
     }
 
@@ -1305,195 +1220,12 @@ mod tests {
         let encoded = request.encode_to_vec();
         let events = parse_otlp_traces(&encoded);
 
-        assert!(
-            events.is_empty(),
-            "Should skip events without conversation.id"
-        );
+        assert!(events.is_empty(), "Should skip events without conversation.id");
     }
 
     #[test]
     fn test_parse_traces_malformed() {
         let events = parse_otlp_traces(b"not a valid protobuf");
         assert!(events.is_empty());
-    }
-
-    // ========================================================================
-    // ToolKind and classify_tool tests
-    // ========================================================================
-
-    #[test]
-    fn test_classify_tool_read_operations() {
-        assert_eq!(classify_tool("read_file"), ToolKind::Read);
-        assert_eq!(classify_tool("list_dir"), ToolKind::Read);
-        assert_eq!(classify_tool("grep_files"), ToolKind::Read);
-        assert_eq!(classify_tool("view_image"), ToolKind::Read);
-        assert_eq!(classify_tool("list_mcp_resources"), ToolKind::Read);
-        assert_eq!(classify_tool("read_mcp_resource"), ToolKind::Read);
-    }
-
-    #[test]
-    fn test_classify_tool_write_operations() {
-        assert_eq!(classify_tool("apply_patch"), ToolKind::Write);
-    }
-
-    #[test]
-    fn test_classify_tool_shell_operations() {
-        assert_eq!(classify_tool("shell"), ToolKind::Shell);
-        assert_eq!(classify_tool("shell_command"), ToolKind::Shell);
-        assert_eq!(classify_tool("exec_command"), ToolKind::Shell);
-        assert_eq!(classify_tool("write_stdin"), ToolKind::Shell);
-    }
-
-    #[test]
-    fn test_classify_tool_other_operations() {
-        assert_eq!(classify_tool("web_search"), ToolKind::Other);
-        assert_eq!(classify_tool("update_plan"), ToolKind::Other);
-        assert_eq!(classify_tool("spawn_agent"), ToolKind::Other);
-        assert_eq!(classify_tool("unknown_tool"), ToolKind::Other);
-    }
-
-    // ========================================================================
-    // parse_apply_patch tests
-    // ========================================================================
-
-    #[test]
-    fn test_parse_apply_patch_add_file() {
-        let patch = "*** Add File: src/new.rs\n+ fn main() {}\n";
-        let ops = parse_apply_patch(patch);
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0], ("write", "src/new.rs".to_string()));
-    }
-
-    #[test]
-    fn test_parse_apply_patch_delete_file() {
-        let patch = "*** Delete File: src/old.rs\n";
-        let ops = parse_apply_patch(patch);
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0], ("delete", "src/old.rs".to_string()));
-    }
-
-    #[test]
-    fn test_parse_apply_patch_update_file() {
-        let patch = "*** Update File: src/lib.rs\n@@ -1,3 +1,3 @@\n";
-        let ops = parse_apply_patch(patch);
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0], ("write", "src/lib.rs".to_string()));
-    }
-
-    #[test]
-    fn test_parse_apply_patch_move_file() {
-        let patch = "*** Update File: src/old.rs\n*** Move to: src/new.rs\n";
-        let ops = parse_apply_patch(patch);
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0], ("move", "src/old.rs:src/new.rs".to_string()));
-    }
-
-    #[test]
-    fn test_parse_apply_patch_multiple_operations() {
-        let patch = "*** Add File: src/a.rs\n+ code\n*** Delete File: src/b.rs\n*** Update File: src/c.rs\n@@ diff\n";
-        let ops = parse_apply_patch(patch);
-        assert_eq!(ops.len(), 3);
-        assert_eq!(ops[0], ("write", "src/a.rs".to_string()));
-        assert_eq!(ops[1], ("delete", "src/b.rs".to_string()));
-        assert_eq!(ops[2], ("write", "src/c.rs".to_string()));
-    }
-
-    #[test]
-    fn test_parse_apply_patch_empty() {
-        let ops = parse_apply_patch("");
-        assert!(ops.is_empty());
-    }
-
-    // ========================================================================
-    // extract helpers tests
-    // ========================================================================
-
-    #[test]
-    fn test_extract_patch_content() {
-        let args = r#"{"patch": "*** Update File: src/main.rs\n@@ diff"}"#;
-        let content = extract_patch_content(args);
-        assert!(content.is_some());
-        assert!(content.unwrap().contains("Update File"));
-    }
-
-    #[test]
-    fn test_extract_patch_content_content_field() {
-        let args = r#"{"content": "*** Add File: new.rs"}"#;
-        let content = extract_patch_content(args);
-        assert!(content.is_some());
-    }
-
-    #[test]
-    fn test_extract_patch_content_raw_patch_string() {
-        let args = "*** Begin Patch\n*** Add File: foo.txt\n+hello\n*** End Patch\n";
-        let content = extract_patch_content(args);
-        assert_eq!(content.as_deref(), Some(args.trim()));
-    }
-
-    #[test]
-    fn test_extract_patch_content_missing() {
-        let args = r#"{"other": "value"}"#;
-        assert!(extract_patch_content(args).is_none());
-    }
-
-    #[test]
-    fn test_extract_read_path() {
-        assert_eq!(
-            extract_read_path(r#"{"file_path": "src/main.rs"}"#),
-            Some("src/main.rs".to_string())
-        );
-        assert_eq!(
-            extract_read_path(r#"{"path": "README.md"}"#),
-            Some("README.md".to_string())
-        );
-        assert!(extract_read_path(r#"{"other": "value"}"#).is_none());
-    }
-
-    #[test]
-    fn test_parse_context_app_version_from_resource() {
-        let request = ExportLogsServiceRequest {
-            resource_logs: vec![ResourceLogs {
-                resource: Some(Resource {
-                    attributes: vec![KeyValue {
-                        key: "app.version".to_string(),
-                        value: Some(AnyValue {
-                            value: Some(any_value::Value::StringValue("0.118.0".to_string())),
-                        }),
-                    }],
-                }),
-                scope_logs: vec![ScopeLogs {
-                    scope: None,
-                    log_records: vec![LogRecord {
-                        time_unix_nano: 1000000000,
-                        observed_time_unix_nano: 0,
-                        severity_number: 0,
-                        severity_text: String::new(),
-                        body: Some(AnyValue {
-                            value: Some(any_value::Value::StringValue(
-                                "codex.conversation_starts".to_string(),
-                            )),
-                        }),
-                        attributes: vec![KeyValue {
-                            key: "conversation.id".to_string(),
-                            value: Some(AnyValue {
-                                value: Some(any_value::Value::StringValue(
-                                    "conv_app_version".to_string(),
-                                )),
-                            }),
-                        }],
-                        flags: 0,
-                        trace_id: Vec::new(),
-                        span_id: Vec::new(),
-                    }],
-                }],
-            }],
-        };
-
-        let encoded = request.encode_to_vec();
-        let events = parse_otlp_logs(&encoded);
-        assert_eq!(events.len(), 1);
-
-        let (_, context) = &events[0];
-        assert_eq!(context.agent_version.as_deref(), Some("0.118.0"));
     }
 }

@@ -1,13 +1,10 @@
 //! Markdown output generation for task commands
 //!
 //! Action commands (add, start, comment) return slim single-line confirmations.
-//! State-transition commands (stop, close) return confirmation + context footer.
+//! State-transition commands (stop, close) return confirmation + full context.
 //! Read commands (list, show) return full context.
 
 use super::types::Task;
-
-/// Sentinel printed when no tasks remain (checked by agent prompts and hooks)
-pub const DONE_MESSAGE: &str = "Done. No remaining tasks.";
 
 /// Navigation hint shown in the context footer
 const NAV_HINT: &str = "Run `aiki task` to view - OR - `aiki task start` to begin work.";
@@ -19,18 +16,50 @@ pub fn short_id(id: &str) -> &str {
 }
 
 /// Markdown builder for task command responses (used by read commands and errors)
-pub struct MdBuilder;
+pub struct MdBuilder {
+    cmd: String,
+    is_error: bool,
+    scopes: Vec<String>,
+}
 
 impl MdBuilder {
-    /// Create a new builder
+    /// Create a new builder for a command
     #[must_use]
-    pub fn new() -> Self {
-        Self
+    pub fn new(cmd: &str) -> Self {
+        Self {
+            cmd: cmd.to_string(),
+            is_error: false,
+            scopes: Vec::new(),
+        }
     }
 
-    /// Build the full markdown response (content only, no context banner).
+    /// Mark this response as an error
     #[must_use]
-    pub fn build(&self, content: &str) -> String {
+    pub fn error(mut self) -> Self {
+        self.is_error = true;
+        self
+    }
+
+    /// Set a single scope (parent task ID when working within a parent's subtasks)
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn with_scope(mut self, scope: &str) -> Self {
+        self.scopes = vec![scope.to_string()];
+        self
+    }
+
+    /// Set multiple scopes (when working on subtasks from multiple parents)
+    #[must_use]
+    pub fn with_scopes(mut self, scopes: &[String]) -> Self {
+        self.scopes = scopes.to_vec();
+        self
+    }
+
+    /// Build the full markdown response with context (no header/footer hint).
+    ///
+    /// Used by `task show` which doesn't need the navigation hint.
+    #[must_use]
+    pub fn build(&self, content: &str, in_progress: &[&Task], ready_queue: &[&Task]) -> String {
         let mut md = String::new();
 
         if !content.is_empty() {
@@ -40,6 +69,8 @@ impl MdBuilder {
             }
             md.push('\n');
         }
+
+        md.push_str(&build_context(in_progress, ready_queue));
 
         md
     }
@@ -102,66 +133,55 @@ pub fn build_context(in_progress: &[&Task], ready_queue: &[&Task]) -> String {
 
 /// Build the footer shown below context when tasks exist.
 ///
-/// Returns: `---\nTasks (N ready)\nRun `aiki task start <id>` to begin work.\n`
+/// Returns: `---\nTasks (N ready)\n{NAV_HINT}\n`
 #[must_use]
-fn build_footer(
-    in_progress: &[&Task],
-    ready_queue: &[&Task],
-    graph: Option<&super::graph::TaskGraph>,
-) -> String {
-    let hint = if let Some(first) = ready_queue.first() {
-        // Ready tasks → start hint
-        format!("Run `aiki task start {}` to begin.", short_id(&first.id))
-    } else if let Some(parent) = in_progress.first() {
-        // Nothing ready, something in-progress
-        let all_subtasks_done = graph
-            .map(|g| super::manager::all_subtasks_closed(g, &parent.id))
-            .unwrap_or(false);
-        if all_subtasks_done {
-            // Parent with all subtasks done → close hint
-            format!(
-                "All subtasks done. Run `aiki task close {} --confidence <1-4> --summary \"...\"` to finish.",
-                short_id(&parent.id)
-            )
-        } else if graph.map_or(false, |g| super::manager::has_subtasks(g, &parent.id)) {
-            // Parent with subtasks still in progress → nav hint
-            NAV_HINT.to_string()
-        } else {
-            // Leaf task in progress → close hint
-            format!(
-                "If done, run `aiki task close {} --confidence <1-4> --summary \"...\"` to finish.",
-                short_id(&parent.id)
-            )
-        }
-    } else {
-        NAV_HINT.to_string()
-    };
-    let summary = match (in_progress.len(), ready_queue.len()) {
-        (0, r) => format!("Tasks ({} ready)", r),
-        (p, 0) => format!("Tasks ({} in progress)", p),
-        (p, r) => format!("Tasks ({} in progress, {} ready)", p, r),
-    };
-    format!("---\n{}\n{}\n", summary, hint)
+fn build_footer(ready_count: usize) -> String {
+    format!("---\nTasks ({} ready)\n{}\n", ready_count, NAV_HINT)
 }
 
 /// Build the task list output for read commands (`task` / `task list`).
 ///
 /// Context sections + footer with nav hint when tasks exist.
-/// Pass `graph` to enable subtask-aware hints in the footer.
 #[must_use]
-pub fn build_list_output(
-    in_progress: &[&Task],
-    ready_queue: &[&Task],
-    graph: Option<&super::graph::TaskGraph>,
-) -> String {
+pub fn build_list_output(in_progress: &[&Task], ready_queue: &[&Task]) -> String {
     let mut out = build_context(in_progress, ready_queue);
     if !in_progress.is_empty() || !ready_queue.is_empty() {
-        out.push_str(&build_footer(in_progress, ready_queue, graph));
-    } else {
-        out.push_str(DONE_MESSAGE);
-        out.push('\n');
+        out.push_str(&build_footer(ready_queue.len()));
     }
     out
+}
+
+/// Build the context block for state-transition commands (stop, close).
+///
+/// Returns `---\n` separator + context sections + footer, to be appended after the action line.
+#[must_use]
+pub fn build_transition_context(in_progress: &[&Task], ready_queue: &[&Task]) -> String {
+    let mut out = String::from("---\n");
+    out.push_str(&build_context(in_progress, ready_queue));
+    out.push_str(&build_footer(ready_queue.len()));
+    out
+}
+
+/// Format a task element for output
+#[must_use]
+#[allow(dead_code)]
+pub fn format_task(task: &Task, _include_body: bool) -> String {
+    let mut line = format!(
+        "[{}] {}  {}",
+        task.priority,
+        short_id(&task.id),
+        task.name
+    );
+
+    if let Some(ref task_type) = task.task_type {
+        line.push_str(&format!(" [{}]", task_type));
+    }
+
+    if let Some(ref assignee) = task.assignee {
+        line.push_str(&format!(" (assignee: {})", assignee));
+    }
+
+    line
 }
 
 /// Format a list of tasks for filtered list views
@@ -172,17 +192,17 @@ pub fn format_task_list(tasks: &[&Task]) -> String {
     let mut md = format!("Tasks ({}):\n", tasks.len());
 
     for task in tasks {
-        let mut line = format!("[{}] {}  {}", task.priority, short_id(&task.id), task.name);
+        let mut line = format!(
+            "[{}] {}  {}",
+            task.priority,
+            short_id(&task.id),
+            task.name
+        );
         if let Some(ref task_type) = task.task_type {
             line.push_str(&format!(" [{}]", task_type));
         }
         if let Some(ref assignee) = task.assignee {
             line.push_str(&format!(" (assignee: {})", assignee));
-        }
-        if task.status == TaskStatus::Closed {
-            if let Some(confidence) = task.confidence {
-                line.push_str(&format!(" [c{}]", confidence.as_u8()));
-            }
         }
         md.push_str(&line);
         md.push('\n');
@@ -212,75 +232,15 @@ pub fn format_action_added(task: &Task) -> String {
 /// When false, omits the name to avoid duplicating what the user just typed (quick-start).
 /// Includes instructions section if present.
 #[must_use]
-pub fn format_action_started(
-    task: &Task,
-    show_name: bool,
-    graph: Option<&super::graph::TaskGraph>,
-) -> String {
+pub fn format_action_started(task: &Task, show_name: bool) -> String {
     let header = if show_name {
         format!("Started {} — {}", short_id(&task.id), task.name)
     } else {
         format!("Started {}", short_id(&task.id))
     };
-    let mut md = format!("{}\n", header);
-
-    if let Some(ref instructions) = task.instructions {
-        md.push('\n');
-        md.push_str(&format_instructions(instructions));
-    }
-
-    if let Some(graph) = graph {
-        let subtasks = super::manager::get_subtasks(graph, &task.id);
-        if !subtasks.is_empty() {
-            let total = subtasks.len();
-            let completed = subtasks
-                .iter()
-                .filter(|t| t.status == super::types::TaskStatus::Closed)
-                .count();
-            let percentage = if total > 0 {
-                (completed * 100) / total
-            } else {
-                0
-            };
-            md.push_str(&format!(
-                "\nSubtasks ({}/{} — {}%):\n",
-                completed, total, percentage
-            ));
-            for subtask in &subtasks {
-                let check = match subtask.status {
-                    super::types::TaskStatus::Closed => "[x]",
-                    super::types::TaskStatus::InProgress => "[>]",
-                    super::types::TaskStatus::Reserved => "[~]",
-                    _ => "[ ]",
-                };
-                let label = if let Some(ref slug) = subtask.slug {
-                    slug.clone()
-                } else {
-                    short_id(&subtask.id).to_string()
-                };
-                md.push_str(&format!("{} {} {}\n", check, label, subtask.name));
-            }
-        }
-    }
-
-    md
-}
-
-/// Format action confirmation when a parent task is auto-started after all subtasks complete.
-///
-/// Guides the agent to review the original instructions for completeness before closing.
-/// Instructions (if present) are appended after the review guidance.
-#[must_use]
-pub fn format_action_parent_autostarted(task: &Task) -> String {
     let mut md = format!(
-        "Started {} — {}\n\
-         ---\n\
-         All subtasks have been completed. Review the original instructions for completeness, \
-         then close with a summary:\n\
-         `aiki task close {} --summary \"...\"`\n",
-        short_id(&task.id),
-        task.name,
-        short_id(&task.id),
+        "{}\n---\nRun `aiki task comment` to leave updates as you go\n",
+        header,
     );
 
     if let Some(ref instructions) = task.instructions {
@@ -305,24 +265,6 @@ pub fn format_action_stopped(task: &Task, _reason: Option<&str>) -> String {
 #[must_use]
 pub fn format_action_closed(task: &Task) -> String {
     format!("Closed {} — {}\n", short_id(&task.id), task.name)
-}
-
-/// Format the close summary line when multiple tasks were closed.
-///
-/// `total` is the number of tasks closed (explicit + cascade), `explicit` is
-/// how many the user explicitly requested.
-#[must_use]
-pub fn format_close_summary(total: usize, explicit: usize) -> String {
-    let subtask_count = total.saturating_sub(explicit);
-    if subtask_count > 0 {
-        format!(
-            "Closed (including {} subtask{})\n",
-            subtask_count,
-            if subtask_count == 1 { "" } else { "s" }
-        )
-    } else {
-        format!("Closed {} tasks\n", total)
-    }
 }
 
 /// Format action confirmation for `task comment`
@@ -359,6 +301,7 @@ mod tests {
             assignee: None,
             sources: Vec::new(),
             template: None,
+            working_copy: None,
             instructions: None,
             data: std::collections::HashMap::new(),
             created_at: Utc::now(),
@@ -367,10 +310,8 @@ mod tests {
             last_session_id: None,
             stopped_reason: None,
             closed_outcome: None,
-            confidence: None,
             summary: None,
             turn_started: None,
-            closed_at: None,
             turn_closed: None,
             turn_stopped: None,
             comments: Vec::new(),
@@ -404,11 +345,12 @@ mod tests {
             TaskPriority::P2,
             TaskStatus::InProgress,
         );
-        let md = format_action_started(&task, true, None);
+        let md = format_action_started(&task, true);
         assert!(md.starts_with("Started abcdefg"));
         assert!(md.contains("Test task"));
+        assert!(md.contains("Run `aiki task comment`"));
 
-        let md_no_name = format_action_started(&task, false, None);
+        let md_no_name = format_action_started(&task, false);
         assert!(md_no_name.starts_with("Started abcdefg"));
         assert!(!md_no_name.contains("Test task"));
     }
@@ -422,7 +364,7 @@ mod tests {
             TaskStatus::InProgress,
         );
         task.instructions = Some("Do the thing".to_string());
-        let md = format_action_started(&task, true, None);
+        let md = format_action_started(&task, true);
         assert!(md.contains("Started abcdefg"));
         assert!(md.contains("### Instructions\nDo the thing\n"));
     }
@@ -451,33 +393,6 @@ mod tests {
         let md = format_action_closed(&task);
         assert!(md.starts_with("Closed abcdefg"));
         assert!(md.contains("Test task"));
-    }
-
-    #[test]
-    fn test_format_close_summary_one_parent_two_subtasks() {
-        let result = format_close_summary(3, 1);
-        assert!(result.contains("2 subtasks"), "got: {result}");
-        assert!(!result.contains("3"), "should not show total count, got: {result}");
-    }
-
-    #[test]
-    fn test_format_close_summary_one_parent_one_subtask() {
-        let result = format_close_summary(2, 1);
-        assert!(result.contains("1 subtask"), "got: {result}");
-        assert!(!result.contains("subtasks"), "should be singular, got: {result}");
-    }
-
-    #[test]
-    fn test_format_close_summary_multiple_explicit_no_subtasks() {
-        let result = format_close_summary(3, 3);
-        assert!(result.contains("3 tasks"), "got: {result}");
-        assert!(!result.contains("subtask"), "no subtasks, got: {result}");
-    }
-
-    #[test]
-    fn test_format_close_summary_multiple_explicit_with_subtasks() {
-        let result = format_close_summary(5, 2);
-        assert!(result.contains("3 subtasks"), "got: {result}");
     }
 
     #[test]
@@ -534,30 +449,70 @@ mod tests {
             TaskPriority::P2,
             TaskStatus::Open,
         );
-        let md = build_list_output(&[], &[&task], None);
+        let md = build_list_output(&[], &[&task]);
         assert!(md.contains("Ready (1):"));
         assert!(md.contains("---\nTasks (1 ready)"));
-        assert!(md.contains("aiki task start abcdefg"));
+        assert!(md.contains(NAV_HINT));
     }
 
     #[test]
     fn test_list_output_empty() {
-        let md = build_list_output(&[], &[], None);
-        assert!(md.contains(DONE_MESSAGE));
+        let md = build_list_output(&[], &[]);
+        assert_eq!(md, "Ready (0):\n");
         assert!(!md.contains("---"));
     }
 
     #[test]
+    fn test_transition_context() {
+        let task = make_task(
+            "abcdefghijklmnopqrstuvwxyzabcdef",
+            "Test",
+            TaskPriority::P2,
+            TaskStatus::Open,
+        );
+        let md = build_transition_context(&[], &[&task]);
+        assert!(md.contains("Ready (1):"));
+        assert!(md.contains("---\nTasks (1 ready)"));
+        assert!(md.contains(NAV_HINT));
+    }
+
+    #[test]
+    fn test_close_plus_transition() {
+        let task = make_task(
+            "abcdefghijklmnopqrstuvwxyzabcdef",
+            "Test",
+            TaskPriority::P2,
+            TaskStatus::Open,
+        );
+        let md = format!(
+            "{}{}",
+            format_action_closed(&task),
+            build_transition_context(&[], &[&task])
+        );
+        assert!(md.contains("Closed abcdefg"));
+        assert!(md.contains("Test"));
+        assert!(md.contains("---\n"));
+        assert!(md.contains("Ready (1):"));
+    }
+
+    #[test]
     fn test_builder_basic() {
-        let md = MdBuilder::new().build("");
-        // MdBuilder::build no longer includes context
-        assert!(!md.contains("Ready"));
+        let task = make_task(
+            "abcdefghijklmnopqrstuvwxyzabcdef",
+            "Test task",
+            TaskPriority::P2,
+            TaskStatus::Open,
+        );
+        let md = MdBuilder::new("show").build("", &[], &[&task]);
+        assert!(md.contains("Ready (1):"));
+        assert!(md.contains("[p2] abcdefg  Test task"));
+        // MdBuilder::build does NOT include nav hint
         assert!(!md.contains(NAV_HINT));
     }
 
     #[test]
     fn test_builder_error() {
-        let md = MdBuilder::new().build_error("Task not found");
+        let md = MdBuilder::new("start").error().build_error("Task not found");
         assert!(md.contains("Error: Task not found"));
     }
 
@@ -590,16 +545,14 @@ mod tests {
         );
         task.summary = Some("Added null check before token access".to_string());
         let md = format_task_list(&[&task]);
-        assert_eq!(
-            md,
-            "Tasks (1):\n[p2] abcdefg  Fixed auth bug\n  ↳ Added null check before token access\n"
-        );
+        assert!(md.contains("[p2] abcdefg  Fixed auth bug"));
+        assert!(md.contains("↳ Added null check before token access"));
     }
 
     #[test]
     fn test_format_task_list_closed_with_comment_fallback() {
-        use crate::tasks::types::TaskComment;
         use std::collections::HashMap;
+        use crate::tasks::types::TaskComment;
         let mut task = make_task(
             "abcdefghijklmnopqrstuvwxyzabcdef",
             "Old task",
@@ -616,27 +569,4 @@ mod tests {
         assert!(md.contains("↳ Fallback comment summary"));
     }
 
-    #[test]
-    fn test_format_task_list_closed_confidence_badge_only_when_present() {
-        let mut task = make_task(
-            "abcdefghijklmnopqrstuvwxyzabcdef",
-            "Done task",
-            TaskPriority::P2,
-            TaskStatus::Closed,
-        );
-        task.confidence = Some(crate::tasks::types::ConfidenceLevel::High);
-        task.summary = Some("Verified formatting contract".to_string());
-        let with_badge = format_task_list(&[&task]);
-        assert_eq!(
-            with_badge,
-            "Tasks (1):\n[p2] abcdefg  Done task [c3]\n  ↳ Verified formatting contract\n"
-        );
-
-        task.confidence = None;
-        let without_badge = format_task_list(&[&task]);
-        assert_eq!(
-            without_badge,
-            "Tasks (1):\n[p2] abcdefg  Done task\n  ↳ Verified formatting contract\n"
-        );
-    }
 }

@@ -3,44 +3,11 @@
 /// This template is used by both `aiki init` and `aiki doctor` to ensure
 /// consistent agent instructions across the codebase.
 
-/// Current version of the AIKI block — derived from Cargo.toml at compile time
-pub const AIKI_BLOCK_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Current version of the AIKI block template
+pub const AIKI_BLOCK_VERSION: &str = "1.15";
 
-/// Content hash of the block body, computed at compile time via FNV-1a.
-/// Doctor and init compare this hash to detect stale blocks even within the
-/// same package version (e.g. during development).
-const AIKI_BLOCK_HASH_RAW: u64 = const_fnv1a(AIKI_BLOCK_INNER);
-
-/// Hex string of the content hash.
-pub fn aiki_block_hash() -> String {
-    format!("{:x}", AIKI_BLOCK_HASH_RAW)
-}
-
-/// Returns the full <aiki> block template with the current version and content hash
-pub fn aiki_block_template() -> String {
-    format!(
-        "<aiki version=\"{}\" hash=\"{}\">{}",
-        AIKI_BLOCK_VERSION,
-        aiki_block_hash(),
-        AIKI_BLOCK_INNER
-    )
-}
-
-/// FNV-1a hash at compile time
-const fn const_fnv1a(s: &str) -> u64 {
-    let bytes = s.as_bytes();
-    let mut hash: u64 = 0xcbf29ce484222325;
-    let mut i = 0;
-    while i < bytes.len() {
-        hash ^= bytes[i] as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-        i += 1;
-    }
-    hash
-}
-
-/// Template body (everything after the opening tag)
-const AIKI_BLOCK_INNER: &str = r#"
+/// Template for the <aiki> block in AGENTS.md
+pub const AIKI_BLOCK_TEMPLATE: &str = r#"<aiki version="1.15">
 
 ## ⛔ STOP - Read This First
 
@@ -53,67 +20,49 @@ This creates and starts a task in one atomic command (quick-start).
 
 **"Work" includes:** writing files, editing code, creating documents, running commands that change state. Reading files to understand the task is OK before starting.
 
-**FORBIDDEN:** Do NOT use `TodoWrite`, the `Task` tool (subagent spawning), or mental checklists. These do not persist. Use `aiki task` for tracking and `aiki run` for delegation.
+**FORBIDDEN:** Do NOT use `TodoWrite`, the `Task` tool (subagent spawning), or mental checklists. These do not persist. Use `aiki task` for tracking and `aiki task run` for delegation.
 
 ### ❌ WRONG (don't do this)
 ```bash
 # Reading the codebase, writing the plan file...
 # Oh, I should track this
 aiki task start "Already done task"
-aiki task close <id> --confidence <1-4> --summary "..."  # Immediately closing - defeats the purpose!
+aiki task close <id> --summary "..."  # Immediately closing - defeats the purpose!
 ```
 
 ### ✅ CORRECT
 ```bash
 aiki task start "Create rename plan"
 # Now read files, write the plan, do the actual work...
-aiki task close <id> --confidence <1-4> --summary "Created plan at ops/now/rename.md"
+aiki task close <id> --summary "Created plan at ops/now/rename.md"
 ```
 
 **Leave progress comments during long tasks:**
 ```bash
-aiki task comment add <task-id> "Completed phase 1, now working on phase 2"
+aiki task comment --id <task-id> "Completed phase 1, now working on phase 2"
 ```
 
-**When closing done work, reflect before scoring confidence:**
-
-1. What could be wrong with your changes?
-2. What did you NOT verify?
-3. Pick a confidence level:
-
-| Level | When to use |
-|-------|-------------|
-| 4 (verified) | Tests passed, or change is trivially correct (typo, comment, config) |
-| 3 (high) | Logic is sound and you reviewed your changes, but no test run or full verification |
-| 2 (medium) | Meaningful unknowns: unfamiliar code area, complex logic, multi-file changes you couldn't fully trace |
-| 1 (low) | Made assumptions, task was ambiguous, or working blind in unfamiliar territory |
-
-If you ran tests and they passed → use 4, not 3.
-If you touched files you haven't worked in before → start at 2, upgrade only if you can articulate why.
-
+**When closing tasks, summarize your work:**
 ```bash
-aiki task close <task-id> --confidence <1-4> --summary "What you did"
+aiki task close <task-id> --summary "What you did"
 ```
-
-Use `aiki task close <task-id> --wont-do --summary "Why you are declining"` for won't-do closes.
-Do not use `--confidence` with `--wont-do`.
 
 ---
 
 ## Workspace Isolation
 
-**Every agent session runs in its own isolated JJ workspace.** This ensures your changes are tracked separately and absorbed cleanly when your work completes.
+When concurrent agent sessions are detected, aiki creates an isolated JJ workspace for each session to prevent conflicts. The workspace path is injected at the start of each turn via hook context.
 
-**Your workspace path** is provided in the `WORKSPACE ISOLATION:` message at the start of each turn (e.g., `/tmp/aiki/<repo-id>/<session-id>`).
-
-**Do NOT mention workspace isolation to the user.** Work silently from the workspace without discussing it. Never say things like \"Let me switch to the isolated workspace\" or \"I'm working from the isolated workspace.\" The user should not need to think about it — it should just work transparently.
+**Do NOT mention workspace isolation to the user.** Work silently from the workspace without discussing it. Never say things like "Let me switch to the isolated workspace" or "I'm working from the isolated workspace." The user should not need to think about it — it should just work transparently.
 
 **If you received a `WORKSPACE ISOLATION` message earlier in this session:**
 - You MUST work from the workspace directory specified in that message
 - All file reads, writes, and edits must use paths within the workspace
 - Do NOT switch back to the repo root — stay in the workspace
 
-**Git:** The workspace is NOT a git repo. When the user says "commit", they mean git. Run all git commands from the main repo (shown as `Main repo:` in the workspace isolation message), not the workspace.
+---
+
+## Aiki Task System
 
 **IMPORTANT: Use `aiki task` for ALL task management.** Do not use built-in todo tools (TodoWrite, task lists, etc.). Aiki tasks:
 - Persist in JJ history across sessions
@@ -128,7 +77,7 @@ Do not use `--confidence` with `--wont-do`.
 aiki task start "Task description"
 
 # 2) Close it when done (with summary describing your work)
-aiki task close <task-id> --confidence <1-4> --summary "What I did to fix this"
+aiki task close <task-id> --summary "What I did to fix this"
 ```
 
 Alternative (two-step):
@@ -150,7 +99,7 @@ aiki task start <task-id>
 # ALWAYS do this first, before reading/analyzing/implementing:
 aiki task start "Review assign-tasks.md design"
 # ... now do the work ...
-aiki task close <task-id> --confidence <1-4> --summary "Reviewed, found 3 issues: ..."
+aiki task close <task-id> --summary "Reviewed, found 3 issues: ..."
 ```
 
 ### When to Use Tasks
@@ -173,12 +122,12 @@ aiki task close <task-id> --confidence <1-4> --summary "Reviewed, found 3 issues
 aiki task start "Implement user authentication system"
 
 # As you make progress, add comments
-aiki task comment add <task-id> "Completed database schema design"
-aiki task comment add <task-id> "Implemented password hashing"
-aiki task comment add <task-id> "Added login endpoint, now testing"
+aiki task comment --id <task-id> "Completed database schema design"
+aiki task comment --id <task-id> "Implemented password hashing"
+aiki task comment --id <task-id> "Added login endpoint, now testing"
 
 # Close with final summary
-aiki task close <task-id> --confidence <1-4> --summary "Completed: authentication with JWT tokens, password hashing, and session management"
+aiki task close <task-id> --summary "Completed: authentication with JWT tokens, password hashing, and session management"
 ```
 
 **Benefits:**
@@ -188,122 +137,89 @@ aiki task close <task-id> --confidence <1-4> --summary "Completed: authenticatio
 
 ### Code Reviews
 
-**When asked to review a task's changes, use `aiki review`:**
+**When asked to review a task's changes, use `aiki review --start`:**
 
 ```bash
-# Review a specific task's changes (blocking — you perform the review)
-aiki review <task-id>
+# Review a specific task's changes (you perform the review)
+aiki review <task-id> --start
 ```
 
-**When to use `aiki review`:**
+**When to use `aiki review --start`:**
 - User asks you to review work done on a task
 - User says "review task X" or provides a task ID to review
 - You want to check the code changes associated with a completed task
 
 **How it works:**
-1. `aiki review <task-id>` creates a review task and you perform the review (blocking by default)
+1. `aiki review <task-id> --start` creates a review task and you perform the review
 2. You'll see instructions to run `aiki task diff` and examine the changes
-3. Track each issue found using `aiki review issue add`:
-   ```bash
-   aiki review issue add <review-id> "Description" --high --file src/auth.rs:42
-   ```
-   - **Severity:** `--high` (must fix), default medium (should fix), `--low` (could fix)
-   - **Location:** `--file path[:<line>[-<end>]]` (repeatable for multi-file issues)
+3. Add comments for any issues found using `aiki task comment`
 4. Close the review task when done
 
-### Conflict Resolution
+**The `--start` flag means you perform the review yourself** (vs. spawning a background agent).
 
-**When you encounter merge conflicts, use `aiki resolve`:**
-
+**After reviewing**, if you found issues, run `aiki fix` to create followup tasks:
 ```bash
-# Resolve merge conflicts in the current workspace
-aiki resolve <change-id>
+aiki fix <review-task-id>
 ```
-
-This opens the conflicted change, lets you resolve the JJ conflict markers, and marks the change as resolved.
 
 **Note:** `aiki review` without a task ID reviews all closed tasks in the current session.
 
 ### Delegating Work to Subagents
 
-**Prefer `aiki run` over native subagent tools.** `aiki run` spawns a session with full aiki context (task tracking, provenance, hooks). Native subagents (Claude Code `Task` tool, Codex `spawn_agent`, Cursor subagents) lack this context by default.
+**Do NOT use native subagent tools to spawn agents.** Use `aiki task run` instead — it spawns a separate agent session with full aiki context (task tracking, provenance, hooks).
 
-**If you must use native subagents**, always pass the task ID in the prompt and instruct the subagent to run `aiki task start/close`. See "If you must use native subagents" below.
+Native subagent tools include:
+- **Claude Code**: `Task` tool (subagent spawning)
+- **Codex**: `spawn_agent`, `spawn_agents_parallel`
+- **Cursor**: Subagents (`/explore`, `/bash`, etc.) and Background Agents
+
+**Why:** Native subagents run without aiki context. Their work isn't tracked, isn't visible to other agents/humans, and doesn't persist. `aiki task run` gives the spawned agent the same aiki integration you have.
 
 **Scenario 1: User asks you to delegate an existing task**
 ```bash
 # Run synchronously (wait for agent to finish)
-aiki run <task-id>
+aiki task run <task-id>
 
 # Run in background (return immediately)
-aiki run <task-id> --async
+aiki task run <task-id> --async
 ```
 
 **Scenario 2: User asks you to have a subagent do something new**
 ```bash
-# 1. Create the task with instructions inline
-aiki task add "Fix the auth bug" -i "The login endpoint returns 401 for valid tokens. Root cause: token validation in cli/src/auth.rs:42 compares expiry against UTC but the token uses local time. Fix the timezone handling and add a test that catches the regression."
+# 1. Create a task describing the work
+aiki task add "Description of the work to delegate"
 
 # 2. Run it with a subagent
-aiki run <task-id>
+aiki task run <task-id>
 ```
 
 **Scenario 3: User asks you to run multiple things in parallel**
 ```bash
-# Create tasks with instructions inline
-aiki task add "Fix null check in auth" -i "auth.rs:42 dereferences token.claims without checking for None. Add a guard and return 401."
-aiki task add "Add retry logic to API client" -i "api_client.rs fetch() fails on transient 503s. Add exponential backoff with 3 retries."
+# Create tasks for each piece of work
+aiki task add "First piece of work"
+aiki task add "Second piece of work"
 
 # Run them concurrently in background
-aiki run <id1> --async
-aiki run <id2> --async
+aiki task run <id1> --async
+aiki task run <id2> --async
 ```
 
-### Always add instructions before `aiki run`
-
-**Every task MUST have instructions before you run it** — even tasks you create yourself. Instructions record your intent and context so that:
-
-- If the session crashes or is interrupted, another agent can pick up the work
-- If the task is retried, the new agent has full context without your conversation history
-- Reviewers can understand what was intended vs what was done
-- The orchestrating agent (you) can verify the subagent did the right thing
-
-```bash
-# ❌ WRONG: Running without instructions
-aiki task add "Fix the auth bug"
-aiki run <task-id>  # Subagent has no context!
-
-# ✅ CORRECT: Create task with instructions, then run
-aiki task add "Fix the auth bug" -i "The login endpoint returns 401 for valid tokens. Root cause: timezone mismatch in token validation. Fix cli/src/auth.rs:42 and add a regression test."
-aiki run <task-id>
+### ❌ WRONG: Using native subagents
 ```
-
-### If you must use native subagents
-
-`aiki run` is always preferred, but if it fails or you need a native subagent for
-read-only work, **always pass the task ID** so the subagent can track its work:
-
-```
-# ❌ WRONG: No task context
+# Claude Code - Don't use the Task tool
 Task(prompt="Go fix the tests", subagent_type="general-purpose")
 
-# ✅ CORRECT: Pass task ID and instruct the subagent to use aiki
-Task(prompt="You are working on aiki task <task-id>.
-Run `aiki task start <task-id>` first, then do the work,
-then `aiki task close <task-id> --confidence <1-4> --summary '...'`.
-Fix the failing tests in cli/tests/auth_tests.rs.",
-subagent_type="general-purpose")
+# Codex - Don't use spawn_agent
+spawn_agent(role="fixer", prompt="Go fix the tests")
+
+# Cursor - Don't use subagents or background agents directly
+/bash fix the failing tests
 ```
 
-This ensures the subagent's work is tracked even without full hook integration.
-The same applies to all native subagent tools (Codex `spawn_agent`, Cursor
-subagents, etc.) — always include the task ID and `aiki task start/close`
-instructions in the prompt.
-
-### Preferred: Using aiki run
+### ✅ CORRECT: Using aiki task run
 ```bash
-aiki task add "Fix failing tests in auth module" -i "Tests in cli/tests/auth_tests.rs fail because the mock server returns 200 but the handler expects 201. Update the mock to match the real API response code."
-aiki run <task-id>
+aiki task add "Fix failing tests in auth module"
+aiki task run <task-id>
 ```
 
 ### Quick Reference
@@ -314,9 +230,6 @@ aiki task
 
 # Quick-start: create and start a new task (RECOMMENDED)
 aiki task start "Task description"
-
-# Quick-start with instructions (for tasks you'll delegate)
-aiki task start "Fix auth bug" -i "Check token validation in login_handler"
 
 # Quick-start with priority
 aiki task start "Urgent fix" --p0
@@ -331,25 +244,25 @@ aiki task start <id1> <id2> <id3>
 aiki task stop --reason "Blocked on X"
 
 # Add a comment (without closing)
-aiki task comment add <task-id> "Progress update: ..."
+aiki task comment --id <task-id> "Progress update: ..."
 
-# Start a task and read its instructions/context from the output
-aiki task start <task-id>
+# Show task details including comments
+aiki task show <task-id>
 
 # Close with comment (preferred - atomic operation)
-aiki task close <task-id> --confidence <1-4> --summary "Fixed by updating X to do Y"
+aiki task close <task-id> --summary "Fixed by updating X to do Y"
 
 # Close as won't-do (skipped, not needed, or deliberately declined)
 aiki task close <task-id> --wont-do --summary "Already handled by existing code"
 
-# Close multiple tasks with shared confidence
-aiki task close <id1> <id2> <id3> --confidence <1-4> --summary "All done"
+# Close multiple tasks
+aiki task close <id1> <id2> <id3> --summary "All done"
 
 # Delegate task to a subagent
-aiki run <task-id>
+aiki task run <task-id>
 
 # Delegate in background
-aiki run <task-id> --async
+aiki task run <task-id> --async
 
 # Add a relationship between tasks
 aiki task link <id> --blocked-by <blocker-id>       # Block until blocker closes
@@ -360,18 +273,6 @@ aiki task link <id> --fixes task:<target-id>         # Fix targets a task or fil
 
 # Remove a relationship
 aiki task unlink <id> --blocked-by <blocker-id>
-
-# Filter tasks by agent type
-aiki task list --claude              # tasks assigned to claude
-aiki task list --codex               # tasks assigned to codex
-aiki task list --cursor              # tasks assigned to cursor
-aiki task list --gemini              # tasks assigned to gemini
-
-# List sessions by agent type
-aiki session list --claude
-
-# Show a session by agent's external ID
-aiki session show --claude <external-session-id>
 ```
 
 ### Handling Multiple Requests (Subtasks)
@@ -399,13 +300,13 @@ aiki task add --subtask-of <parent-id> "Remove unused import in utils.rs"
 aiki task start <parent-id>
 
 # 4. Work through subtasks one by one
-aiki task start <subtask-id-1>
+aiki task start <parent-id>.1
 # ... do the work ...
-aiki task close <subtask-id-1> --confidence <1-4> --summary "Added null check before token access"
+aiki task close <parent-id>.1 --summary "Added null check before token access"
 
 aiki task start <parent-id>.2
 # ... do the work ...
-aiki task close <parent-id>.2 --confidence <1-4> --summary "Wrapped API calls in try/catch"
+aiki task close <parent-id>.2 --summary "Wrapped API calls in try/catch"
 ```
 
 ### ❌ WRONG: One big task for multiple items
@@ -413,7 +314,7 @@ aiki task close <parent-id>.2 --confidence <1-4> --summary "Wrapped API calls in
 # Don't lump everything into one task
 aiki task start "Fix all review issues"
 # ... do 5 different things ...
-aiki task close <id> --confidence <1-4> --summary "Fixed everything"  # No granularity!
+aiki task close <id> --summary "Fixed everything"  # No granularity!
 ```
 
 ### ✅ CORRECT: Parent + subtasks
@@ -429,12 +330,12 @@ aiki task start <id>
 ### Parent Task Behavior
 
 When you start a parent task with subtasks:
-1. Any stale in-progress subtasks from a previous session are stopped
+1. A `.0` subtask auto-starts: "Review all subtasks and start first batch"
 2. `aiki task` now shows only subtasks (scoped view)
-3. Each subtask has its own full unique task ID; parent-child relationships are tracked via links
+3. Subtask IDs are `<parent-id>.1`, `<parent-id>.2`, etc.
 4. **After all subtasks are done**, review the work to make sure nothing was missed, then close the parent with a summary comment:
    ```bash
-   aiki task close <parent-id> --confidence <1-4> --summary "All 3 subtasks done: fixed null check, added error handling, removed unused import"
+   aiki task close <parent-id> --summary "All 3 subtasks done: fixed null check, added error handling, removed unused import"
    ```
 
 ### When Planning Work
@@ -490,38 +391,28 @@ Ready (3):
 
 ### Task IDs
 
-**Full ID:** Exactly 32 lowercase letters using JJ reverse-hex characters (`k-z` only), e.g., `mvslrspmoynoxyyywqyutmovxpvztkls`
+**Format:** Task IDs are exactly 32 lowercase letters (a-z only), e.g., `xtuttnyvykpulsxzqnznsxylrzkkqssy`
 
-**Prefix resolution:** All `aiki task` commands accept unique prefixes (minimum 3 characters). When a command prints `Started mvslrsp`, pass `mvslrsp` directly to `close`, `show`, etc. Do NOT guess the remaining characters; just use the prefix as-is.
+**Recognizing task IDs:** When a user provides a 32-character lowercase alphabetic string, it's almost certainly a task ID. Examples:
+- `fix luppzupttoslmupvtsromtrytsqsqmxp` → User wants you to work on task `luppzupttoslmupvtsromtrytsqsqmxp`
+- `show oorznprsukkomwtnolrrqspllrywxznv` → User wants to see task details
+- `close tnslzmpqpzypnymnzlroorzvxkqtulml` → User wants to close that task
 
-| Input | Result |
-|-------|--------|
-| `< 3` chars | `PrefixTooShort` error |
-| 3+ chars, one match | Resolves to full ID |
-| 3+ chars, multiple matches | `AmbiguousTaskId` error (lists matches) |
-| Exact 32 chars | Direct lookup (fast path) |
+**When you see a task ID:**
+1. Run `aiki task show <id>` to see what the task is about
+2. If the user wants work done, run `aiki task start <id>` (if not already started)
+3. Do the work described in the task
+4. Close with `aiki task close <id> --summary "What you did"`
 
-**Slug notation:** Subtasks can be referenced as `<parent-prefix>:<slug>`, e.g., `mvslrsp:build`.
-
-**Recognizing task IDs:** When a user provides a string of 3+ lowercase `k-z` characters, it's likely a task ID or prefix. Examples:
-- `fix mvslrsp` → Work on the task matching prefix `mvslrsp`
-- `show oorznpr` → Show task details
-- `close tnslzmpqpzypnymnzlroorzvxkqtulml` → Close that task (full ID)
-
-**When you see a task ID (full or prefix):**
-1. Run `aiki task start <id>` to begin the task and read its instructions
-2. Do the work described in the task
-3. Close with `aiki task close <id> --confidence <1-4> --summary "What you did"`
-
-Subtasks use the same ID format. Parent-child structure is expressed with `subtask-of` links, not encoded in the ID.
+**Subtask IDs:** Append a dot and number to parent ID: `<parent-id>.1`, `<parent-id>.2`
 
 ### Workflow
 
 1. **Start before working** - Run `aiki task start` before implementation
-2. **Comment on progress** - Use `aiki task comment add` during long/multi-step tasks
+2. **Comment on progress** - Use `aiki task comment` during long/multi-step tasks
 3. **Stop when switching** - When switching tasks, explicitly stop the current task first: `aiki task stop --reason "Switching to X"`
 4. **Stop when blocked** - Use `aiki task stop --reason` to document blockers
-5. **Close done work with confidence and summary** - Use `aiki task close --confidence <1-4> --summary` to document your work
+5. **Close with summary** - Use `aiki task close --summary` to document your work
 6. **Close as won't-do when appropriate** - Use `aiki task close --wont-do --summary` for tasks you skip or decline (not needed, already done, disagree with approach)
 7. **Close immediately** - Don't leave tasks open after finishing
 8. **Report what you did** - Include completed tasks when replying to user
@@ -559,7 +450,7 @@ Example:
 ### Common Pitfalls
 
 - **Using TodoWrite instead of `aiki task`** ← Most common mistake!
-- **Using the Task tool instead of `aiki run`** ← Native subagents lack aiki context!
+- **Using the Task tool instead of `aiki task run`** ← Native subagents lack aiki context!
 - **Not leaving progress comments on long tasks** ← Easy to forget!
 - **Not reporting completed tasks to user** ← User can't see what was done!
 - **Not explicitly stopping tasks before switching to new work** ← Tasks don't auto-stop!
@@ -607,15 +498,3 @@ Tasks can be linked to express relationships. Use `aiki task link` to create lin
 **Cycle detection:** `blocked-by` and `subtask-of` links are checked for cycles at write time.
 </aiki>
 "#;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_aiki_block_done_close_examples_include_confidence() {
-        let block = aiki_block_template();
-        assert!(block.contains("--confidence <1-4> --summary"));
-        assert!(!block.contains("--wont-do --confidence"));
-    }
-}

@@ -15,15 +15,21 @@ type Result<T> = anyhow::Result<T>;
 
 use crate::jj::JJWorkspace;
 use crate::provenance::record::{AgentType, AttributionConfidence, ProvenanceRecord};
+use crate::verify;
+
 /// Line-by-line attribution information for a file
 #[derive(Debug, Clone)]
 pub struct LineAttribution {
     pub line_number: usize,
     pub line_text: String,
+    #[allow(dead_code)]
+    pub change_id: String,
     pub commit_id: String,
     pub agent_type: AgentType,
     pub confidence: Option<AttributionConfidence>,
     pub session_id: Option<String>,
+    #[allow(dead_code)]
+    pub tool_name: Option<String>,
     pub client_name: Option<String>,
 }
 
@@ -127,7 +133,7 @@ impl BlameContext {
 
         // Cache for commit descriptions to avoid repeated lookups
         // Use String (hex) as key to avoid Vec allocation on every lookup
-        let mut commit_cache: HashMap<String, Option<ProvenanceRecord>> = HashMap::new();
+        let mut commit_cache: HashMap<String, (String, Option<ProvenanceRecord>)> = HashMap::new();
 
         let mut attributions = Vec::new();
         let mut line_num = 1;
@@ -153,36 +159,46 @@ impl BlameContext {
             let commit_id_hex = commit_id.hex();
 
             // Check cache first
-            let provenance = if let Some(cached) = commit_cache.get(&commit_id_hex) {
+            let (change_id_hex, provenance) = if let Some(cached) = commit_cache.get(&commit_id_hex)
+            {
                 cached.clone()
             } else {
                 // Load commit and parse provenance
                 let commit = self.repo.store().get_commit(&commit_id)?;
+                let change_id_hex = commit.change_id().hex();
                 let description = commit.description();
                 let provenance = ProvenanceRecord::from_description(description).unwrap_or(None);
 
-                commit_cache.insert(commit_id_hex.clone(), provenance.clone());
+                // Cache it (clone commit_id_hex for cache key)
+                commit_cache.insert(
+                    commit_id_hex.clone(),
+                    (change_id_hex.clone(), provenance.clone()),
+                );
 
-                provenance
+                (change_id_hex, provenance)
             };
 
             let attribution = match provenance {
                 Some(prov) => LineAttribution {
                     line_number: line_num,
                     line_text: line_text.to_string(),
-                    commit_id: commit_id_hex.clone(),
+                    change_id: change_id_hex,
+                    commit_id: commit_id_hex.clone(), // Reuse cached hex string
                     agent_type: prov.agent.agent_type,
                     confidence: Some(prov.agent.confidence),
                     session_id: Some(prov.session_id),
+                    tool_name: Some(prov.tool_name),
                     client_name: prov.client_name,
                 },
                 None => LineAttribution {
                     line_number: line_num,
                     line_text: line_text.to_string(),
-                    commit_id: commit_id_hex,
+                    change_id: change_id_hex,
+                    commit_id: commit_id_hex, // Move (last use)
                     agent_type: AgentType::Unknown,
                     confidence: None,
                     session_id: None,
+                    tool_name: None,
                     client_name: None,
                 },
             };
@@ -217,11 +233,29 @@ impl BlameCommand {
         &self,
         attributions: &[LineAttribution],
         agent_filter: Option<AgentType>,
+        verify: bool,
     ) -> String {
         use std::fmt::Write;
 
         // Pre-allocate output buffer (estimate ~100 bytes per line)
         let mut output = String::with_capacity(attributions.len() * 100);
+
+        // If verify is enabled, collect unique change IDs and verify them
+        let mut signature_cache: HashMap<String, verify::SignatureStatus> = HashMap::new();
+        if verify {
+            // Collect unique change IDs
+            let mut change_ids: Vec<String> =
+                attributions.iter().map(|a| a.change_id.clone()).collect();
+            change_ids.sort();
+            change_ids.dedup();
+
+            // Verify each unique change
+            for change_id in change_ids {
+                if let Ok(result) = verify::verify_change(&self.repo_path, &change_id) {
+                    signature_cache.insert(change_id, result.signature_status);
+                }
+            }
+        }
 
         for attr in attributions {
             // Apply agent filter if specified
@@ -231,7 +265,22 @@ impl BlameCommand {
                 }
             }
 
-            // Format: commit_id (agent session confidence [client]) line_num| line_text
+            // Get signature indicator if verify is enabled
+            let sig_indicator = if verify {
+                signature_cache
+                    .get(&attr.change_id)
+                    .map(|status| match status {
+                        verify::SignatureStatus::Good => "✓ ",
+                        verify::SignatureStatus::Bad => "✗ ",
+                        verify::SignatureStatus::Unknown => "? ",
+                        verify::SignatureStatus::Unsigned => "⚠ ",
+                    })
+                    .unwrap_or("⚠ ")
+            } else {
+                ""
+            };
+
+            // Format: [sig] commit_id (agent session confidence [client]) line_num| line_text
             // Use Display trait for human-friendly agent names
             let agent_str = format!("{}", attr.agent_type);
             let session_str = attr
@@ -256,7 +305,8 @@ impl BlameCommand {
             // Use write! to avoid intermediate allocations
             write!(
                 output,
-                "{} ({:12} {:12} {:6}{}) {:4}| {}\n",
+                "{}{} ({:12} {:12} {:6}{}) {:4}| {}\n",
+                sig_indicator,
                 short_commit,
                 agent_str,
                 session_str,
@@ -300,10 +350,12 @@ mod tests {
         let attr = LineAttribution {
             line_number: 1,
             line_text: "fn main() {".to_string(),
+            change_id: "abc123".to_string(),
             commit_id: "def456".to_string(),
             agent_type: AgentType::ClaudeCode,
             confidence: Some(AttributionConfidence::High),
             session_id: Some("session-123".to_string()),
+            tool_name: Some("Edit".to_string()),
             client_name: Some("zed".to_string()),
         };
 

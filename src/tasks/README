@@ -1,0 +1,69 @@
+# Task Lifecycle: Automatic Transitions
+
+This documents every place the task system automatically starts, stops, or closes a task
+as a side effect of another action.
+
+## 1. No auto-stop on start
+
+Starting a task does **not** auto-stop other in-progress tasks. Agents are responsible for
+explicitly stopping tasks when switching (`aiki task stop --reason "Switching to X"`) or
+closing them when done (`aiki task close --summary "..."`).
+
+## 2. Auto-start parent (when last subtask closes)
+
+**Location:** `../commands/task.rs` — `run_close()`
+
+When a subtask is closed and it is the **last unclosed subtask** of a parent, the parent
+is automatically started (transitions to InProgress). This prompts the agent to do a
+final review/wrap-up of the parent.
+
+- Skips if parent is already Closed or InProgress
+- Uses `all_subtasks_closed()` from `manager.rs`
+
+## 3. Auto-create + auto-start `.0` planning subtask (on parent start)
+
+**Location:** `../commands/task.rs` — `run_start()`
+
+When a parent task with subtasks is started, a `.0` planning subtask is auto-created
+(if it doesn't already exist) named "Review all subtasks and start first batch".
+The `.0` subtask is started **instead of** the parent itself.
+
+## 4. Quick-start: create + start atomically
+
+**Location:** `../commands/task.rs` — `run_start()`
+
+When `aiki task start "some description"` receives a non-task-ID string, it creates a
+new task with that description and immediately starts it.
+
+## 5. Template quick-start: create from template + start
+
+**Location:** `../commands/task.rs` — `run_start()`
+
+When `aiki task start --template <name>` is used, it creates task(s) from the template
+then recursively calls the start flow with the new task ID.
+
+## 6. Auto-start next subtask (on subtask close)
+
+**Location:** `../commands/task.rs` — `run_close()`
+
+When a subtask is closed and the **parent is claimed by the current session**, the next
+pending subtask (by priority, then creation order) is automatically started. This only
+triggers when the session owns the parent — not when an agent only claimed a single
+subtask without the parent.
+
+- Requires: parent `claimed_by_session` matches current session
+- Skips if all subtasks are closed (auto-start parent handles that case)
+- The auto-started subtask inherits the session claim
+- Output includes the started subtask with its instructions
+
+## Summary
+
+| Transition            | Trigger                        | Effect                                  |
+|-----------------------|--------------------------------|-----------------------------------------|
+| Auto-start parent     | Closing last subtask           | Parent transitions to InProgress        |
+| Auto-start next child | Closing subtask (parent owned) | Next pending subtask started            |
+| Auto-create .0        | Starting parent with subtasks  | Planning subtask created and started    |
+| Quick-start           | `task start "desc"`            | New task created and started            |
+| Template start        | `task start --template X`      | Template task created and started       |
+
+The auto-start-parent and auto-start-next-child logic live in the close handler in `commands/task.rs`.

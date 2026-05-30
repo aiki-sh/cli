@@ -654,7 +654,6 @@ pub fn fire_session_start_event(
         session,
         cwd: working_dir,
         timestamp: chrono::Utc::now(),
-        transcript_path: None,
     });
 
     // Dispatch to event bus (non-blocking - errors are logged but don't fail the proxy)
@@ -923,9 +922,7 @@ pub fn handle_session_end(
         turn: crate::events::Turn::unknown(), // Set by handle_turn_completed
         response: response_text.to_string(),
         modified_files: Vec::new(), // Files tracked separately via change.done events
-        tasks: Default::default(),  // Populated by handle_turn_completed
-        tokens: None,
-        model: None,
+        tasks: Default::default(), // Populated by handle_turn_completed
     });
 
     let response = event_bus::dispatch(event)?;

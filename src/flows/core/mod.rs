@@ -5,23 +5,16 @@
 
 mod functions;
 
+#[allow(unused_imports)]
 pub use functions::{
-    // Change event functions (unified mutations: write, delete, move)
-    build_delete_metadata,
-    build_human_metadata_change_post,
-    build_human_metadata_change_pre,
-    build_move_metadata,
-    build_write_metadata,
-    classify_edits_change,
     // Commit integration
     generate_coauthors,
-    prepare_separation_change,
-    restore_original_files_change,
+    // Change event functions (unified mutations: write, delete, move)
+    build_delete_metadata, build_human_metadata_change_post, build_human_metadata_change_pre,
+    build_move_metadata, build_write_metadata, classify_edits_change, prepare_separation_change,
+    restore_original_files_change, write_ai_files_change,
     // Task system functions
-    task_in_progress,
-    task_list_size_for_agent,
+    task_in_progress, task_list_size, task_list_size_for_agent,
     // Workspace isolation functions
-    workspace_absorb_all,
-    workspace_ensure_isolated,
-    write_ai_files_change,
+    detect_workspace_conflicts, workspace_absorb_all, workspace_create_if_concurrent,
 };

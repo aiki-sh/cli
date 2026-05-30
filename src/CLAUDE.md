@@ -182,6 +182,7 @@ See `cli/src/error.rs` for the full list. Common ones:
 - **Agents**: `UnknownAgentType(String)`, `UnsupportedAgentType(String)`
 - **Flows**: `InvalidLetSyntax(String)`, `InvalidVariableName(String)`, `ActionFailed`
 - **Commands**: `JjCommandFailed(String)`, `GitDiffFailed(String)`
+- **Signing**: `SshKeyNotFound(PathBuf)`, `GpgKeyIdExtractionFailed`
 
 ### Main Function Error Handling
 
@@ -372,6 +373,7 @@ cli/src/
     ├── hooks.rs - Hook installation and management
     ├── blame.rs - File attribution
     ├── authors.rs - Author extraction
+    ├── verify.rs - Signature verification
     └── record_change.rs - Legacy change recording
 ```
 

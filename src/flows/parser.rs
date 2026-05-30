@@ -15,7 +15,8 @@ impl HookParser {
     /// - `{type}.completed` expands to `task.closed` with `if: event.task.type == "{type}" && event.task.outcome == "done"`
     pub fn parse_str(yaml: &str) -> Result<Hook> {
         // First parse to Value for preprocessing
-        let mut value: Value = serde_yaml::from_str(yaml).context("Failed to parse flow YAML")?;
+        let mut value: Value =
+            serde_yaml::from_str(yaml).context("Failed to parse flow YAML")?;
 
         // Expand sugar patterns
         if let Value::Mapping(ref mut map) = value {
@@ -317,10 +318,7 @@ before:
 "#;
 
         let result = HookParser::parse_str(yaml);
-        assert!(
-            result.is_err(),
-            "Old before: [string-list] form should not parse as CompositionBlock"
-        );
+        assert!(result.is_err(), "Old before: [string-list] form should not parse as CompositionBlock");
     }
 
     #[test]

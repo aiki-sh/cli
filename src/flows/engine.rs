@@ -9,9 +9,9 @@ use crate::validation::is_valid_flow_identifier;
 
 use super::state::{ActionResult, AikiState};
 use super::types::{
-    Action, AutoreplyAction, AutoreplyContent, CallAction, CommitMessageAction, CommitMessageOp,
-    ContextAction, HookStatement, IfStatement, JjAction, LetAction, LogAction, OnFailure,
-    OnFailureShortcut, ReviewAction, ShellAction, SwitchStatement, TaskRunAction,
+    Action, AutoreplyAction, AutoreplyContent, CommitMessageAction, CommitMessageOp, ContextAction,
+    HookStatement, IfStatement, JjAction, LetAction, LogAction, OnFailure, OnFailureShortcut,
+    ReviewAction, CallAction, ShellAction, SwitchStatement, TaskRunAction,
 };
 use super::variables::VariableResolver;
 use crate::error::{AikiError, Result};
@@ -58,11 +58,7 @@ impl HookEngine {
                 resolver.add_var("event.turn".to_string(), e.turn.number.to_string());
                 resolver.add_var("event.turn_id".to_string(), e.turn.id.clone());
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
             }
@@ -70,11 +66,7 @@ impl HookEngine {
             // Read operations
             crate::events::AikiEvent::ReadPermissionAsked(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
                 resolver.add_var("event.tool_name".to_string(), e.tool_name.clone());
@@ -85,11 +77,7 @@ impl HookEngine {
             }
             crate::events::AikiEvent::ReadCompleted(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
                 resolver.add_var("event.tool_name".to_string(), e.tool_name.clone());
@@ -102,11 +90,7 @@ impl HookEngine {
             }
             crate::events::AikiEvent::SessionStarted(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
             }
@@ -116,11 +100,7 @@ impl HookEngine {
                 resolver.add_var("event.turn".to_string(), e.turn.number.to_string());
                 resolver.add_var("event.turn_id".to_string(), e.turn.id.clone());
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
                 resolver.add_var(
@@ -134,72 +114,44 @@ impl HookEngine {
             }
             crate::events::AikiEvent::SessionEnded(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
             }
             crate::events::AikiEvent::SessionResumed(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
             }
             crate::events::AikiEvent::SessionWillCompact(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
             }
             crate::events::AikiEvent::SessionCompacted(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
             }
             crate::events::AikiEvent::SessionCleared(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
             }
             crate::events::AikiEvent::ShellPermissionAsked(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
                 resolver.add_var("event.command".to_string(), e.command.clone());
             }
             crate::events::AikiEvent::ShellCompleted(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
                 resolver.add_var("event.command".to_string(), e.command.clone());
@@ -217,11 +169,7 @@ impl HookEngine {
             }
             crate::events::AikiEvent::McpPermissionAsked(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
                 resolver.add_var("event.tool_name".to_string(), e.tool_name.clone());
@@ -229,11 +177,7 @@ impl HookEngine {
             }
             crate::events::AikiEvent::McpCompleted(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
                 resolver.add_var("event.tool_name".to_string(), e.tool_name.clone());
@@ -244,11 +188,7 @@ impl HookEngine {
             }
             crate::events::AikiEvent::WebPermissionAsked(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
                 resolver.add_var("event.operation".to_string(), e.operation.to_string());
@@ -261,11 +201,7 @@ impl HookEngine {
             }
             crate::events::AikiEvent::WebCompleted(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
                 resolver.add_var("event.operation".to_string(), e.operation.to_string());
@@ -290,11 +226,7 @@ impl HookEngine {
             // Change operations (unified mutations: write, delete, move)
             crate::events::AikiEvent::ChangePermissionAsked(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
                 resolver.add_var(
@@ -356,11 +288,7 @@ impl HookEngine {
             }
             crate::events::AikiEvent::ChangeCompleted(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
                 resolver.add_var(
@@ -426,30 +354,10 @@ impl HookEngine {
                 // No event-specific variables for unsupported events
             }
 
-            // Model transition events
-            crate::events::AikiEvent::ModelChanged(e) => {
-                resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
-                    e.session.external_id().to_string(),
-                );
-                resolver.add_var("event.new_model".to_string(), e.new_model.clone());
-                if let Some(ref prev) = e.previous_model {
-                    resolver.add_var("event.previous_model".to_string(), prev.clone());
-                }
-            }
-
             // Task lifecycle events
             crate::events::AikiEvent::RepoChanged(e) => {
                 resolver.add_var(
-                    "event.session.uuid".to_string(),
-                    e.session.uuid().to_string(),
-                );
-                resolver.add_var(
-                    "event.session.external_id".to_string(),
+                    "event.session_id".to_string(),
                     e.session.external_id().to_string(),
                 );
                 resolver.add_var("event.repo.root".to_string(), e.repo.root.clone());
@@ -528,74 +436,37 @@ impl HookEngine {
         // Add cwd using helper method
         resolver.add_var("cwd", state.cwd().to_string_lossy().to_string());
 
-        // Expose whether an autoreply has been queued earlier in this hook run.
-        // Used to guard session.end from firing when a follow-up turn is pending.
-        resolver.add_var(
-            "has_pending_autoreply".to_string(),
-            state.has_pending_autoreply().to_string(),
-        );
-
         // Set up lazy per-key env var lookup instead of collecting all env vars
         // This ensures runtime set_var/remove_var mutations are immediately visible
         resolver.set_env_lookup(|name| std::env::var(name).ok());
 
         // Add session variables for task.closed events
-        // These look up the session driven by the closed task's thread
+        // These look up the session driven by the closed task
         if let crate::events::AikiEvent::TaskClosed(e) = &state.event {
             let task_id = e.task.id.clone();
-            let session_cache = state.task_closed_thread_session_cache();
-            let resolve_thread_session: std::rc::Rc<
-                dyn Fn() -> Option<crate::session::ThreadSessionInfo>,
-            > = {
-                let task_id = task_id.clone();
-                let session_cache = session_cache.clone();
-                std::rc::Rc::new(move || {
-                    session_cache
-                        .get_or_init(|| crate::session::find_thread_session(&task_id))
-                        .clone()
-                })
-            };
 
             debug_log(|| format!("task.closed: event.task.id={}", task_id));
 
-            // Lazy lookup of thread session info — matches on thread tail
-            let resolve_thread_session_for_tail = resolve_thread_session.clone();
-            resolver.add_lazy_var("session.thread.tail", move || {
-                let result = if let Some(session_info) = resolve_thread_session_for_tail() {
-                    session_info.thread.tail.clone()
+            // Lazy lookup of session info for this task
+            let task_id_for_session = task_id.clone();
+            resolver.add_lazy_var("session.task.id", move || {
+                let result = if let Some(session_info) =
+                    crate::session::find_task_session(&task_id_for_session)
+                {
+                    session_info.task_id
                 } else {
                     String::new()
                 };
-                debug_log(|| format!("task.closed: session.thread.tail resolved to '{}'", result));
+                debug_log(|| format!("task.closed: session.task.id resolved to '{}'", result));
                 result
             });
 
-            let resolve_thread_session_for_head = resolve_thread_session.clone();
-            resolver.add_lazy_var("session.thread.head", move || {
-                let result = if let Some(session_info) = resolve_thread_session_for_head() {
-                    session_info.thread.head.clone()
-                } else {
-                    String::new()
-                };
-                debug_log(|| format!("task.closed: session.thread.head resolved to '{}'", result));
-                result
-            });
-
-            let resolve_thread_session_for_thread = resolve_thread_session.clone();
-            resolver.add_lazy_var("session.thread", move || {
-                let result = if let Some(session_info) = resolve_thread_session_for_thread() {
-                    session_info.thread.serialize()
-                } else {
-                    String::new()
-                };
-                debug_log(|| format!("task.closed: session.thread resolved to '{}'", result));
-                result
-            });
-
-            let resolve_thread_session_for_mode = resolve_thread_session.clone();
+            let task_id_for_mode = task_id;
             resolver.add_lazy_var("session.mode", move || {
                 // Read the session file to get the actual mode
-                let result = if let Some(session_info) = resolve_thread_session_for_mode() {
+                let result = if let Some(session_info) =
+                    crate::session::find_task_session(&task_id_for_mode)
+                {
                     session_info.mode.to_string().to_string()
                 } else {
                     String::new()
@@ -603,103 +474,6 @@ impl HookEngine {
                 debug_log(|| format!("task.closed: session.mode resolved to '{}'", result));
                 result
             });
-
-            let resolve_thread_session_for_agent = resolve_thread_session;
-            resolver.add_lazy_var("session.agent", move || {
-                let result = if let Some(session_info) = resolve_thread_session_for_agent() {
-                    session_info.agent_type.clone()
-                } else {
-                    String::new()
-                };
-                debug_log(|| format!("task.closed: session.agent resolved to '{}'", result));
-                result
-            });
-        }
-
-        // Add session variables for session-bearing events (turn.completed, etc.)
-        // These read directly from the session on the event payload.
-        if let Ok(session) = extract_session(&state.event) {
-            // Only add these if not already set (task.closed sets them via reverse lookup above)
-            if !matches!(&state.event, crate::events::AikiEvent::TaskClosed(_)) {
-                let mode = session.mode();
-                resolver.add_var("session.mode".to_string(), mode.to_string());
-
-                let thread = session.thread();
-
-                if let Some(thread) = thread {
-                    let tail = thread.tail.clone();
-                    let head = thread.head.clone();
-                    let serialized = thread.serialize();
-                    resolver.add_var("session.thread.tail".to_string(), tail.clone());
-                    resolver.add_var("session.thread.head".to_string(), head);
-                    resolver.add_var("session.thread".to_string(), serialized);
-
-                    // session.thread.tail.status — lazy lookup from task graph
-                    let tail_for_status = tail;
-                    let cwd_for_status = state.cwd().to_path_buf();
-                    resolver.add_lazy_var("session.thread.tail.status", move || {
-                        crate::tasks::read_events(&cwd_for_status)
-                            .ok()
-                            .and_then(|events| {
-                                let graph = crate::tasks::materialize_graph(&events);
-                                graph.tasks.get(&tail_for_status).map(|t| t.status.to_string())
-                            })
-                            .unwrap_or_default()
-                    });
-                } else {
-                    resolver.add_var("session.thread.tail".to_string(), String::new());
-                    resolver.add_var("session.thread.head".to_string(), String::new());
-                    resolver.add_var("session.thread".to_string(), String::new());
-                    resolver.add_var("session.thread.tail.status".to_string(), String::new());
-                }
-
-                // session.task.* — lazy lookup of the thread tail task from the task graph
-                if let Some(thread) = thread {
-                    let tail_id = thread.tail.clone();
-                    let cwd = state.cwd().to_path_buf();
-                    // Cache the task lookup so we only load the graph once
-                    let task_cache: std::rc::Rc<
-                        std::cell::OnceCell<Option<(String, String)>>,
-                    > = std::rc::Rc::new(std::cell::OnceCell::new());
-
-                    let lookup_task = {
-                        let tail_id = tail_id.clone();
-                        let cwd = cwd.clone();
-                        let cache = task_cache.clone();
-                        move || -> Option<(String, String)> {
-                            cache.get_or_init(|| {
-                                let events = crate::tasks::read_events(&cwd).ok()?;
-                                let graph = crate::tasks::materialize_graph(&events);
-                                let task = graph.tasks.get(&tail_id)?;
-                                Some((
-                                    task.status.to_string(),
-                                    task.task_type.clone().unwrap_or_default(),
-                                ))
-                            }).clone()
-                        }
-                    };
-
-                    resolver.add_var("session.task.id".to_string(), tail_id);
-
-                    let lookup_status = lookup_task.clone();
-                    resolver.add_lazy_var("session.task.status", move || {
-                        lookup_status()
-                            .map(|(status, _)| status)
-                            .unwrap_or_default()
-                    });
-
-                    let lookup_type = lookup_task;
-                    resolver.add_lazy_var("session.task.type", move || {
-                        lookup_type()
-                            .map(|(_, task_type)| task_type)
-                            .unwrap_or_default()
-                    });
-                } else {
-                    resolver.add_var("session.task.id".to_string(), String::new());
-                    resolver.add_var("session.task.status".to_string(), String::new());
-                    resolver.add_var("session.task.type".to_string(), String::new());
-                }
-            }
         }
 
         resolver
@@ -795,12 +569,6 @@ impl HookEngine {
             Action::SessionEnd(session_end_action) => {
                 Self::execute_session_end(session_end_action, state)
             }
-            Action::AutoreplyToEndSession(action) => {
-                Self::execute_autoreply_to_end_session(action, state)
-            }
-            Action::AutoreplyToFixConflicts(action) => {
-                Self::execute_autoreply_to_fix_conflicts(action, state)
-            }
         }
     }
 
@@ -825,8 +593,6 @@ impl HookEngine {
             Action::Stop(_) => return Ok(HookOutcome::FailedStop),
             Action::Block(_) => return Ok(HookOutcome::FailedBlock),
             Action::SessionEnd(session_end_action) => &session_end_action.on_failure,
-            Action::AutoreplyToEndSession(action) => &action.on_failure,
-            Action::AutoreplyToFixConflicts(action) => &action.on_failure,
         };
 
         let failure_text = if !result.stderr.is_empty() {
@@ -944,12 +710,6 @@ impl HookEngine {
             }
             Action::SessionEnd(_) => {
                 // session.end actions don't produce storable results
-            }
-            Action::AutoreplyToEndSession(_) => {
-                // autoreply_to_end_session sets state.end_session flag, no storable result
-            }
-            Action::AutoreplyToFixConflicts(_) => {
-                // autoreply_to_fix_conflicts adds to context assembler, no storable result
             }
         }
     }
@@ -1151,12 +911,7 @@ impl HookEngine {
         }
 
         // Resolve optional agent override
-        let agent_override = action
-            .task_run
-            .agent
-            .as_ref()
-            .map(|a| resolver.resolve(a))
-            .transpose()?;
+        let agent_override = action.task_run.agent.as_ref().map(|a| resolver.resolve(a)).transpose()?;
 
         // Build options
         let mut options = TaskRunOptions::new();
@@ -1199,7 +954,7 @@ impl HookEngine {
     /// `review: { task_id: X, template: Y }` is equivalent to
     /// `aiki review X --template Y --async`. Flows always use async mode.
     fn execute_review(action: &ReviewAction, state: &mut AikiState) -> Result<ActionResult> {
-        use crate::reviews::{create_review, detect_target, CreateReviewParams};
+        use crate::commands::review::{create_review, CreateReviewParams, detect_target};
         use crate::tasks::runner::{task_run_async, TaskRunOptions};
 
         // Create variable resolver
@@ -1214,20 +969,10 @@ impl HookEngine {
             .transpose()?;
 
         // Resolve optional agent override
-        let agent_override = action
-            .review
-            .agent
-            .as_ref()
-            .map(|a| resolver.resolve(a))
-            .transpose()?;
+        let agent_override = action.review.agent.as_ref().map(|a| resolver.resolve(a)).transpose()?;
 
         // Resolve optional template name
-        let template = action
-            .review
-            .template
-            .as_ref()
-            .map(|t| resolver.resolve(t))
-            .transpose()?;
+        let template = action.review.template.as_ref().map(|t| resolver.resolve(t)).transpose()?;
 
         // Get cwd from state
         let cwd = state.cwd();
@@ -1260,7 +1005,7 @@ impl HookEngine {
                 scope,
                 agent_override,
                 template,
-                fix_template: None,
+                fix: false,
                 autorun: false,
             },
         ) {
@@ -1386,11 +1131,11 @@ impl HookEngine {
         })
     }
 
-    /// Execute a sigterm_to_end_session action - terminates the current session via SIGTERM
+    /// Execute a session.end action - terminates the current session gracefully
     ///
-    /// This action is used for agents (like Codex) whose SDK doesn't fire the Stop
-    /// hook in exec mode, so cooperative termination via autoreply_to_end_session
-    /// cannot work. Sends SIGTERM to the agent process after hooks complete.
+    /// This action is used for task-driven sessions that should auto-end when their
+    /// driving task closes. It spawns a thread that waits briefly then sends SIGTERM
+    /// to the parent process (the agent), allowing the hook to complete first.
     fn execute_session_end(
         action: &crate::flows::types::SessionEndAction,
         state: &mut AikiState,
@@ -1403,64 +1148,33 @@ impl HookEngine {
         // Resolve variables in reason text
         let reason = resolver.resolve(&action.reason)?;
 
-        debug_log(|| format!("sigterm_to_end_session: {}", reason));
+        debug_log(|| format!("session.end: {}", reason));
 
-        // Get session info. For task.closed events, reverse-lookup from session files.
-        // For session-bearing events, extract directly from the event payload.
-        let session_info = state.resolve_task_closed_thread_session();
-        let parent_pid = extract_session(&state.event)
-            .ok()
-            .and_then(|s| s.parent_pid())
-            .or_else(|| session_info.as_ref().map(|info| info.pid));
-
-        if let Some(pid) = parent_pid {
-            // Fire synthetic turn.completed → session.ended to complete the
-            // session lifecycle. Codex exec doesn't fire Stop, so the last
-            // turn's turn.completed (workspace absorption) was never run.
-            // session.ended handles history recording and session file cleanup.
-            if let Some(ref info) = session_info {
-                let session = info.to_aiki_session();
-                let cwd = state.cwd().to_path_buf();
-
-                // 1. Synthetic turn.completed — absorbs workspace changes
-                debug_log(|| format!("sigterm_to_end_session: Dispatching synthetic turn.completed for {}", info.session_id));
-                let turn_event = crate::events::AikiEvent::TurnCompleted(
-                    crate::events::AikiTurnCompletedPayload {
-                        session: session.clone(),
-                        cwd: cwd.clone(),
-                        timestamp: chrono::Utc::now(),
-                        turn: crate::events::Turn::unknown(),
-                        response: String::new(),
-                        modified_files: vec![],
-                        tasks: Default::default(),
-                        tokens: None,
-                        model: None,
-                    },
-                );
-                if let Err(e) = crate::event_bus::dispatch(turn_event) {
-                    debug_log(|| format!("sigterm_to_end_session: turn.completed dispatch failed (non-fatal): {}", e));
-                }
-
-                // 2. Synthetic session.ended — history, session file cleanup
-                debug_log(|| format!("sigterm_to_end_session: Dispatching synthetic session.ended for {}", info.session_id));
-                let ended_event = crate::events::AikiEvent::SessionEnded(
-                    crate::events::AikiSessionEndedPayload {
-                        session,
-                        cwd,
-                        timestamp: chrono::Utc::now(),
-                        reason: reason.clone(),
-                        tokens: None,
-                    },
-                );
-                if let Err(e) = crate::event_bus::dispatch(ended_event) {
-                    debug_log(|| format!("sigterm_to_end_session: session.ended dispatch failed (non-fatal): {}", e));
+        // Get the session's parent PID (the agent process)
+        let parent_pid = match &state.event {
+            crate::events::AikiEvent::TaskClosed(e) => {
+                // For task.closed events, we need to find the session that matches the task
+                // Look up the session for this task
+                if let Some(session_info) = crate::session::find_task_session(&e.task.id) {
+                    Some(session_info.pid)
+                } else {
+                    debug_log(|| {
+                        format!("session.end: No task session found for task {}", e.task.id)
+                    });
+                    None
                 }
             }
+            _ => {
+                debug_log(|| "session.end: Can only be used in task.closed events".to_string());
+                None
+            }
+        };
 
+        if let Some(pid) = parent_pid {
             // Defer SIGTERM until after all hooks complete
             // The actual termination happens in execute_pending_session_ends()
             // which is called by the event handler after hook execution
-            debug_log(|| format!("sigterm_to_end_session: Deferring SIGTERM to PID {}", pid));
+            debug_log(|| format!("session.end: Deferring SIGTERM to PID {}", pid));
             state.add_pending_session_end(pid);
 
             Ok(ActionResult {
@@ -1471,7 +1185,7 @@ impl HookEngine {
             })
         } else {
             // No parent PID found - log warning but don't fail
-            debug_log(|| "sigterm_to_end_session: No parent PID available, skipping termination".to_string());
+            debug_log(|| "session.end: No parent PID available, skipping termination".to_string());
             Ok(ActionResult {
                 success: true,
                 exit_code: Some(0),
@@ -1481,111 +1195,20 @@ impl HookEngine {
         }
     }
 
-    /// Execute an autoreply_to_end_session action (cooperative termination).
-    ///
-    /// Sets `state.end_session = true` so that the turn.completed handler
-    /// returns `Decision::Block`. The editor output builder translates this
-    /// into the agent-specific stop signal (e.g., `{ "continue": false }`
-    /// for Codex).
-    fn execute_autoreply_to_end_session(
-        action: &crate::flows::types::AutoreplyToEndSessionAction,
-        state: &mut AikiState,
-    ) -> Result<ActionResult> {
-        use crate::cache::debug_log;
-
-        let mut resolver = Self::create_resolver(state);
-        let reason = resolver.resolve(&action.reason)?;
-
-        debug_log(|| format!("autoreply_to_end_session: {}", reason));
-        state.end_session = true;
-
-        Ok(ActionResult {
-            success: true,
-            exit_code: Some(0),
-            stdout: String::new(),
-            stderr: String::new(),
-        })
-    }
-
-    /// Execute an autoreply_to_fix_conflicts action.
-    ///
-    /// Builds a conflict resolution autoreply message from the conflicted file
-    /// list and adds it to the context assembler, just like a regular autoreply.
-    fn execute_autoreply_to_fix_conflicts(
-        action: &crate::flows::types::AutoreplyToFixConflictsAction,
-        state: &mut AikiState,
-    ) -> Result<ActionResult> {
-        use crate::cache::debug_log;
-        use crate::events::AikiEvent;
-
-        if !matches!(&state.event, AikiEvent::TurnCompleted(_)) {
-            return Err(AikiError::Other(anyhow::anyhow!(
-                "autoreply_to_fix_conflicts can only be used in turn.completed events"
-            )));
-        }
-
-        let mut resolver = Self::create_resolver(state);
-        let conflicted_files = resolver.resolve(&action.conflicted_files)?;
-
-        debug_log(|| format!("autoreply_to_fix_conflicts: {}", conflicted_files));
-
-        let message = format!(
-            "CONFLICT RESOLUTION REQUIRED\n\
-             \n\
-             Absorption introduced conflicts in the working copy.\n\
-             Conflicted files:\n\
-             {conflicted_files}\n\
-             \n\
-             To resolve: edit the conflicted files to remove JJ conflict\n\
-             markers, then continue working. JJ parses your edits back\n\
-             automatically on snapshot. Alternatively, run\n\
-             `aiki resolve <change-id>` to delegate conflict resolution.\n\
-             \n\
-             JJ conflict marker format (NOT Git's format):\n\
-             \x20 <<<<<<< Conflict N of M\n\
-             \x20 %%%%%%% Changes from base to side #1 (this is a DIFF, not content)\n\
-             \x20 +++++++ Contents of side #2 (this is literal content)\n\
-             \x20 >>>>>>> Conflict N of M ends\n\
-             \n\
-             The %%%%%%% section shows a diff (additions/removals from base),\n\
-             NOT a middle version like Git's =======. Apply the diff's intent\n\
-             to side #2's content to produce the merged result."
-        );
-
-        let chunk = crate::flows::context::ContextChunk {
-            prepend: None,
-            append: Some(crate::flows::context::TextLines::Single(message)),
-        };
-
-        let assembler = state.get_context_assembler_mut()?;
-        assembler.add_chunk(chunk);
-
-        Ok(ActionResult {
-            success: true,
-            exit_code: Some(0),
-            stdout: String::new(),
-            stderr: String::new(),
-        })
-    }
-
     /// Execute a context action
     ///
     /// This action accumulates context that will be prepended to prompts/autoreplies.
-    /// Works for session lifecycle events plus turn.started and turn.completed.
+    /// Works for session.started, turn.started, and turn.completed events.
     fn execute_context(action: &ContextAction, state: &mut AikiState) -> Result<ActionResult> {
         use crate::events::AikiEvent;
 
         // Verify this is an event type that supports context injection
         if !matches!(
             &state.event,
-            AikiEvent::SessionStarted(_)
-                | AikiEvent::SessionResumed(_)
-                | AikiEvent::SessionCleared(_)
-                | AikiEvent::TurnStarted(_)
-                | AikiEvent::TurnCompleted(_)
+            AikiEvent::SessionStarted(_) | AikiEvent::TurnStarted(_) | AikiEvent::TurnCompleted(_)
         ) {
             return Err(AikiError::Other(anyhow::anyhow!(
-                "context action can only be used in session.started, session.resumed, session.cleared, turn.started, or turn.completed events"
+                "context action can only be used in session.started, turn.started, or turn.completed events"
             )));
         }
 
@@ -1976,7 +1599,8 @@ impl HookEngine {
         // Step 2: Build Rhai scope from state variables
         let mut resolver = Self::create_resolver(state);
         let variables = resolver.collect_variables();
-        let var_map: std::collections::BTreeMap<String, String> = variables.into_iter().collect();
+        let var_map: std::collections::BTreeMap<String, String> =
+            variables.into_iter().collect();
         let mut scope = crate::expressions::build_scope_from_flat(&var_map);
 
         // Step 3: Evaluate with Rhai
@@ -2369,13 +1993,17 @@ impl HookEngine {
             // ========================================================================
             // Workspace isolation functions
             // ========================================================================
-            ("core", "workspace_ensure_isolated") => {
+            ("core", "workspace_create_if_concurrent") => {
                 let session = extract_session(&state.event)?;
-                crate::flows::core::workspace_ensure_isolated(session, state.cwd())
+                crate::flows::core::workspace_create_if_concurrent(session, state.cwd())
             }
             ("core", "workspace_absorb_all") => {
                 let session = extract_session(&state.event)?;
                 crate::flows::core::workspace_absorb_all(session)
+            }
+            ("core", "detect_workspace_conflicts") => {
+                let session = extract_session(&state.event)?;
+                crate::flows::core::detect_workspace_conflicts(session)
             }
             _ => Err(AikiError::FunctionNotFoundInNamespace(
                 function.to_string(),
@@ -2418,7 +2046,9 @@ impl HookEngine {
             format!("aiki/{}.{}", module, function_name)
         } else {
             // Bare names are rejected — must use self. or full namespace (aiki/...)
-            return Err(AikiError::InvalidFunctionPath(function_path.to_string()));
+            return Err(AikiError::InvalidFunctionPath(
+                function_path.to_string(),
+            ));
         };
 
         // Parse function path: namespace/module.function
@@ -2572,13 +2202,17 @@ impl HookEngine {
             // ========================================================================
             // Workspace isolation functions
             // ========================================================================
-            ("core", "workspace_ensure_isolated") => {
+            ("core", "workspace_create_if_concurrent") => {
                 let session = extract_session(&state.event)?;
-                crate::flows::core::workspace_ensure_isolated(session, state.cwd())
+                crate::flows::core::workspace_create_if_concurrent(session, state.cwd())
             }
             ("core", "workspace_absorb_all") => {
                 let session = extract_session(&state.event)?;
                 crate::flows::core::workspace_absorb_all(session)
+            }
+            ("core", "detect_workspace_conflicts") => {
+                let session = extract_session(&state.event)?;
+                crate::flows::core::detect_workspace_conflicts(session)
             }
             _ => Err(AikiError::FunctionNotFoundInNamespace(
                 function.to_string(),
@@ -2609,7 +2243,6 @@ fn extract_session(event: &AikiEvent) -> Result<&crate::session::AikiSession> {
         AikiEvent::WebCompleted(e) => Ok(&e.session),
         AikiEvent::McpPermissionAsked(e) => Ok(&e.session),
         AikiEvent::McpCompleted(e) => Ok(&e.session),
-        AikiEvent::ModelChanged(e) => Ok(&e.session),
         AikiEvent::RepoChanged(e) => Ok(&e.session),
         _ => Err(AikiError::Other(anyhow::anyhow!(
             "workspace functions require an event with a session"
@@ -2761,10 +2394,7 @@ fn execute_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{
-        AikiChangeCompletedPayload, AikiTaskClosedPayload, ChangeOperation, TaskEventPayload,
-        WriteOperation,
-    };
+    use crate::events::{AikiChangeCompletedPayload, ChangeOperation, WriteOperation};
     use crate::provenance::record::AgentType;
     use crate::session::{AikiSession, SessionMode};
 
@@ -2811,36 +2441,6 @@ mod tests {
                 file_paths: vec![file_path.to_string()],
                 edit_details: vec![],
             }),
-        })
-    }
-
-    fn create_session_resumed_event() -> AikiEvent {
-        let session = AikiSession::new(
-            AgentType::ClaudeCode,
-            "test-session".to_string(),
-            None::<&str>,
-            crate::provenance::DetectionMethod::Hook,
-            SessionMode::Interactive,
-        );
-        AikiEvent::SessionResumed(crate::events::AikiSessionResumedPayload {
-            session,
-            cwd: std::path::PathBuf::from("/tmp"),
-            timestamp: chrono::Utc::now(),
-        })
-    }
-
-    fn create_session_cleared_event() -> AikiEvent {
-        let session = AikiSession::new(
-            AgentType::ClaudeCode,
-            "test-session".to_string(),
-            None::<&str>,
-            crate::provenance::DetectionMethod::Hook,
-            SessionMode::Interactive,
-        );
-        AikiEvent::SessionCleared(crate::events::AikiSessionClearedPayload {
-            session,
-            cwd: std::path::PathBuf::from("/tmp"),
-            timestamp: chrono::Utc::now(),
         })
     }
 
@@ -3266,11 +2866,12 @@ mod tests {
                 on_failure: OnFailure::default(),
             }),
             Action::Let(LetAction {
-                let_: "x = {{event.session.external_id}}".to_string(),
+                let_: "x = {{event.session_id}}".to_string(),
                 on_failure: OnFailure::default(),
             }),
         ];
 
+        // PostFileChange event has tool_name and session_id fields
         let mut state = AikiState::new(create_test_event());
 
         let _result = execute_actions(&actions, &mut state).unwrap();
@@ -4004,7 +3605,7 @@ mod tests {
 
     #[test]
     fn test_self_function_error_propagation() {
-        use crate::events::{AikiEvent, AikiTurnStartedPayload};
+        use crate::events::{AikiEvent, AikiTurnStartedPayload, TurnSource};
 
         // Create TurnStarted event
         let session = AikiSession::new(
@@ -4036,40 +3637,6 @@ mod tests {
 
         // Should fail
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_context_action_allowed_for_session_resumed() {
-        let action = Action::Context(ContextAction {
-            context: crate::flows::types::ContextContent::Simple("resumed context".to_string()),
-            on_failure: OnFailure::default(),
-        });
-
-        let mut state = AikiState::new(create_session_resumed_event());
-        let result = execute_actions(&[action], &mut state).unwrap();
-
-        assert!(matches!(result, HookOutcome::Success));
-        assert_eq!(
-            state.build_context_with_original_prompt().as_deref(),
-            Some("resumed context")
-        );
-    }
-
-    #[test]
-    fn test_context_action_allowed_for_session_cleared() {
-        let action = Action::Context(ContextAction {
-            context: crate::flows::types::ContextContent::Simple("cleared context".to_string()),
-            on_failure: OnFailure::default(),
-        });
-
-        let mut state = AikiState::new(create_session_cleared_event());
-        let result = execute_actions(&[action], &mut state).unwrap();
-
-        assert!(matches!(result, HookOutcome::Success));
-        assert_eq!(
-            state.build_context_with_original_prompt().as_deref(),
-            Some("cleared context")
-        );
     }
 
     #[test]
@@ -4860,10 +4427,7 @@ mod tests {
 
         // Rhai: type mismatch returns false (lenient mode)
         let result = HookEngine::evaluate_condition("$text > 5", &mut state).unwrap();
-        assert!(
-            !result,
-            "Comparing non-numeric value should return false (lenient)"
-        );
+        assert!(!result, "Comparing non-numeric value should return false (lenient)");
     }
 
     #[test]
@@ -4879,307 +4443,5 @@ mod tests {
         // event.file_count > 5 should be false
         let result = HookEngine::evaluate_condition("event.file_count > 5", &mut state).unwrap();
         assert!(!result, "event.file_count (3) > 5 should be false");
-    }
-
-    // ── Mutex + helpers for session-file-based tests (env mutation) ──
-
-    // Use the process-wide mutex from global.rs to avoid races with other modules
-    fn session_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::global::AIKI_HOME_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    struct EnvGuard {
-        original: Option<String>,
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(v) => std::env::set_var(crate::global::AIKI_HOME_ENV, v),
-                None => std::env::remove_var(crate::global::AIKI_HOME_ENV),
-            }
-        }
-    }
-
-    fn setup_aiki_home() -> (tempfile::TempDir, EnvGuard) {
-        let aiki_home = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(aiki_home.path().join("sessions")).unwrap();
-        let original = std::env::var(crate::global::AIKI_HOME_ENV).ok();
-        std::env::set_var(crate::global::AIKI_HOME_ENV, aiki_home.path());
-        (aiki_home, EnvGuard { original })
-    }
-
-    fn create_task_closed_event(task_id: &str) -> AikiEvent {
-        AikiTaskClosedPayload {
-            task: TaskEventPayload {
-                id: task_id.to_string(),
-                name: "Test task".to_string(),
-                task_type: "feature".to_string(),
-                status: "closed".to_string(),
-                assignee: None,
-                outcome: Some("done".to_string()),
-                source: None,
-                files: None,
-                changes: None,
-            },
-            cwd: std::path::PathBuf::from("/tmp/test"),
-            timestamp: chrono::Utc::now(),
-        }
-        .into()
-    }
-
-    // 32-char lowercase IDs for thread tests
-    const HEAD_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const TAIL_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-    // --- 5a: task.closed resolves session.thread.{tail,head} and session.thread ---
-    #[test]
-    fn test_task_closed_resolves_session_thread_tail() {
-        let _lock = session_test_lock();
-        let (aiki_home, _guard) = setup_aiki_home();
-
-        // Write session file with thread=head:tail
-        let sessions_dir = aiki_home.path().join("sessions");
-        let content = format!(
-            "thread={}:{}\nparent_pid=12345\nsession_id=sess-5a\nmode=interactive\n",
-            HEAD_ID, TAIL_ID,
-        );
-        std::fs::write(sessions_dir.join("sess-5a"), &content).unwrap();
-
-        // Close the TAIL task → should match the session
-        let event = create_task_closed_event(TAIL_ID);
-        let state = AikiState::new(event);
-        let mut resolver = HookEngine::create_resolver(&state);
-
-        assert_eq!(
-            resolver.resolve("{{session.thread.tail}}").unwrap(),
-            TAIL_ID,
-        );
-        assert_eq!(
-            resolver.resolve("{{session.thread.head}}").unwrap(),
-            HEAD_ID,
-        );
-        assert_eq!(
-            resolver.resolve("{{session.thread}}").unwrap(),
-            format!("{}:{}", HEAD_ID, TAIL_ID),
-        );
-    }
-
-    // --- 5b: No session file on disk → empty strings ---
-    #[test]
-    fn test_task_closed_session_thread_empty_when_no_session() {
-        let _lock = session_test_lock();
-        let (_aiki_home, _guard) = setup_aiki_home();
-        // No session files written
-
-        let event = create_task_closed_event(TAIL_ID);
-        let state = AikiState::new(event);
-        let mut resolver = HookEngine::create_resolver(&state);
-
-        assert_eq!(resolver.resolve("{{session.thread.tail}}").unwrap(), "",);
-        assert_eq!(resolver.resolve("{{session.mode}}").unwrap(), "",);
-    }
-
-    // --- 5c: Only tail triggers session.end (head does not) ---
-    #[test]
-    fn test_task_closed_only_tail_triggers_session_end() {
-        let _lock = session_test_lock();
-        let (aiki_home, _guard) = setup_aiki_home();
-
-        let sessions_dir = aiki_home.path().join("sessions");
-        let content = format!(
-            "thread={}:{}\nparent_pid=99999\nsession_id=sess-5c\nmode=interactive\n",
-            HEAD_ID, TAIL_ID,
-        );
-        std::fs::write(sessions_dir.join("sess-5c"), &content).unwrap();
-
-        let session_end = crate::flows::types::SessionEndAction {
-            reason: "task done".to_string(),
-            on_failure: crate::flows::types::OnFailure::default(),
-        };
-
-        // Close HEAD task → session lookup should NOT match (tail-only matching)
-        {
-            let event = create_task_closed_event(HEAD_ID);
-            let mut state = AikiState::new(event);
-
-            // Verify the thread session lookup returns None for the head task
-            assert!(
-                state.resolve_task_closed_thread_session().is_none(),
-                "Closing the HEAD task should NOT match a session (tail-only match)",
-            );
-
-            // session.end action should succeed but not register any pending termination
-            let result = HookEngine::execute_session_end(&session_end, &mut state).unwrap();
-            assert!(result.success);
-            // No pending session end should have been registered (no PID found)
-        }
-
-        // Close TAIL task → should match → session.end fires
-        {
-            let event = create_task_closed_event(TAIL_ID);
-            let mut state = AikiState::new(event);
-
-            // Verify the thread session lookup returns Some for the tail task
-            let session_info = state.resolve_task_closed_thread_session();
-            assert!(
-                session_info.is_some(),
-                "Closing the TAIL task should match the session",
-            );
-            assert_eq!(session_info.unwrap().pid, 99999);
-
-            // session.end action should register a pending termination
-            let result = HookEngine::execute_session_end(&session_end, &mut state).unwrap();
-            assert!(result.success);
-        }
-    }
-
-    // --- 5d: Single-task thread (head==tail) triggers session.end ---
-    #[test]
-    fn test_task_closed_single_task_thread_triggers_session_end() {
-        let _lock = session_test_lock();
-        let (aiki_home, _guard) = setup_aiki_home();
-
-        let sessions_dir = aiki_home.path().join("sessions");
-        // Single-task thread: thread=<id> (no colon → head==tail)
-        let content = format!(
-            "thread={}\nparent_pid=77777\nsession_id=sess-5d\nmode=background\n",
-            HEAD_ID,
-        );
-        std::fs::write(sessions_dir.join("sess-5d"), &content).unwrap();
-
-        let event = create_task_closed_event(HEAD_ID);
-        let mut state = AikiState::new(event);
-
-        // Single-task thread: closing the only task matches
-        let session_info = state.resolve_task_closed_thread_session();
-        assert!(
-            session_info.is_some(),
-            "Single-task thread should match when closing that task",
-        );
-        let info = session_info.unwrap();
-        assert_eq!(info.thread.head, HEAD_ID);
-        assert_eq!(info.thread.tail, HEAD_ID);
-        assert!(info.thread.is_single());
-        assert_eq!(info.pid, 77777);
-
-        // Verify session.thread resolves to just the ID (no colon for single-task)
-        let mut resolver = HookEngine::create_resolver(&state);
-        assert_eq!(resolver.resolve("{{session.thread}}").unwrap(), HEAD_ID,);
-
-        // session.end should register pending termination
-        let session_end = crate::flows::types::SessionEndAction {
-            reason: "single-task session done".to_string(),
-            on_failure: crate::flows::types::OnFailure::default(),
-        };
-        let result = HookEngine::execute_session_end(&session_end, &mut state).unwrap();
-        assert!(result.success);
-    }
-
-    // --- 5e: Background mode blocks the hook for non-orchestrator tasks ---
-    //
-    // Background sessions running non-orchestrator tasks should NOT be SIGTERM'd.
-    #[test]
-    fn test_task_closed_background_non_orchestrator_blocks_hook() {
-        let _lock = session_test_lock();
-        let (aiki_home, _guard) = setup_aiki_home();
-
-        // Write session file with mode=background (as spawn_blocking now sets)
-        let sessions_dir = aiki_home.path().join("sessions");
-        let content = format!(
-            "thread={}\nparent_pid=88888\nsession_id=sess-5e\nmode=background\n",
-            HEAD_ID,
-        );
-        std::fs::write(sessions_dir.join("sess-5e"), &content).unwrap();
-
-        // Close a non-orchestrator task (feature type) that matches the session's thread tail
-        let event = create_task_closed_event(HEAD_ID);
-        let mut state = AikiState::new(event);
-
-        // Verify the session IS found (thread tail matches)
-        let session_info = state.resolve_task_closed_thread_session();
-        assert!(
-            session_info.is_some(),
-            "Session should be found by thread tail"
-        );
-        let info = session_info.unwrap();
-        assert_eq!(info.mode, crate::session::SessionMode::Background);
-
-        // The hook condition now allows interactive OR orchestrator tasks
-        let condition = r#"event.task.id == session.thread.tail && (session.mode == "interactive" || event.task.type == "orchestrator")"#;
-        let result = HookEngine::evaluate_condition(condition, &mut state).unwrap();
-        assert!(
-            !result,
-            "Hook condition must be FALSE for background sessions with non-orchestrator tasks"
-        );
-    }
-
-    // --- 5f: Interactive mode allows the full hook condition ---
-    #[test]
-    fn test_task_closed_interactive_mode_allows_hook_condition() {
-        let _lock = session_test_lock();
-        let (aiki_home, _guard) = setup_aiki_home();
-
-        let sessions_dir = aiki_home.path().join("sessions");
-        let content = format!(
-            "thread={}\nparent_pid=99999\nsession_id=sess-5f\nmode=interactive\n",
-            HEAD_ID,
-        );
-        std::fs::write(sessions_dir.join("sess-5f"), &content).unwrap();
-
-        let event = create_task_closed_event(HEAD_ID);
-        let mut state = AikiState::new(event);
-
-        let condition = r#"event.task.id == session.thread.tail && (session.mode == "interactive" || event.task.type == "orchestrator")"#;
-        let result = HookEngine::evaluate_condition(condition, &mut state).unwrap();
-        assert!(
-            result,
-            "Hook condition must be TRUE for interactive sessions"
-        );
-    }
-
-    // --- 5g: Background orchestrator sessions are terminated ---
-    //
-    // When an orchestrator task closes, its background session should be SIGTERM'd.
-    // This is the fix for spawn_blocking hangs in `aiki build`.
-    #[test]
-    fn test_task_closed_background_orchestrator_allows_hook() {
-        let _lock = session_test_lock();
-        let (aiki_home, _guard) = setup_aiki_home();
-
-        let sessions_dir = aiki_home.path().join("sessions");
-        let content = format!(
-            "thread={}\nparent_pid=77777\nsession_id=sess-5g\nmode=background\n",
-            HEAD_ID,
-        );
-        std::fs::write(sessions_dir.join("sess-5g"), &content).unwrap();
-
-        // Create an orchestrator task closed event
-        let event: AikiEvent = AikiTaskClosedPayload {
-            task: TaskEventPayload {
-                id: HEAD_ID.to_string(),
-                name: "Loop orchestrator".to_string(),
-                task_type: "orchestrator".to_string(),
-                status: "closed".to_string(),
-                assignee: None,
-                outcome: Some("done".to_string()),
-                source: None,
-                files: None,
-                changes: None,
-            },
-            cwd: std::path::PathBuf::from("/tmp/test"),
-            timestamp: chrono::Utc::now(),
-        }
-        .into();
-        let mut state = AikiState::new(event);
-
-        let condition = r#"event.task.id == session.thread.tail && (session.mode == "interactive" || event.task.type == "orchestrator")"#;
-        let result = HookEngine::evaluate_condition(condition, &mut state).unwrap();
-        assert!(
-            result,
-            "Hook condition must be TRUE for orchestrator tasks in background sessions"
-        );
     }
 }

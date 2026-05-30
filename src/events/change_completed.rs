@@ -273,6 +273,50 @@ impl ChangeOperation {
             _ => "",
         }
     }
+
+    /// Get all file paths affected by this operation (for unified access)
+    /// - Write: files that were created/modified
+    /// - Delete: files that were removed
+    /// - Move: files at their new locations (destinations)
+    #[must_use]
+    #[allow(dead_code)] // Part of ChangeOperation API
+    pub fn file_paths(&self) -> Vec<String> {
+        match self {
+            Self::Write(op) => op.file_paths.clone(),
+            Self::Delete(op) => op.file_paths.clone(),
+            Self::Move(op) => op.destination_paths.clone(),
+        }
+    }
+
+    /// Get edit details if this is a Write operation
+    #[must_use]
+    #[allow(dead_code)] // Part of ChangeOperation API
+    pub fn edit_details(&self) -> &[EditDetail] {
+        match self {
+            Self::Write(op) => &op.edit_details,
+            _ => &[],
+        }
+    }
+
+    /// Get source paths if this is a Move operation
+    #[must_use]
+    #[allow(dead_code)] // Part of ChangeOperation API
+    pub fn source_paths(&self) -> &[String] {
+        match self {
+            Self::Move(op) => &op.source_paths,
+            _ => &[],
+        }
+    }
+
+    /// Get destination paths if this is a Move operation
+    #[must_use]
+    #[allow(dead_code)] // Part of ChangeOperation API
+    pub fn destination_paths(&self) -> &[String] {
+        match self {
+            Self::Move(op) => &op.destination_paths,
+            _ => &[],
+        }
+    }
 }
 
 // ============================================================================
@@ -351,11 +395,12 @@ fn resolve_workspace_cwd(payload: &mut AikiChangeCompletedPayload) {
 /// Detect if the changed files belong to a different JJ repo than the session's
 /// current repo root. If so, fire a `repo.changed` event before change.completed.
 ///
-/// Uses the session file's `repo=<id>` entries to track which repo each session is
-/// in across process invocations.
+/// Uses the `by-repo/<repo-id>/<session-uuid>` sidecar files (persisted on disk)
+/// to track which repo each session is in. This works across process invocations,
+/// unlike the previous in-process static which was always empty.
 fn detect_repo_transition(payload: &AikiChangeCompletedPayload) {
-    use crate::session::isolation::find_jj_root;
-    use crate::session::AikiSessionFile;
+    use crate::session::isolation::{find_jj_root, find_session_repo,
+        register_session_in_repo, unregister_session_from_repo};
 
     // Get first file path from the operation to determine the repo
     let file_path = match &payload.operation {
@@ -387,17 +432,26 @@ fn detect_repo_transition(payload: &AikiChangeCompletedPayload) {
         _ => return,
     };
 
-    let session_file = AikiSessionFile::new(&payload.session);
-    let previous_repo_id = session_file.read_repo_id();
+    let session_uuid = payload.session.uuid().to_string();
 
-    // If the session is already tracked as being in the target repo, no transition.
-    if previous_repo_id.as_deref() == Some(&new_repo_id) {
-        return;
+    // Check if sidecar already exists for this session in the new repo — no transition
+    let sidecar = crate::global::global_aiki_dir()
+        .join("sessions")
+        .join("by-repo")
+        .join(&new_repo_id)
+        .join(&session_uuid);
+
+    if sidecar.exists() {
+        return; // Already in this repo, no transition
     }
 
-    if let Err(e) = session_file.update_repo_id(&new_repo_id) {
-        debug_log(|| format!("Failed to update session repo: {}", e));
-        return;
+    // Find previous repo for this session (scan by-repo dirs)
+    let previous_repo_id = find_session_repo(&session_uuid);
+
+    // Move sidecar: register in new repo, unregister from old
+    register_session_in_repo(&new_repo_id, &session_uuid);
+    if let Some(ref old_repo_id) = previous_repo_id {
+        unregister_session_from_repo(old_repo_id, &session_uuid);
     }
 
     // If no previous repo (first change in session): no transition to fire
@@ -444,22 +498,21 @@ pub fn handle_change_completed(mut payload: AikiChangeCompletedPayload) -> Resul
     // Uses global JJ repo at ~/.aiki/.jj/ for cross-repo conversation history
     // Defensive fallback: if history lookup fails, use defaults (turn=0, source=User)
     if !payload.turn.is_known() {
-        let (turn_number, source) = match history::get_current_turn_info(
-            &global::global_aiki_dir(),
-            payload.session.uuid(),
-        ) {
-            Ok(result) => result,
-            Err(e) => {
-                debug_log(|| {
-                    format!(
-                        "History lookup failed for session {}, using defaults (turn=0): {}",
-                        payload.session.uuid(),
-                        e
-                    )
-                });
-                (0, TurnSource::User)
-            }
-        };
+        let (turn_number, source) =
+            match history::get_current_turn_info(&global::global_aiki_dir(), payload.session.uuid())
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    debug_log(|| {
+                        format!(
+                            "History lookup failed for session {}, using defaults (turn=0): {}",
+                            payload.session.uuid(),
+                            e
+                        )
+                    });
+                    (0, TurnSource::User)
+                }
+            };
         if turn_number > 0 {
             payload.turn = Turn::new(
                 turn_number,
@@ -583,6 +636,27 @@ mod tests {
         assert_eq!(write_op.is_move(), "");
         assert_eq!(delete_op.is_move(), "");
         assert_eq!(move_op.is_move(), "true");
+    }
+
+    #[test]
+    fn test_change_operation_file_paths() {
+        let write_op = ChangeOperation::Write(WriteOperation {
+            file_paths: vec!["a.txt".to_string()],
+            edit_details: vec![],
+        });
+        let delete_op = ChangeOperation::Delete(DeleteOperation {
+            file_paths: vec!["b.txt".to_string()],
+        });
+        let move_op = ChangeOperation::Move(MoveOperation {
+            file_paths: vec!["new.txt".to_string()],
+            source_paths: vec!["old.txt".to_string()],
+            destination_paths: vec!["new.txt".to_string()],
+        });
+
+        // file_paths returns destinations for Move
+        assert_eq!(write_op.file_paths(), vec!["a.txt"]);
+        assert_eq!(delete_op.file_paths(), vec!["b.txt"]);
+        assert_eq!(move_op.file_paths(), vec!["new.txt"]);
     }
 
     #[test]

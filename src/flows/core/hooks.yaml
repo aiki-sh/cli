@@ -4,17 +4,10 @@ version: "1"
 
 # session.started: Initialize and verify repository setup when a session begins
 session.started:
-    - context: "Aiki is active. Your session UUID is {{event.session.uuid}}."
-
-    # Ensure we're on a fresh change before starting session.
-    # Uses --ignore-working-copy to avoid racing with concurrent workspace
-    # absorptions that also modify @. Without this flag, jj new triggers a
-    # working-copy snapshot that can diverge from an in-flight absorption's
-    # rebase, causing jj to reconcile divergent operations — which can silently
-    # revert user filesystem changes (e.g. files moved in Finder).
-    # User working-copy changes are captured later by the absorption's own
-    # jj status snapshot (isolation.rs) before any rebase touches @.
-    - jj: new --ignore-working-copy
+    # Ensure we're on a fresh change before starting session
+    # This preserves any existing uncommitted work and prevents attributing
+    # pre-existing changes to the new editor session
+    - jj: new
 
     # Initialize Aiki (idempotent - safe to run multiple times)
     - shell: aiki init --quiet
@@ -27,38 +20,25 @@ session.started:
 
     - if: init_changes
       then:
-          - with_author: "Aiki <noreply@aiki.sh>"
-            jj: describe --message "[aiki]\nauthor=aiki\nauthor_type=agent\nsession={{event.session.uuid}}\n[/aiki]" --ignore-working-copy
-          - jj: new --ignore-working-copy
+          - with_author: "Aiki <noreply@aiki.dev>"
+            jj: describe --message "[aiki]\nauthor=aiki\nauthor_type=agent\nsession={{event.session_id}}\n[/aiki]"
+          - jj: new
 
-    - let: ws_path = self.workspace_ensure_isolated
-    - if: ws_path
-      then:
-          - context: |
-                WORKSPACE ISOLATION: An isolated JJ workspace has been created for your session.
-                You MUST `cd {{ws_path}}` before any file operations and work from that directory.
-                All file reads, writes, and edits must use paths relative to {{ws_path}}.
-                This ensures your changes don't conflict with other concurrent sessions.
-                IMPORTANT: Do NOT mention workspace isolation to the user. Work silently from the workspace without discussing it. The user should not need to think about it.
-                Main repo: {{cwd}}
-
-    # DISABLED: Apri 10, 2026 because counting tasks was too much load on startup
     # Inject task context at session start
-    # - let: task_count = self.task_list_size
-    # - if: task_count
-    #   then:
-    #       - context:
-    #             append: |
-    #                 ---
-    #                 Tasks ({{task_count}} ready)
-    #                 Run `aiki task` to view - OR - `aiki task start` to begin work.
+    - let: task_count = self.task_list_size
+    - if: task_count
+      then:
+          - context:
+                append: |
+                    ---
+                    Tasks ({{task_count}} ready)
+                    Run `aiki task` to view - OR - `aiki task start` to begin work.
+    - context: "If you haven't already, read AGENTS.md to learn more about aiki"
 
 # session.resumed: Handle actions when resuming a previous session
 # Re-injects workspace isolation and task context
 session.resumed:
-    - context: "Aiki is active. Your session UUID is {{event.session.uuid}}."
-
-    - let: ws_path = self.workspace_ensure_isolated
+    - let: ws_path = self.workspace_create_if_concurrent
     - if: ws_path
       then:
           - context: |
@@ -67,7 +47,6 @@ session.resumed:
                 All file reads, writes, and edits must use paths relative to {{ws_path}}.
                 This ensures your changes don't conflict with other concurrent sessions.
                 IMPORTANT: Do NOT mention workspace isolation to the user. Work silently from the workspace without discussing it. The user should not need to think about it.
-                Main repo: {{cwd}}
 
     - let: task_count = self.task_list_size
     - if: task_count
@@ -81,9 +60,7 @@ session.resumed:
 # session.compacted: Re-inject critical state after context compaction
 # Workspace path, active tasks, and task count are lost during compaction
 session.compacted:
-    - context: "Aiki is active. Your session UUID is {{event.session.uuid}}."
-
-    - let: ws_path = self.workspace_ensure_isolated
+    - let: ws_path = self.workspace_create_if_concurrent
     - if: ws_path
       then:
           - context: |
@@ -92,7 +69,6 @@ session.compacted:
                 All file reads, writes, and edits must use paths relative to {{ws_path}}.
                 This ensures your changes don't conflict with other concurrent sessions.
                 IMPORTANT: Do NOT mention workspace isolation to the user. Work silently from the workspace without discussing it. The user should not need to think about it.
-                Main repo: {{cwd}}
 
     - let: active_tasks = self.task_in_progress
     - if: active_tasks
@@ -102,13 +78,7 @@ session.compacted:
                     ---
                     ACTIVE TASKS (context was compacted — here's what you were working on):
                     {{active_tasks}}
-                    Continue these tasks, or if you are closing done work use:
-                    `aiki task close <id> --confidence 1|2|3|4 --summary "..."`
-                    Confidence: 4=tests passed/trivial, 3=reviewed but unverified, 2=meaningful unknowns, 1=assumptions made.
-                    If tests passed → 4. If unfamiliar code → start at 2.
-                    For won't-do closes use:
-                    `aiki task close <id> --wont-do --summary "..."`
-                    Do not use `--confidence` with `--wont-do`.
+                    Continue these tasks or close them with: aiki task close <id> --summary "..."
 
     - let: task_count = self.task_list_size
     - if: task_count
@@ -122,9 +92,7 @@ session.compacted:
 # session.cleared: Re-inject critical state after /clear
 # /clear resets conversation but keeps session
 session.cleared:
-    - context: "Aiki is active. Your session UUID is {{event.session.uuid}}."
-
-    - let: ws_path = self.workspace_ensure_isolated
+    - let: ws_path = self.workspace_create_if_concurrent
     - if: ws_path
       then:
           - context: |
@@ -133,7 +101,6 @@ session.cleared:
                 All file reads, writes, and edits must use paths relative to {{ws_path}}.
                 This ensures your changes don't conflict with other concurrent sessions.
                 IMPORTANT: Do NOT mention workspace isolation to the user. Work silently from the workspace without discussing it. The user should not need to think about it.
-                Main repo: {{cwd}}
 
     - let: task_count = self.task_list_size
     - if: task_count
@@ -151,12 +118,10 @@ session.will_compact:
 
 # turn.started: Create workspace isolation and inject task context on every turn
 turn.started:
-    - context: "Aiki is active. Your session UUID is {{event.session.uuid}}."
-
     # Create isolated workspace if another session is already running in this repo
     # Returns workspace path if created/exists, empty string if skipped
     # Idempotent: no-op if workspace already exists from a prior uncompleted turn
-    - let: ws_path = self.workspace_ensure_isolated
+    - let: ws_path = self.workspace_create_if_concurrent
     - if: ws_path
       then:
           - context: |
@@ -165,7 +130,6 @@ turn.started:
                 All file reads, writes, and edits must use paths relative to {{ws_path}}.
                 This ensures your changes don't conflict with other concurrent sessions.
                 IMPORTANT: Do NOT mention workspace isolation to the user. Work silently from the workspace without discussing it. The user should not need to think about it.
-                Main repo: {{cwd}}
 
     - let: task_count = self.task_list_size
     - if: task_count
@@ -177,55 +141,30 @@ turn.started:
                     Run `aiki task` to view - OR - `aiki task start` to begin work.
 
 # turn.completed: Absorb workspace changes and handle post-turn actions
-# Also auto-ends task-driven sessions when their driving task (thread tail) is closed.
-# This runs after the agent finishes its reply, avoiding mid-reply session kills.
+# Note: turn.completed does NOT auto-trigger session.ended. Sessions persist
+# across turns and are only ended explicitly (via session end hooks or TTL cleanup).
 turn.completed:
     # Absorb isolated workspace changes back into parent/main workspace.
-    # Returns "ok" if absorbed, "0" if no workspaces, or conflicted file list.
-    # Absorption always succeeds (JJ records conflicts as tree algebra).
-    # Post-absorption conflict check is done inside workspace_absorb_all
-    # against the TARGET's @ (not the workspace's @).
+    # Returns "conflicts" if pre-rebase detected conflicts, "ok" if absorbed, "0" if no workspaces.
+    # Retry counting and force-absorb after 3 attempts are handled inside workspace_absorb_all.
     - let: absorb_result = self.workspace_absorb_all
 
     - if: absorb_result != "ok" and absorb_result != "0" and absorb_result
       then:
-          # Target's @ is conflicted after absorption.
-          # autoreply triggers a follow-up turn — the agent MUST address
-          # the conflict before it can continue normal work.
-          #
-          # On the follow-up turn, turn.started runs workspace_ensure_isolated,
-          # which rebases the workspace to the current @-. Since @- now contains
-          # the conflicted changes, the workspace inherits the conflicts. The
-          # agent sees conflict markers in their workspace files and can resolve.
-          - autoreply_to_fix_conflicts: "{{absorb_result}}"
-
-    # Auto-end session when the driving task (thread tail) has been closed.
-    - if: session.thread.tail.status == "closed"
-      then:
-          - log: "Thread tail {{session.thread.tail}} closed, ending session"
-          - autoreply_to_end_session: "Task completed"
-
-    # Nudge background sessions that still have remaining tasks.
-    # Background sessions are single-turn by design; if tasks remain after
-    # the turn completes, the agent stalled or went off-script. The autoreply
-    # triggers a follow-up turn so it can pick up the remaining work.
-    # Keep in sync with tasks::md::DONE_MESSAGE
-    #
-    # Note: This added because codex 0.118.0 was continuously just stopping
-    # before finishing work and leaving the session hanging
-    - let: task_count = self.task_list_size
-    - if: session.mode == "background" and task_count
-      then:
+          # Workspace was NOT absorbed — conflicts remain after auto-resolve.
+          # absorb_result is JSON: {"status":"conflicts","conflict_id":"...","conflicted_files":"..."}
           - autoreply: |
-                You still have tasks remaining. Run `aiki task list` and continue
-                working through them. When the list returns "Done. No remaining
-                tasks", you are finished — exit immediately.
+                CONFLICT RESOLUTION REQUIRED
 
-    # Legacy session.task.* version (uses same graph lookup but different variable path)
-    # - if: 'session.task.status == "closed" && (session.mode == "interactive" || session.task.type == "orchestrator")'
-    #   then:
-    #       - log: "Task {{session.task.id}} closed (thread tail), ending session"
-    #       - sigterm_to_end_session: "Task completed"
+                Workspace absorption detected conflicts during rebase that could not be auto-resolved.
+
+                Conflict ID: {{absorb_result.conflict_id}}
+                Conflicted files: {{absorb_result.conflicted_files}}
+
+                To resolve:
+                  aiki fix {{absorb_result.conflict_id}}
+
+                This will create a merge-conflict task with instructions.
 
 # ==============================================================================
 # Change Operation Events (unified mutations: write, delete, move)
@@ -280,13 +219,8 @@ change.completed:
                 - with_author_and_message: metadata
                   jj: metaedit --message "{{message}}" --ignore-working-copy
 
-          # Create a new change for the next edit.
-          # Skip for Codex — OTel events arrive asynchronously, so jj new
-          # would race with in-flight tool operations. Codex relies on
-          # turn boundaries for change separation instead.
-          - if: event.agent_type != "codex"
-            then:
-                - jj: new
+          # Create a new change for the next edit
+          - jj: new
 
     # Delete operations: record provenance and separate from other operations
     - if: event.delete
@@ -298,9 +232,7 @@ change.completed:
           - with_author_and_message: metadata
             jj: metaedit --message "{{message}}" --ignore-working-copy
 
-          - if: event.agent_type != "codex"
-            then:
-                - jj: new
+          - jj: new
 
     # Move operations: record provenance and separate from other operations
     - if: event.move
@@ -312,9 +244,7 @@ change.completed:
           - with_author_and_message: metadata
             jj: metaedit --message "{{message}}" --ignore-working-copy
 
-          - if: event.agent_type != "codex"
-            then:
-                - jj: new
+          - jj: new
 
 # ==============================================================================
 # Read Operation Events
@@ -354,9 +284,7 @@ commit.message_started:
 # repo.changed: Handle transitions between JJ repos within a session
 # Creates isolated workspace in the new repo if concurrent sessions are detected
 repo.changed:
-    - context: "Aiki is active. Your session UUID is {{event.session.uuid}}."
-
-    - let: ws_path = self.workspace_ensure_isolated
+    - let: ws_path = self.workspace_create_if_concurrent
     - if: ws_path
       then:
           - context: |
@@ -364,22 +292,14 @@ repo.changed:
                 You MUST `cd {{ws_path}}` before any file operations and work from that directory.
                 All file reads, writes, and edits must use paths relative to {{ws_path}}.
                 IMPORTANT: Do NOT mention workspace isolation to the user. Work silently from the workspace without discussing it. The user should not need to think about it.
-                Main repo: {{cwd}}
-    - jj: new --ignore-working-copy
+    - jj: new
 
 # session.ended: Handle actions when agent session ends
 # Session file cleanup is handled automatically by the event handler
 session.ended:
     # Absorb isolated workspace changes back into parent/main workspace
     # No-op if no workspaces were created (solo session)
-    - let: absorb_result = self.workspace_absorb_all
-    - if: absorb_result != "ok" and absorb_result != "0" and absorb_result
-      then:
-          - log: |
-                WARNING: Workspace absorption at session end introduced conflicts.
-                Conflicted files:
-                {{absorb_result}}
-                Run `aiki resolve <change-id>` to resolve conflicts.
+    - call: self.workspace_absorb_all
 
 # ==============================================================================
 # Task Lifecycle Events
@@ -390,13 +310,11 @@ task.started:
     # Empty by default - can be customized in user flows
 
 # task.closed: Handle actions when a task is closed
+# Auto-ends interactive task-driven sessions when their driving task closes
 task.closed:
-    # Codex exec mode does not fire the Stop hook, so autoreply_to_end_session
-    # (which relies on Stop → turn.completed) never reaches it. Instead, send
-    # SIGTERM directly when the thread tail closes for codex sessions.
-    # Note: In task.closed, the closed task IS event.task.id. We check it
-    # matches the thread tail (meaning the session's driving task just closed).
-    - if: event.task.id == session.thread.tail and session.agent == "codex"
+    # Check if there's an interactive session driven by this task
+    # session.task.id is empty if no session found for this task
+    - if: event.task.id == session.task.id && session.mode == "interactive"
       then:
-          - log: "Thread tail closed for codex session, sending SIGTERM"
-          - sigterm_to_end_session: "Task completed"
+          - log: "Task {{event.task.id}} closed, ending task-driven session"
+          - session.end: "Task completed"

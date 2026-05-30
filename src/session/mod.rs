@@ -1,4 +1,3 @@
-pub mod flags;
 pub mod isolation;
 pub mod turn_state;
 
@@ -6,7 +5,6 @@ use crate::cache::debug_log;
 use crate::error::{AikiError, Result};
 use crate::global;
 use crate::provenance::record::{AgentType, DetectionMethod};
-use crate::tasks::lanes::ThreadId;
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::fs;
@@ -16,7 +14,7 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 /// Session mode - background vs interactive
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SessionMode {
-    /// Background session created by `aiki run`
+    /// Background session created by `aiki task run`
     Background,
     /// Interactive session (user working directly in agent)
     Interactive,
@@ -100,9 +98,9 @@ impl AikiSessionFile {
             metadata.push_str(&format!("parent_pid={}\n", pid));
         }
 
-        // Add thread if this is a thread-driven session (spawned by aiki plan or aiki run --async)
-        if let Some(thread) = self.session.thread() {
-            metadata.push_str(&format!("thread={}\n", thread.serialize()));
+        // Add task if this is a task-driven session (spawned by aiki plan or aiki task run --async)
+        if let Some(task_id) = self.session.task() {
+            metadata.push_str(&format!("task={}\n", task_id));
         }
 
         metadata.push_str("[/aiki]\n");
@@ -158,6 +156,22 @@ impl AikiSessionFile {
         }
     }
 
+    /// Read agent_version from existing session file
+    ///
+    /// Returns None if file doesn't exist or agent_version field not found.
+    /// This allows subsequent events to read cached version without re-detecting.
+    #[allow(dead_code)] // Part of AikiSessionFile API
+    pub fn read_agent_version(&self) -> Option<String> {
+        fs::read_to_string(&self.path).ok().and_then(|content| {
+            // Parse [aiki]...[/aiki] block for agent_version field
+            content
+                .lines()
+                .find(|line| line.starts_with("agent_version="))
+                .and_then(|line| line.strip_prefix("agent_version="))
+                .map(|v| v.to_string())
+        })
+    }
+
     /// Update the session file with parent_pid if not already present.
     ///
     /// This is called when we discover the agent PID via `find_ancestor_by_name`
@@ -200,6 +214,21 @@ impl AikiSessionFile {
         Ok(())
     }
 
+    /// Read all repository IDs from the session file
+    ///
+    /// Returns a list of repo IDs (from `repo=` lines). Empty if file doesn't exist
+    /// or has no repo fields.
+    pub fn read_repos(&self) -> Vec<String> {
+        match fs::read_to_string(&self.path) {
+            Ok(content) => content
+                .lines()
+                .filter_map(|line| line.strip_prefix("repo="))
+                .map(|s| s.to_string())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Add a repository ID to the session file if not already present
     ///
     /// This tracks which repositories the session has touched.
@@ -232,83 +261,6 @@ impl AikiSessionFile {
         let mut file = fs::File::create(&tmp_path)
             .map_err(|e| AikiError::Other(anyhow::anyhow!("Failed to create temp file: {}", e)))?;
         file.write_all(new_content.as_bytes())
-            .map_err(|e| AikiError::Other(anyhow::anyhow!("Failed to write temp file: {}", e)))?;
-        file.sync_all()
-            .map_err(|e| AikiError::Other(anyhow::anyhow!("Failed to sync temp file: {}", e)))?;
-
-        fs::rename(&tmp_path, &self.path)
-            .map_err(|e| AikiError::Other(anyhow::anyhow!("Failed to rename temp file: {}", e)))?;
-
-        Ok(())
-    }
-
-    /// Read the current repo ID tracked for this session file.
-    ///
-    /// Returns the last `repo=<id>` entry if present.
-    pub fn read_repo_id(&self) -> Option<String> {
-        fs::read_to_string(&self.path).ok().and_then(|content| {
-            content
-                .lines()
-                .filter_map(|line| line.strip_prefix("repo="))
-                .last()
-                .map(String::from)
-        })
-    }
-
-    /// Update the current repo ID stored in the session file.
-    ///
-    /// Replaces any existing `repo=<id>` lines with the provided value.
-    pub fn update_repo_id(&self, repo_id: &str) -> Result<()> {
-        use std::io::Write;
-
-        let content = match fs::read_to_string(&self.path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => {
-                return Err(AikiError::Other(anyhow::anyhow!(
-                    "Failed to read session file: {}",
-                    e
-                )))
-            }
-        };
-
-        let marker = "repo=";
-        let replacement = format!("repo={}", repo_id);
-
-        let (before, after) = match content.split_once("[/aiki]") {
-            Some((before, after)) => (before, after),
-            None => return Ok(()),
-        };
-
-        let mut lines: Vec<String> = Vec::new();
-        let mut replaced = false;
-
-        for line in before.lines() {
-            if line.starts_with(marker) {
-                if !replaced {
-                    lines.push(replacement.clone());
-                    replaced = true;
-                }
-                continue;
-            }
-            lines.push(line.to_string());
-        }
-
-        if !replaced {
-            lines.push(replacement);
-        }
-
-        let mut rewritten = lines.join("\n");
-        if !rewritten.ends_with('\n') {
-            rewritten.push('\n');
-        }
-        rewritten.push_str("[/aiki]");
-        rewritten.push_str(after);
-
-        let tmp_path = self.path.with_extension("tmp");
-        let mut file = fs::File::create(&tmp_path)
-            .map_err(|e| AikiError::Other(anyhow::anyhow!("Failed to create temp file: {}", e)))?;
-        file.write_all(rewritten.as_bytes())
             .map_err(|e| AikiError::Other(anyhow::anyhow!("Failed to write temp file: {}", e)))?;
         file.sync_all()
             .map_err(|e| AikiError::Other(anyhow::anyhow!("Failed to sync temp file: {}", e)))?;
@@ -358,12 +310,12 @@ pub struct AikiSession {
     /// In ACP mode, this is the `agent_pid` from the session/start message.
     /// Used to match bash commands back to their originating session.
     parent_pid: Option<u32>,
-    /// Thread driving this session (if any)
+    /// Task ID driving this session (if any)
     ///
-    /// Set from AIKI_THREAD environment variable.
-    /// Used for task-driven sessions spawned by `aiki plan` or `aiki run --async`.
-    /// When the driving thread's tail task closes, interactive sessions auto-end.
-    thread: Option<ThreadId>,
+    /// Set from AIKI_TASK environment variable.
+    /// Used for task-driven sessions spawned by `aiki plan` or `aiki task run --async`.
+    /// When the driving task closes, interactive sessions auto-end.
+    task: Option<String>,
 }
 
 impl AikiSession {
@@ -390,7 +342,7 @@ impl AikiSession {
     ///
     /// # Examples
     /// ```
-    /// use aiki::session::{AikiSession, SessionMode};
+    /// use aiki::session::AikiSession;
     /// use aiki::provenance::{AgentType, DetectionMethod};
     ///
     /// // Hook-based (no agent version)
@@ -398,8 +350,7 @@ impl AikiSession {
     ///     AgentType::ClaudeCode,
     ///     "claude-session-abc123",
     ///     None::<&str>,
-    ///     DetectionMethod::Hook,
-    ///     SessionMode::Interactive,
+    ///     DetectionMethod::Hook
     /// );
     ///
     /// // ACP-based (with agent version)
@@ -407,8 +358,7 @@ impl AikiSession {
     ///     AgentType::ClaudeCode,
     ///     "claude-session-abc123",
     ///     Some("0.10.6"),
-    ///     DetectionMethod::ACP,
-    ///     SessionMode::Interactive,
+    ///     DetectionMethod::ACP
     /// );
     ///
     /// // Same inputs produce same UUID (deterministic)
@@ -416,8 +366,7 @@ impl AikiSession {
     ///     AgentType::ClaudeCode,
     ///     "claude-session-abc123",
     ///     None::<&str>,
-    ///     DetectionMethod::Hook,
-    ///     SessionMode::Interactive,
+    ///     DetectionMethod::Hook
     /// );
     /// assert_eq!(session.uuid(), session2.uuid());
     /// ```
@@ -442,7 +391,7 @@ impl AikiSession {
             detection_method,
             mode,
             parent_pid: None,
-            thread: None,
+            task: None,
         }
     }
 
@@ -462,7 +411,7 @@ impl AikiSession {
             detection_method: DetectionMethod::Unknown,
             mode,
             parent_pid: None,
-            thread: None,
+            task: None,
         }
     }
 
@@ -471,7 +420,7 @@ impl AikiSession {
     /// Convenience constructor that automatically sets `DetectionMethod::Hook`
     /// and captures the parent process ID for PID-based session detection.
     /// Mode is determined by `AIKI_SESSION_MODE` env var:
-    /// - "background" → Background mode (for `aiki run --async`)
+    /// - "background" → Background mode (for `aiki task run --async`)
     /// - anything else → Interactive mode (default, for `aiki plan` and normal sessions)
     ///
     /// # Examples
@@ -510,7 +459,7 @@ impl AikiSession {
             mode,
         )
         .with_parent_pid(parent_pid)
-        .with_thread_from_env()
+        .with_task_from_env()
     }
 
     /// Generate a deterministic short ID for a session
@@ -537,15 +486,14 @@ impl AikiSession {
     ///
     /// # Example
     /// ```
-    /// use aiki::session::{AikiSession, SessionMode};
+    /// use aiki::session::AikiSession;
     /// use aiki::provenance::{AgentType, DetectionMethod};
     ///
     /// let session = AikiSession::new(
     ///     AgentType::ClaudeCode,
     ///     "session-123",
     ///     None::<&str>,
-    ///     DetectionMethod::ACP,
-    ///     SessionMode::Interactive,
+    ///     DetectionMethod::ACP
     /// )
     /// .with_client_info(Some("zed"), Some("0.213.3"));
     /// ```
@@ -567,15 +515,14 @@ impl AikiSession {
     ///
     /// # Example
     /// ```
-    /// use aiki::session::{AikiSession, SessionMode};
+    /// use aiki::session::AikiSession;
     /// use aiki::provenance::{AgentType, DetectionMethod};
     ///
     /// let session = AikiSession::new(
     ///     AgentType::ClaudeCode,
     ///     "session-123",
     ///     None::<&str>,
-    ///     DetectionMethod::Hook,
-    ///     SessionMode::Interactive,
+    ///     DetectionMethod::Hook
     /// )
     /// .with_parent_pid(Some(1234));
     /// ```
@@ -585,25 +532,29 @@ impl AikiSession {
         self
     }
 
-    /// Set the thread driving this session
+    /// Set the task ID driving this session
     ///
-    /// Used for sessions spawned by `aiki plan` or `aiki run --async`.
+    /// Used for sessions spawned by `aiki plan` or `aiki task run --async`.
     #[must_use]
-    pub fn with_thread(mut self, thread: Option<ThreadId>) -> Self {
-        self.thread = thread;
+    pub fn with_task(mut self, task_id: Option<String>) -> Self {
+        self.task = task_id;
         self
     }
 
-    /// Capture thread from AIKI_THREAD environment variable
+    /// Capture task ID from AIKI_TASK environment variable
     ///
     /// This should be called when creating sessions to check if this session
-    /// was spawned by a workflow command (e.g., `aiki plan`, `aiki run --async`).
+    /// was spawned by a workflow command (e.g., `aiki plan`, `aiki task run --async`).
     #[must_use]
-    pub fn with_thread_from_env(self) -> Self {
-        let thread_val = std::env::var("AIKI_THREAD").ok();
-        debug_log(|| format!("with_thread_from_env: AIKI_THREAD={:?}", thread_val));
-        let thread = thread_val.and_then(|v| ThreadId::parse(&v).ok());
-        self.with_thread(thread)
+    pub fn with_task_from_env(self) -> Self {
+        let task_id = std::env::var("AIKI_TASK").ok();
+        debug_log(|| {
+            format!(
+                "with_task_from_env: AIKI_TASK={:?}",
+                task_id
+            )
+        });
+        self.with_task(task_id)
     }
 
     /// Get the session UUID as a string
@@ -660,10 +611,10 @@ impl AikiSession {
         self.parent_pid
     }
 
-    /// Get the thread driving this session (if any)
+    /// Get the task ID if this is a task-driven session
     #[must_use]
-    pub fn thread(&self) -> Option<&ThreadId> {
-        self.thread.as_ref()
+    pub fn task(&self) -> Option<&str> {
+        self.task.as_deref()
     }
 
     /// Get a session file handle for this session
@@ -683,6 +634,24 @@ impl AikiSession {
     }
 }
 
+/// Count active sessions globally
+#[allow(dead_code)] // Part of session API
+pub fn count_sessions() -> Result<usize> {
+    let sessions_dir = global::global_sessions_dir();
+
+    if !sessions_dir.exists() {
+        return Ok(0);
+    }
+
+    let count = fs::read_dir(&sessions_dir)
+        .map_err(|e| AikiError::Other(anyhow::anyhow!("Failed to read sessions directory: {}", e)))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_file())
+        .count();
+
+    Ok(count)
+}
+
 /// Parsed session info for listing
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -691,6 +660,7 @@ pub struct SessionInfo {
     pub mode: SessionMode,
     pub started_at: String,
     pub parent_pid: Option<u32>,
+    pub repos: Vec<String>,
 }
 
 /// List all sessions from the global sessions directory
@@ -723,6 +693,7 @@ pub fn list_all_sessions() -> Result<Vec<SessionInfo>> {
         let mut mode: Option<SessionMode> = None;
         let mut started_at = String::new();
         let mut parent_pid: Option<u32> = None;
+        let mut repos = Vec::new();
 
         for line in content.lines() {
             let line = line.trim();
@@ -740,6 +711,8 @@ pub fn list_all_sessions() -> Result<Vec<SessionInfo>> {
                 started_at = val.to_string();
             } else if let Some(val) = line.strip_prefix("parent_pid=") {
                 parent_pid = val.parse().ok();
+            } else if let Some(val) = line.strip_prefix("repo=") {
+                repos.push(val.to_string());
             }
         }
 
@@ -758,6 +731,7 @@ pub fn list_all_sessions() -> Result<Vec<SessionInfo>> {
             mode: mode.unwrap_or(SessionMode::Interactive), // Default to interactive for old sessions
             started_at,
             parent_pid,
+            repos,
         });
     }
 
@@ -765,6 +739,104 @@ pub fn list_all_sessions() -> Result<Vec<SessionInfo>> {
     sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
 
     Ok(sessions)
+}
+
+/// Result of detecting the current session context
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Part of session API
+pub enum SessionContext {
+    /// No active sessions - likely running from human terminal
+    NoSession,
+    /// Exactly one active session with this agent type
+    SingleSession(AgentType),
+    /// Multiple active sessions - ambiguous context
+    MultipleSessions,
+}
+
+/// Detect the current session context
+///
+/// Returns detailed information about active sessions:
+/// - NoSession: No session files found (human terminal)
+/// - SingleSession(agent): Exactly one active session
+/// - MultipleSessions: More than one session active (ambiguous)
+#[allow(dead_code)] // Part of session API
+pub fn get_session_context(repo_path: impl AsRef<Path>) -> SessionContext {
+    let sessions_dir = repo_path.as_ref().join(".aiki/sessions");
+
+    if !sessions_dir.exists() {
+        return SessionContext::NoSession;
+    }
+
+    let session_files: Vec<_> = match fs::read_dir(&sessions_dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_file())
+            .collect(),
+        Err(_) => return SessionContext::NoSession,
+    };
+
+    match session_files.len() {
+        0 => SessionContext::NoSession,
+        1 => {
+            // Try to read agent type from the session file
+            if let Ok(content) = fs::read_to_string(session_files[0].path()) {
+                for line in content.lines() {
+                    let line = line.trim();
+                    if let Some(agent_str) = line.strip_prefix("agent=") {
+                        if let Some(agent_type) = AgentType::from_str(agent_str) {
+                            return SessionContext::SingleSession(agent_type);
+                        }
+                    }
+                }
+            }
+            // Couldn't parse agent type, treat as no session
+            SessionContext::NoSession
+        }
+        _ => SessionContext::MultipleSessions,
+    }
+}
+
+/// Get the agent type from the current active session, if any
+///
+/// Returns the agent type if there's exactly one active session.
+/// Returns None if there are no sessions or multiple sessions.
+#[allow(dead_code)] // Part of session API
+pub fn get_current_agent_type(repo_path: impl AsRef<Path>) -> Option<AgentType> {
+    match get_session_context(repo_path) {
+        SessionContext::SingleSession(agent) => Some(agent),
+        _ => None,
+    }
+}
+
+/// Check if a specific session is active
+///
+/// Uses deterministic UUID generation to check if the session file exists.
+/// This allows precise session lookup even when multiple sessions are active.
+#[allow(dead_code)] // Part of session API
+/// Check if a session is active by looking for its session file
+pub fn has_active_session(agent_type: AgentType, external_session_id: &str) -> bool {
+    let uuid = AikiSession::generate_uuid(agent_type, external_session_id);
+    let session_file = global::global_sessions_dir().join(&uuid);
+    session_file.exists()
+}
+
+/// End a session and clean up its session file
+#[allow(dead_code)] // Part of session API
+pub fn end_session(
+    agent_type: AgentType,
+    external_session_id: impl Into<String>,
+    detection_method: DetectionMethod,
+    mode: SessionMode,
+) -> Result<()> {
+    let session = AikiSession::new(
+        agent_type,
+        external_session_id,
+        None::<&str>,
+        detection_method,
+        mode,
+    );
+    session.file().delete()?;
+    Ok(())
 }
 
 // ============================================================================
@@ -866,6 +938,7 @@ pub fn find_ancestor_by_name(name: &str) -> Option<u32> {
 
 /// Result of PID-based session lookup
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields are part of SessionMatch API
 pub struct SessionMatch {
     /// The agent type from the session file
     pub agent_type: AgentType,
@@ -877,9 +950,12 @@ pub struct SessionMatch {
 
 /// Find an active session by matching parent_pid against the current process's ancestors
 ///
-/// Matching strategy:
-/// 1. If AIKI_THREAD is set and a candidate's `thread=` matches, pick it immediately
-/// 2. Otherwise, prefer the most recently *active* session (by JJ event timestamp)
+/// This is the core function for PID-based session detection:
+/// 1. Get all ancestor PIDs of the current process
+/// 2. Scan session files in global sessions directory
+/// 3. Find sessions whose parent_pid matches one of our ancestors
+/// 4. If multiple match, prefer the most recently *active* session
+///    (queries JJ for latest event timestamp)
 ///
 /// The `jj_cwd` parameter is needed for querying JJ to get latest event timestamps.
 ///
@@ -901,8 +977,6 @@ pub fn find_session_by_ancestor_pid(jj_cwd: impl AsRef<Path>) -> Option<SessionM
         Ok(e) => e,
         Err(_) => return None,
     };
-
-    let current_thread = std::env::var("AIKI_THREAD").ok();
 
     // Track best match with its last-activity time
     let mut best_match: Option<(SessionMatch, std::time::SystemTime)> = None;
@@ -928,7 +1002,6 @@ pub fn find_session_by_ancestor_pid(jj_cwd: impl AsRef<Path>) -> Option<SessionM
         let mut agent_type: Option<AgentType> = None;
         let mut external_session_id: Option<String> = None;
         let mut aiki_session_id: Option<String> = None;
-        let mut thread: Option<String> = None;
 
         for line in content.lines() {
             let line = line.trim();
@@ -944,8 +1017,6 @@ pub fn find_session_by_ancestor_pid(jj_cwd: impl AsRef<Path>) -> Option<SessionM
                 if aiki_session_id.is_none() {
                     aiki_session_id = Some(val.to_string());
                 }
-            } else if let Some(val) = line.strip_prefix("thread=") {
-                thread = Some(val.to_string());
             }
         }
 
@@ -960,13 +1031,6 @@ pub fn find_session_by_ancestor_pid(jj_cwd: impl AsRef<Path>) -> Option<SessionM
                         external_session_id: ext_id,
                         session_id: aiki_id.clone(),
                     };
-
-                    // Tier 1: thread match wins immediately
-                    if let Some(ref cur) = current_thread {
-                        if thread.as_deref() == Some(cur.as_str()) {
-                            return Some(candidate);
-                        }
-                    }
 
                     // Query JJ for latest event timestamp for this session
                     let last_activity = query_latest_event(jj_cwd, &aiki_id)
@@ -991,61 +1055,37 @@ pub fn find_session_by_ancestor_pid(jj_cwd: impl AsRef<Path>) -> Option<SessionM
     best_match.map(|(m, _)| m)
 }
 
-/// Info about a thread-driven session (spawned by `aiki plan` or `aiki run --async`)
+/// Info about a task-driven session (spawned by `aiki plan` or `aiki task run --async`)
 #[derive(Debug, Clone)]
-pub struct ThreadSessionInfo {
-    /// Thread driving this session
-    pub thread: ThreadId,
+pub struct TaskSessionInfo {
+    /// Session ID
+    pub session_id: String,
+    /// Task ID driving this session
+    pub task_id: String,
     /// Process ID of the agent (for termination)
     pub pid: u32,
     /// Session mode (interactive or background)
     pub mode: SessionMode,
-    /// Agent type (claude-code, codex, etc.)
-    pub agent_type: String,
-    /// Aiki session UUID (8-char hex)
-    pub session_id: String,
-    /// External session ID (from the agent)
-    pub external_session_id: String,
 }
 
-impl ThreadSessionInfo {
-    /// Reconstruct an AikiSession from the session file info.
-    ///
-    /// Used by `sigterm_to_end_session` to fire synthetic lifecycle events
-    /// (session.ended) before killing the agent process.
-    pub fn to_aiki_session(&self) -> AikiSession {
-        let agent = AgentType::from_str(&self.agent_type).unwrap_or(AgentType::Unknown);
-        AikiSession::new(
-            agent,
-            &self.external_session_id,
-            None::<&str>,
-            DetectionMethod::Hook,
-            self.mode,
-        )
-        .with_parent_pid(Some(self.pid))
-        .with_thread(Some(self.thread.clone()))
-    }
-}
-
-/// Find a thread-driven session by task ID (matches against thread tail)
+/// Find a task-driven session by task ID
 ///
-/// Scans session files for one whose `thread=<wire>` has a tail matching
-/// the given task ID. Returns session info including the PID for process
-/// termination.
+/// Scans session files for one with `task=<task_id>` and returns
+/// the session info including the PID for process termination.
 ///
 /// Returns None if no matching session found.
-pub fn find_thread_session(task_id: &str) -> Option<ThreadSessionInfo> {
+pub fn find_task_session(task_id: &str) -> Option<TaskSessionInfo> {
     let sessions_dir = global::global_sessions_dir();
 
     debug_log(|| {
         format!(
-            "find_thread_session: looking for thread tail={} in {:?}",
+            "find_task_session: looking for task={} in {:?}",
             task_id, sessions_dir
         )
     });
 
     if !sessions_dir.exists() {
-        debug_log(|| "find_thread_session: sessions dir does not exist".to_string());
+        debug_log(|| "find_task_session: sessions dir does not exist".to_string());
         return None;
     }
 
@@ -1073,59 +1113,49 @@ pub fn find_thread_session(task_id: &str) -> Option<ThreadSessionInfo> {
         };
 
         // Parse session file fields
-        let mut session_thread: Option<String> = None;
+        let mut session_task: Option<String> = None;
         let mut parent_pid: Option<u32> = None;
         let mut session_id: Option<String> = None;
         let mut mode: Option<SessionMode> = None;
-        let mut agent_type: Option<String> = None;
-        let mut external_session_id: Option<String> = None;
 
         for line in content.lines() {
             let line = line.trim();
-            if let Some(val) = line.strip_prefix("thread=") {
-                session_thread = Some(val.to_string());
+            if let Some(val) = line.strip_prefix("task=") {
+                session_task = Some(val.to_string());
             } else if let Some(val) = line.strip_prefix("parent_pid=") {
                 parent_pid = val.parse().ok();
             } else if let Some(val) = line.strip_prefix("session_id=") {
                 session_id = Some(val.to_string());
             } else if let Some(val) = line.strip_prefix("mode=") {
                 mode = SessionMode::from_str(val);
-            } else if let Some(val) = line.strip_prefix("agent=") {
-                agent_type = Some(val.to_string());
-            } else if let Some(val) = line.strip_prefix("external_session_id=") {
-                external_session_id = Some(val.to_string());
             }
         }
 
-        // Check if this session's thread tail matches our task
-        if let (Some(thread_wire), Some(pid), Some(sid)) =
-            (session_thread.clone(), parent_pid, session_id.clone())
+        // Check if this session matches our task
+        if let (Some(st), Some(pid), Some(sid)) =
+            (session_task.clone(), parent_pid, session_id.clone())
         {
-            if let Ok(thread) = ThreadId::parse(&thread_wire) {
-                debug_log(|| {
-                    format!(
-                        "find_thread_session: session {} has thread={}, tail={}, looking for {}",
-                        sid, thread_wire, thread.tail, task_id
-                    )
+            debug_log(|| {
+                format!(
+                    "find_task_session: session {} has task={}, looking for {}",
+                    sid, st, task_id
+                )
+            });
+            if st == task_id {
+                debug_log(|| format!("find_task_session: FOUND match! pid={}", pid));
+                return Some(TaskSessionInfo {
+                    session_id: sid,
+                    task_id: st,
+                    pid,
+                    mode: mode.unwrap_or(SessionMode::Interactive),
                 });
-                if thread.tail == task_id {
-                    debug_log(|| format!("find_thread_session: FOUND match! pid={}", pid));
-                    return Some(ThreadSessionInfo {
-                        thread,
-                        pid,
-                        mode: mode.unwrap_or(SessionMode::Interactive),
-                        agent_type: agent_type.clone().unwrap_or_default(),
-                        session_id: sid.clone(),
-                        external_session_id: external_session_id.clone().unwrap_or_default(),
-                    });
-                }
             }
         }
     }
 
     debug_log(|| {
         format!(
-            "find_thread_session: checked {} sessions, no match found",
+            "find_task_session: checked {} sessions, no match found",
             sessions_checked
         )
     });
@@ -1136,10 +1166,9 @@ pub fn find_thread_session(task_id: &str) -> Option<ThreadSessionInfo> {
 /// detect we're running under a specific agent (via `find_ancestor_by_name`).
 ///
 /// This is a fallback for agents like Codex that don't provide their PID via OTEL.
-/// Matching strategy:
-/// 1. If AIKI_THREAD is set and a candidate's `thread=` matches, return it immediately
-/// 2. If AIKI_THREAD is set but no candidate matched, return None
-/// 3. If AIKI_THREAD is not set, prefer most recently active session (by JJ event timestamp)
+/// Matches sessions by:
+/// 1. Agent type (must match)
+/// 2. Most recently active session (by JJ event timestamp)
 ///
 /// The `jj_cwd` parameter is needed for querying JJ to get latest event timestamps.
 ///
@@ -1159,8 +1188,6 @@ pub fn find_session_by_agent_type(
         Ok(e) => e,
         Err(_) => return None,
     };
-
-    let current_thread = std::env::var("AIKI_THREAD").ok();
 
     // Track best match with its last-activity time
     let mut best_match: Option<(SessionMatch, std::time::SystemTime)> = None;
@@ -1185,7 +1212,6 @@ pub fn find_session_by_agent_type(
         let mut agent_type: Option<AgentType> = None;
         let mut external_session_id: Option<String> = None;
         let mut aiki_session_id: Option<String> = None;
-        let mut thread: Option<String> = None;
 
         for line in content.lines() {
             let line = line.trim();
@@ -1199,8 +1225,6 @@ pub fn find_session_by_agent_type(
                 if aiki_session_id.is_none() {
                     aiki_session_id = Some(val.to_string());
                 }
-            } else if let Some(val) = line.strip_prefix("thread=") {
-                thread = Some(val.to_string());
             }
         }
 
@@ -1213,19 +1237,6 @@ pub fn find_session_by_agent_type(
                         external_session_id: ext_id,
                         session_id: aiki_id.clone(),
                     };
-
-                    // Tier 1: thread match wins immediately
-                    if let Some(ref cur) = current_thread {
-                        if thread.as_deref() == Some(cur.as_str()) {
-                            return Some(candidate);
-                        }
-                    }
-
-                    // If AIKI_THREAD is set but didn't match, skip this candidate
-                    // (prevents cross-thread session leakage)
-                    if current_thread.is_some() {
-                        continue;
-                    }
 
                     // Query JJ for latest event timestamp for this session
                     let last_activity = query_latest_event(jj_cwd, &aiki_id)
@@ -1259,47 +1270,6 @@ pub fn find_session_by_agent_type(
 /// 4. If found via fallback, update session file with discovered PID for future lookups
 /// 5. Final fallback: find most-recent session that includes the current repo ID
 ///
-/// Strict session detection: only matches if the current process is running
-/// *inside* an agent session (PID ancestry). Returns None when called from
-/// the user's terminal.
-///
-/// Use this instead of `find_active_session` when you need to know "am I an
-/// agent right now?" rather than "is any agent working in this repo?"
-pub fn find_own_session(jj_cwd: impl AsRef<Path>) -> Option<SessionMatch> {
-    let jj_cwd = jj_cwd.as_ref();
-
-    // PID-based matching (works for most agents)
-    if let Some(session) = find_session_by_ancestor_pid(jj_cwd) {
-        return Some(session);
-    }
-
-    // Codex doesn't provide PID via OTEL — check process name ancestry
-    if let Some(codex_pid) = find_ancestor_by_name("codex") {
-        if let Some(session) = find_session_by_agent_type(jj_cwd, AgentType::Codex) {
-            let session_file_path = global::global_sessions_dir().join(&session.session_id);
-            let session_file = AikiSessionFile {
-                path: session_file_path,
-                session: AikiSession::new(
-                    session.agent_type,
-                    &session.external_session_id,
-                    None::<&str>,
-                    DetectionMethod::Hook,
-                    SessionMode::Interactive,
-                ),
-            };
-            if let Err(e) = session_file.update_parent_pid(codex_pid) {
-                crate::cache::debug_log(|| {
-                    format!("Failed to update session file with PID: {}", e)
-                });
-            }
-            return Some(session);
-        }
-    }
-
-    // No repo fallback — if we're not a child of an agent, we're not in a session
-    None
-}
-
 /// The `jj_cwd` parameter is needed for querying JJ to get latest event timestamps,
 /// and is also used to derive the repo ID for fallback filtering.
 ///
@@ -1408,7 +1378,8 @@ fn find_session_by_repo(repo_path: impl AsRef<Path>) -> Option<SessionMatch> {
             continue;
         }
 
-        if let (Some(agent_type), Some(session_id)) = (info.agent_type, info.session_id.clone()) {
+        if let (Some(agent_type), Some(session_id)) = (info.agent_type, info.session_id.clone())
+        {
             let external_id = info.external_session_id.unwrap_or_default();
 
             matching_sessions.push(SessionMatch {
@@ -1424,6 +1395,15 @@ fn find_session_by_repo(repo_path: impl AsRef<Path>) -> Option<SessionMatch> {
     matching_sessions.pop()
 }
 
+/// Extract and parse the `timestamp=` field from a JJ event description.
+///
+/// Supports RFC 3339 format (e.g., "2026-01-23T12:00:00Z") and
+/// JJ's native format (e.g., "2026-01-23 12:00:00.000 -08:00").
+///
+/// Returns:
+/// - `Ok(Some(timestamp))` - timestamp found and parsed
+/// - `Ok(None)` - empty description (no events)
+/// - `Err(e)` - timestamp field missing or unparseable
 fn parse_event_timestamp(description: &str) -> std::result::Result<Option<DateTime<Utc>>, String> {
     if description.trim().is_empty() {
         return Ok(None);
@@ -1512,6 +1492,7 @@ fn query_latest_event(
 
 /// Parsed session file metadata used for cleanup and session detection
 struct SessionFileInfo {
+    path: PathBuf,
     agent_type: Option<AgentType>,
     session_id: Option<String>,
     external_session_id: Option<String>,
@@ -1548,6 +1529,7 @@ fn parse_session_file(path: &Path) -> Option<SessionFileInfo> {
     }
 
     Some(SessionFileInfo {
+        path: path.to_path_buf(),
         agent_type,
         session_id,
         external_session_id,
@@ -1596,7 +1578,6 @@ fn emit_synthetic_session_ended(session_info: &SessionFileInfo, reason: SessionC
         cwd,
         timestamp: Utc::now(),
         reason: reason_str.to_string(),
-        tokens: None,
     });
 
     if let Err(e) = event_bus::dispatch(event) {
@@ -1647,7 +1628,10 @@ pub fn prune_dead_pid_sessions() {
                 match isolation::recover_orphaned_workspaces(session_uuid) {
                     Ok(0) => {}
                     Ok(n) => {
-                        eprintln!("[aiki] Recovered {} workspace(s) from crashed session", n);
+                        eprintln!(
+                            "[aiki] Recovered {} workspace(s) from crashed session",
+                            n
+                        );
                     }
                     Err(e) => {
                         debug_log(|| {
@@ -1670,44 +1654,24 @@ pub fn prune_dead_pid_sessions() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use chrono::Timelike;
+    use chrono::{Datelike, Timelike};
     use std::env;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    // Use the process-wide mutex from global.rs to avoid races with other modules
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::global::AIKI_HOME_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
+    // Mutex to serialize tests that modify AIKI_HOME env var
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
-    /// RAII guard that restores an environment variable on drop.
+    /// Guard that restores AIKI_HOME on drop
     struct EnvGuard {
-        key: String,
         original: Option<String>,
-    }
-
-    impl EnvGuard {
-        /// Save the current value of `key`, then set it to `value` (or remove if `None`).
-        fn new(key: &str, value: Option<&str>) -> Self {
-            let original = env::var(key).ok();
-            match value {
-                Some(v) => env::set_var(key, v),
-                None => env::remove_var(key),
-            }
-            Self {
-                key: key.to_string(),
-                original,
-            }
-        }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.original {
-                Some(v) => env::set_var(&self.key, v),
-                None => env::remove_var(&self.key),
+                Some(v) => env::set_var(global::AIKI_HOME_ENV, v),
+                None => env::remove_var(global::AIKI_HOME_ENV),
             }
         }
     }
@@ -1725,12 +1689,11 @@ mod tests {
         let aiki_home_path = aiki_home.path().to_path_buf();
         fs::create_dir_all(aiki_home_path.join("sessions")).unwrap();
 
-        let guard = EnvGuard::new(
-            global::AIKI_HOME_ENV,
-            Some(aiki_home_path.to_str().unwrap()),
-        );
+        // Save original AIKI_HOME and set new value
+        let original = env::var(global::AIKI_HOME_ENV).ok();
+        env::set_var(global::AIKI_HOME_ENV, &aiki_home_path);
 
-        (repo_dir, aiki_home, guard)
+        (repo_dir, aiki_home, EnvGuard { original })
     }
 
     /// Set up isolated AIKI_HOME only (for tests that don't need repo path).
@@ -1742,12 +1705,11 @@ mod tests {
         let aiki_home_path = aiki_home.path().to_path_buf();
         fs::create_dir_all(aiki_home_path.join("sessions")).unwrap();
 
-        let guard = EnvGuard::new(
-            global::AIKI_HOME_ENV,
-            Some(aiki_home_path.to_str().unwrap()),
-        );
+        // Save original AIKI_HOME and set new value
+        let original = env::var(global::AIKI_HOME_ENV).ok();
+        env::set_var(global::AIKI_HOME_ENV, &aiki_home_path);
 
-        (aiki_home, guard)
+        (aiki_home, EnvGuard { original })
     }
 
     /// Simple test repo setup (for tests that only need a local temp directory)
@@ -1759,7 +1721,7 @@ mod tests {
 
     #[test]
     fn test_create_and_query_session() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
 
         // Create a session and write its file
@@ -1783,11 +1745,14 @@ mod tests {
             "cwd field should not be in session file"
         );
         assert!(content.ends_with("[/aiki]\n"));
+
+        // Verify session count
+        assert_eq!(count_sessions().unwrap(), 1);
     }
 
     #[test]
     fn test_multiple_creates_same_session() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
 
         // Create session file twice (idempotent via O_EXCL)
@@ -1803,11 +1768,14 @@ mod tests {
 
         // Should produce same session UUID
         assert_eq!(session1.uuid(), session2.uuid());
+
+        // Should only have one file
+        assert_eq!(count_sessions().unwrap(), 1);
     }
 
     #[test]
     fn test_update_parent_pid_adds_pid_to_session_file() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
 
         // Create session without PID (using new() instead of for_hook() to avoid auto-capture)
@@ -1847,7 +1815,7 @@ mod tests {
 
     #[test]
     fn test_update_parent_pid_idempotent() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
 
         // Create session without PID
@@ -1874,7 +1842,7 @@ mod tests {
 
     #[test]
     fn test_multiple_different_sessions() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
 
         // Create multiple different sessions
@@ -1894,6 +1862,9 @@ mod tests {
         // Both should exist
         assert!(global::global_sessions_dir().join(session1.uuid()).exists());
         assert!(global::global_sessions_dir().join(session2.uuid()).exists());
+
+        // Should have 2 sessions
+        assert_eq!(count_sessions().unwrap(), 2);
     }
 
     #[test]
@@ -1929,8 +1900,39 @@ mod tests {
     }
 
     #[test]
+    fn test_session_end() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
+
+        // Start a session
+        let session = AikiSession::for_hook(
+            AgentType::ClaudeCode,
+            "claude-session-end-test",
+            None::<&str>,
+        );
+        session.file().create().unwrap();
+
+        // Verify it exists
+        assert!(global::global_sessions_dir().join(session.uuid()).exists());
+        assert_eq!(count_sessions().unwrap(), 1);
+
+        // End the session
+        end_session(
+            AgentType::ClaudeCode,
+            "claude-session-end-test",
+            DetectionMethod::Hook,
+            SessionMode::Interactive,
+        )
+        .unwrap();
+
+        // Verify it's gone
+        assert!(!global::global_sessions_dir().join(session.uuid()).exists());
+        assert_eq!(count_sessions().unwrap(), 0);
+    }
+
+    #[test]
     fn test_session_lifecycle() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
 
         // Start
@@ -1950,7 +1952,7 @@ mod tests {
 
     #[test]
     fn test_idempotent_file_creation() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
 
         // Create same session file 5 times (idempotent via O_EXCL)
@@ -1961,6 +1963,69 @@ mod tests {
             // Only first create should return true
             assert_eq!(created, i == 0);
         }
+
+        // Should only have 1 session file
+        assert_eq!(count_sessions().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_session_file_stores_agent_version() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
+
+        // Create a session with agent version
+        let session = AikiSession::new(
+            AgentType::ClaudeCode,
+            "test-session-with-version",
+            Some("2.0.61"),
+            DetectionMethod::Hook,
+            SessionMode::Interactive,
+        );
+
+        // Write session file
+        let session_file = session.file();
+        session_file.create().unwrap();
+
+        // Verify agent_version is stored in the file
+        let content = fs::read_to_string(&session_file.path).unwrap();
+        assert!(
+            content.contains("agent_version=2.0.61"),
+            "Session file should contain agent_version"
+        );
+
+        // Verify we can read it back
+        let cached_version = session_file.read_agent_version();
+        assert_eq!(cached_version, Some("2.0.61".to_string()));
+    }
+
+    #[test]
+    fn test_session_file_without_agent_version() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
+
+        // Create a session without agent version
+        let session = AikiSession::new(
+            AgentType::ClaudeCode,
+            "test-session-no-version",
+            None::<&str>,
+            DetectionMethod::Hook,
+            SessionMode::Interactive,
+        );
+
+        // Write session file
+        let session_file = session.file();
+        session_file.create().unwrap();
+
+        // Verify agent_version is NOT in the file
+        let content = fs::read_to_string(&session_file.path).unwrap();
+        assert!(
+            !content.contains("agent_version="),
+            "Session file should not contain agent_version field"
+        );
+
+        // Verify read returns None
+        let cached_version = session_file.read_agent_version();
+        assert_eq!(cached_version, None);
     }
 
     // ========================================================================
@@ -1969,7 +2034,7 @@ mod tests {
 
     #[test]
     fn test_session_file_stores_parent_pid() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
 
         // Create a session with parent_pid
@@ -1996,7 +2061,7 @@ mod tests {
 
     #[test]
     fn test_session_file_without_parent_pid() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
 
         // Create a session without parent_pid (ACP mode without agent_pid)
@@ -2056,7 +2121,7 @@ mod tests {
 
     #[test]
     fn test_find_session_by_ancestor_pid_no_sessions() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (repo_dir, _aiki_home, _guard) = setup_test_repo_with_global_inner();
         let repo_path = repo_dir.path();
 
@@ -2067,7 +2132,7 @@ mod tests {
 
     #[test]
     fn test_find_session_by_ancestor_pid_with_matching_session() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (repo_dir, _aiki_home, _guard) = setup_test_repo_with_global_inner();
         let repo_path = repo_dir.path();
 
@@ -2098,7 +2163,7 @@ mod tests {
 
     #[test]
     fn test_find_session_by_ancestor_pid_non_matching_pid() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (repo_dir, _aiki_home, _guard) = setup_test_repo_with_global_inner();
         let repo_path = repo_dir.path();
 
@@ -2122,7 +2187,7 @@ mod tests {
 
     #[test]
     fn test_prune_dead_pid_sessions_removes_dead_pid() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_repo_dir, _aiki_home, _guard) = setup_test_repo_with_global_inner();
 
         // Create a session with a PID that definitely doesn't exist
@@ -2150,7 +2215,7 @@ mod tests {
 
     #[test]
     fn test_prune_dead_pid_sessions_keeps_live_pid() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_repo_dir, _aiki_home, _guard) = setup_test_repo_with_global_inner();
 
         // Create a session with our own PID (which is alive)
@@ -2179,7 +2244,7 @@ mod tests {
 
     #[test]
     fn test_for_hook_session_file_has_parent_pid() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
 
         // Create session using for_hook (which captures parent PID)
@@ -2275,48 +2340,53 @@ mod tests {
     }
 
     #[test]
-    fn test_find_session_by_ancestor_pid_thread_match_wins() {
-        // Thread match takes priority over last-activity tiebreaker.
+    fn test_find_session_by_ancestor_pid_with_multiple_matching_sessions() {
+        // This test verifies that when multiple sessions match our PID ancestry,
+        // we find at least one session. Activity-based preference now uses JJ queries,
+        // so in a non-JJ test environment all sessions get UNIX_EPOCH timestamps.
+        // The important behavior is that we return *a* matching session.
 
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (repo_dir, _aiki_home, _guard) = setup_test_repo_with_global_inner();
         let repo_path = repo_dir.path();
         let sessions_dir = global::global_sessions_dir();
 
+        // Use parent PID (which is in our ancestor chain)
         let parent_pid = match get_parent_pid() {
             Some(pid) => pid,
-            None => return,
+            None => return, // Skip test if parent PID unavailable
         };
 
-        // Session A: no thread
+        // Create session A
         let a_content = format!(
-            "[aiki]\nagent=claude\nexternal_session_id=session-no-thread\nsession_id=uuid-no-thread\nstarted_at=2026-01-24T12:00:00Z\nparent_pid={}\n[/aiki]\n",
+            "[aiki]\nagent=claude\nexternal_session_id=session-a\nsession_id=uuid-a\nstarted_at=2026-01-24T12:00:00Z\nparent_pid={}\n[/aiki]\n",
             parent_pid
         );
-        fs::write(sessions_dir.join("uuid-no-thread"), &a_content).unwrap();
+        fs::write(sessions_dir.join("uuid-a"), &a_content).unwrap();
 
-        // Session B: matching thread
+        // Create session B
         let b_content = format!(
-            "[aiki]\nagent=claude\nexternal_session_id=session-threaded\nsession_id=uuid-threaded\nstarted_at=2026-01-20T12:00:00Z\nparent_pid={}\nthread=test-thread-123\n[/aiki]\n",
+            "[aiki]\nagent=claude\nexternal_session_id=session-b\nsession_id=uuid-b\nstarted_at=2026-01-20T12:00:00Z\nparent_pid={}\n[/aiki]\n",
             parent_pid
         );
-        fs::write(sessions_dir.join("uuid-threaded"), &b_content).unwrap();
-
-        // Set AIKI_THREAD to match session B
-        let _thread_guard = EnvGuard::new("AIKI_THREAD", Some("test-thread-123"));
+        fs::write(sessions_dir.join("uuid-b"), &b_content).unwrap();
 
         let result = find_session_by_ancestor_pid(repo_path);
-        assert!(result.is_some(), "Should find the thread-matching session");
+        assert!(
+            result.is_some(),
+            "Should find at least one matching session"
+        );
         let session = result.unwrap();
-        assert_eq!(
-            session.session_id, "uuid-threaded",
-            "Thread match should win over last-activity tiebreaker"
+        // Without JJ, both sessions have UNIX_EPOCH timestamps, so either may be returned
+        assert!(
+            session.session_id == "uuid-a" || session.session_id == "uuid-b",
+            "Should return one of the matching sessions"
         );
     }
 
     #[test]
     fn test_session_file_uses_new_format() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
 
         let session = AikiSession::new(
@@ -2343,18 +2413,26 @@ mod tests {
         assert!(!content.contains("cwd="), "Should not include cwd field");
     }
 
+    // ========================================================================
+    // parse_event_timestamp tests (covers TTL cleanup timestamp parsing)
+    // ========================================================================
+
     #[test]
     fn test_parse_event_timestamp_rfc3339() {
-        let description = "event=prompt\ntimestamp=2026-01-23T12:00:00Z\nsession=sess123\n";
+        let description =
+            "[aiki]\nevent=prompt\nsession=sess123\ntimestamp=2026-01-23T12:00:00Z\n[/aiki]\n";
         let result = parse_event_timestamp(description);
         assert!(result.is_ok());
         let ts = result.unwrap().unwrap();
+        assert_eq!(ts.year(), 2026);
+        assert_eq!(ts.month(), 1);
+        assert_eq!(ts.day(), 23);
         assert_eq!(ts.hour(), 12);
     }
 
     #[test]
     fn test_parse_event_timestamp_rfc3339_with_offset() {
-        let description = "event=prompt\ntimestamp=2026-01-23T04:00:00-08:00\nsession=sess123\n";
+        let description = "event=response\ntimestamp=2026-01-23T04:00:00-08:00\n";
         let result = parse_event_timestamp(description);
         assert!(result.is_ok());
         let ts = result.unwrap().unwrap();
@@ -2463,8 +2541,45 @@ mod tests {
     // ========================================================================
 
     #[test]
+    fn test_read_repos_no_file() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
+        let session = AikiSession::new(
+            AgentType::ClaudeCode,
+            "test-session",
+            None::<&str>,
+            DetectionMethod::Hook,
+            SessionMode::Interactive,
+        );
+        let session_file = session.file();
+
+        // File doesn't exist - should return empty vec
+        let repos = session_file.read_repos();
+        assert!(repos.is_empty());
+    }
+
+    #[test]
+    fn test_read_repos_no_repo_fields() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
+        let session = AikiSession::new(
+            AgentType::ClaudeCode,
+            "test-session",
+            None::<&str>,
+            DetectionMethod::Hook,
+            SessionMode::Interactive,
+        );
+        let session_file = session.file();
+        session_file.create().unwrap();
+
+        // File exists but has no repo fields
+        let repos = session_file.read_repos();
+        assert!(repos.is_empty());
+    }
+
+    #[test]
     fn test_add_repo_to_session_file() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
         let session = AikiSession::new(
             AgentType::ClaudeCode,
@@ -2479,6 +2594,10 @@ mod tests {
         // Add a repo
         session_file.add_repo("abc123def456").unwrap();
 
+        // Verify it was added
+        let repos = session_file.read_repos();
+        assert_eq!(repos, vec!["abc123def456"]);
+
         // Verify file content
         let content = fs::read_to_string(&session_file.path).unwrap();
         assert!(content.contains("repo=abc123def456"));
@@ -2487,7 +2606,7 @@ mod tests {
 
     #[test]
     fn test_add_multiple_repos() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
         let session = AikiSession::new(
             AgentType::ClaudeCode,
@@ -2504,16 +2623,17 @@ mod tests {
         session_file.add_repo("def456").unwrap();
         session_file.add_repo("ghi789").unwrap();
 
-        // Verify all were added by reading file content
-        let content = fs::read_to_string(&session_file.path).unwrap();
-        assert!(content.contains("repo=abc123"));
-        assert!(content.contains("repo=def456"));
-        assert!(content.contains("repo=ghi789"));
+        // Verify all were added
+        let repos = session_file.read_repos();
+        assert_eq!(repos.len(), 3);
+        assert!(repos.contains(&"abc123".to_string()));
+        assert!(repos.contains(&"def456".to_string()));
+        assert!(repos.contains(&"ghi789".to_string()));
     }
 
     #[test]
     fn test_add_repo_idempotent() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
         let session = AikiSession::new(
             AgentType::ClaudeCode,
@@ -2530,17 +2650,13 @@ mod tests {
         session_file.add_repo("abc123").unwrap();
 
         // Should only appear once
-        let content = fs::read_to_string(&session_file.path).unwrap();
-        let repo_count = content
-            .lines()
-            .filter(|l| l.trim() == "repo=abc123")
-            .count();
-        assert_eq!(repo_count, 1);
+        let repos = session_file.read_repos();
+        assert_eq!(repos, vec!["abc123"]);
     }
 
     #[test]
     fn test_add_repo_to_nonexistent_file() {
-        let _lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let (_aiki_home, _guard) = setup_global_aiki_home_inner();
         let session = AikiSession::new(
             AgentType::ClaudeCode,
@@ -2554,331 +2670,5 @@ mod tests {
         // Don't create the file - add_repo should handle gracefully
         let result = session_file.add_repo("abc123");
         assert!(result.is_ok());
-    }
-
-    // ========================================================================
-    // Session thread persistence tests (2a-2i)
-    // ========================================================================
-
-    // Helper: 32-char lowercase IDs for ThreadId tests
-    const THREAD_ID_A: &str = "abcdefghijklmnopqrstuvwxyzabcdef";
-    const THREAD_ID_B: &str = "fedcbazyxwvutsrqponmlkjihgfedcba";
-
-    // --- 2a: with_thread sets the thread field ---
-    #[test]
-    fn test_with_thread_sets_thread_field() {
-        let session = AikiSession::new(
-            AgentType::ClaudeCode,
-            "thread-test",
-            None::<&str>,
-            DetectionMethod::Hook,
-            SessionMode::Interactive,
-        )
-        .with_thread(Some(ThreadId::single(THREAD_ID_A.to_string())));
-
-        let thread = session.thread().expect("thread should be set");
-        assert_eq!(thread.head, THREAD_ID_A);
-        assert_eq!(thread.tail, THREAD_ID_A);
-    }
-
-    // --- 2b: with_thread(None) clears thread field ---
-    #[test]
-    fn test_with_thread_none_clears_field() {
-        let session = AikiSession::new(
-            AgentType::ClaudeCode,
-            "thread-test",
-            None::<&str>,
-            DetectionMethod::Hook,
-            SessionMode::Interactive,
-        )
-        .with_thread(Some(ThreadId::single(THREAD_ID_A.to_string())))
-        .with_thread(None);
-
-        assert!(session.thread().is_none());
-    }
-
-    // --- 2c: with_thread_from_env parses single ID ---
-    #[test]
-    fn test_with_thread_from_env_parses_single() {
-        let _lock = env_lock();
-        let _guard = EnvGuard::new("AIKI_THREAD", Some(THREAD_ID_A));
-
-        let session = AikiSession::new(
-            AgentType::ClaudeCode,
-            "env-single-test",
-            None::<&str>,
-            DetectionMethod::Hook,
-            SessionMode::Interactive,
-        )
-        .with_thread_from_env();
-
-        let thread = session.thread().expect("thread should be set from env");
-        assert!(thread.is_single());
-        assert_eq!(thread.head, THREAD_ID_A);
-    }
-
-    // --- 2d: with_thread_from_env parses head:tail pair ---
-    #[test]
-    fn test_with_thread_from_env_parses_pair() {
-        let _lock = env_lock();
-        let pair = format!("{}:{}", THREAD_ID_A, THREAD_ID_B);
-        let _guard = EnvGuard::new("AIKI_THREAD", Some(&pair));
-
-        let session = AikiSession::new(
-            AgentType::ClaudeCode,
-            "env-pair-test",
-            None::<&str>,
-            DetectionMethod::Hook,
-            SessionMode::Interactive,
-        )
-        .with_thread_from_env();
-
-        let thread = session.thread().expect("thread should be set from env");
-        assert!(!thread.is_single());
-        assert_eq!(thread.head, THREAD_ID_A);
-        assert_eq!(thread.tail, THREAD_ID_B);
-    }
-
-    // --- 2e: with_thread_from_env when unset is None ---
-    #[test]
-    fn test_with_thread_from_env_unset_is_none() {
-        let _lock = env_lock();
-        let _guard = EnvGuard::new("AIKI_THREAD", None);
-
-        let session = AikiSession::new(
-            AgentType::ClaudeCode,
-            "env-unset-test",
-            None::<&str>,
-            DetectionMethod::Hook,
-            SessionMode::Interactive,
-        )
-        .with_thread_from_env();
-
-        assert!(session.thread().is_none());
-    }
-
-    // --- 2f: with_thread_from_env with invalid value is None ---
-    #[test]
-    fn test_with_thread_from_env_invalid_is_none() {
-        let _lock = env_lock();
-        let _guard = EnvGuard::new("AIKI_THREAD", Some("bad"));
-
-        let session = AikiSession::new(
-            AgentType::ClaudeCode,
-            "env-invalid-test",
-            None::<&str>,
-            DetectionMethod::Hook,
-            SessionMode::Interactive,
-        )
-        .with_thread_from_env();
-
-        assert!(session.thread().is_none());
-    }
-
-    // --- 2g: session file writes thread field ---
-    #[test]
-    fn test_session_file_writes_thread() {
-        let _lock = env_lock();
-        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
-
-        let thread = ThreadId {
-            head: THREAD_ID_A.to_string(),
-            tail: THREAD_ID_B.to_string(),
-        };
-
-        let session = AikiSession::new(
-            AgentType::ClaudeCode,
-            "thread-file-test",
-            None::<&str>,
-            DetectionMethod::Hook,
-            SessionMode::Interactive,
-        )
-        .with_thread(Some(thread));
-
-        session.file().create().unwrap();
-
-        let session_file_path = global::global_sessions_dir().join(session.uuid());
-        let content = fs::read_to_string(&session_file_path).unwrap();
-        let expected = format!("thread={}:{}", THREAD_ID_A, THREAD_ID_B);
-        assert!(
-            content.contains(&expected),
-            "Session file should contain thread field, got: {}",
-            content
-        );
-    }
-
-    // --- 2h: find_thread_session matches on tail only ---
-    #[test]
-    fn test_find_thread_session_matches_on_tail() {
-        let _lock = env_lock();
-        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
-
-        let sessions_dir = global::global_sessions_dir();
-
-        // Write a session file with thread=head:tail and a parent_pid
-        let content = format!(
-            "[aiki]\nagent=claude\nexternal_session_id=thread-match-test\nsession_id=uuid-thread-match\nstarted_at=2026-01-24T12:00:00Z\nparent_pid=55555\nthread={}:{}\nmode=interactive\n[/aiki]\n",
-            THREAD_ID_A, THREAD_ID_B
-        );
-        fs::write(sessions_dir.join("uuid-thread-match"), &content).unwrap();
-
-        // Match by tail → should find it
-        let result = find_thread_session(THREAD_ID_B);
-        assert!(result.is_some(), "Should find session by tail match");
-        let info = result.unwrap();
-        assert_eq!(info.thread.tail, THREAD_ID_B);
-        assert_eq!(info.pid, 55555);
-
-        // Match by head → should NOT find it (tail-only match)
-        let result = find_thread_session(THREAD_ID_A);
-        assert!(result.is_none(), "Should not match on head, only tail");
-    }
-
-    // --- 2i: find_thread_session with single-task thread ---
-    #[test]
-    fn test_find_thread_session_single_task_thread() {
-        let _lock = env_lock();
-        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
-
-        let sessions_dir = global::global_sessions_dir();
-
-        // Write a session file with thread=<id> (single-task, head==tail)
-        let content = format!(
-            "[aiki]\nagent=claude\nexternal_session_id=thread-single-test\nsession_id=uuid-thread-single\nstarted_at=2026-01-24T12:00:00Z\nparent_pid=66666\nthread={}\nmode=background\n[/aiki]\n",
-            THREAD_ID_A
-        );
-        fs::write(sessions_dir.join("uuid-thread-single"), &content).unwrap();
-
-        // Match by the single ID → should find it (head==tail)
-        let result = find_thread_session(THREAD_ID_A);
-        assert!(result.is_some(), "Should find single-task thread session");
-        let info = result.unwrap();
-        assert!(info.thread.is_single());
-        assert_eq!(info.thread.head, THREAD_ID_A);
-        assert_eq!(info.thread.tail, THREAD_ID_A);
-        assert_eq!(info.pid, 66666);
-        assert_eq!(info.mode, SessionMode::Background);
-    }
-
-    // --- find_session_by_agent_type thread tests ---
-
-    /// Helper: write a minimal session file that `find_session_by_agent_type` can parse.
-    fn write_agent_session(
-        sessions_dir: &Path,
-        agent: &str,
-        ext_id: &str,
-        session_id: &str,
-        thread: Option<&str>,
-    ) {
-        let mut content = format!(
-            "agent={agent}\nexternal_session_id={ext_id}\nsession_id={session_id}\n"
-        );
-        if let Some(t) = thread {
-            content.push_str(&format!("thread={t}\n"));
-        }
-        fs::write(sessions_dir.join(session_id), &content).unwrap();
-    }
-
-    #[test]
-    fn test_find_session_by_agent_type_thread_match() {
-        let _lock = env_lock();
-        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
-        let sessions_dir = global::global_sessions_dir();
-
-        // Two codex sessions: one with matching thread, one without
-        write_agent_session(&sessions_dir, "codex", "ext-1", "sess-no-thread", None);
-        write_agent_session(
-            &sessions_dir,
-            "codex",
-            "ext-2",
-            "sess-thread-abc",
-            Some("thread-abc"),
-        );
-
-        let _thread_guard = EnvGuard::new("AIKI_THREAD", Some("thread-abc"));
-
-        let result = find_session_by_agent_type("/tmp", AgentType::Codex);
-        assert!(result.is_some(), "Should find session with matching thread");
-        let m = result.unwrap();
-        assert_eq!(m.session_id, "sess-thread-abc");
-        assert_eq!(m.external_session_id, "ext-2");
-    }
-
-    #[test]
-    fn test_find_session_by_agent_type_thread_unmatched() {
-        let _lock = env_lock();
-        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
-        let sessions_dir = global::global_sessions_dir();
-
-        // Only sessions with different threads
-        write_agent_session(
-            &sessions_dir,
-            "codex",
-            "ext-1",
-            "sess-thread-aaa",
-            Some("thread-aaa"),
-        );
-        write_agent_session(
-            &sessions_dir,
-            "codex",
-            "ext-2",
-            "sess-thread-bbb",
-            Some("thread-bbb"),
-        );
-
-        let _thread_guard = EnvGuard::new("AIKI_THREAD", Some("thread-xyz"));
-
-        let result = find_session_by_agent_type("/tmp", AgentType::Codex);
-        // AIKI_THREAD is set but no session thread matches → returns None
-        // This prevents cross-thread session leakage
-        assert!(
-            result.is_none(),
-            "Should return None when AIKI_THREAD is set but no session thread matches"
-        );
-    }
-
-    #[test]
-    fn test_find_session_by_agent_type_no_thread_fallback() {
-        let _lock = env_lock();
-        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
-        let sessions_dir = global::global_sessions_dir();
-
-        // Multiple codex sessions, no AIKI_THREAD set
-        write_agent_session(&sessions_dir, "codex", "ext-1", "sess-fallback-1", None);
-        write_agent_session(&sessions_dir, "codex", "ext-2", "sess-fallback-2", None);
-
-        let _thread_guard = EnvGuard::new("AIKI_THREAD", None);
-
-        let result = find_session_by_agent_type("/tmp", AgentType::Codex);
-        assert!(
-            result.is_some(),
-            "Should return Some (first match) when AIKI_THREAD is not set"
-        );
-    }
-
-    #[test]
-    fn test_find_session_by_agent_type_wrong_agent() {
-        let _lock = env_lock();
-        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
-        let sessions_dir = global::global_sessions_dir();
-
-        // Only claude sessions, searching for codex
-        write_agent_session(&sessions_dir, "claude", "ext-1", "sess-claude", None);
-
-        let _thread_guard = EnvGuard::new("AIKI_THREAD", None);
-
-        let result = find_session_by_agent_type("/tmp", AgentType::Codex);
-        assert!(result.is_none(), "Should not find session with wrong agent type");
-    }
-
-    #[test]
-    fn test_find_session_by_agent_type_empty_dir() {
-        let _lock = env_lock();
-        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
-
-        let _thread_guard = EnvGuard::new("AIKI_THREAD", Some("thread-abc"));
-
-        let result = find_session_by_agent_type("/tmp", AgentType::Codex);
-        assert!(result.is_none(), "Should return None for empty sessions dir");
     }
 }
