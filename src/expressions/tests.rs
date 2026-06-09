@@ -82,7 +82,10 @@ fn test_string_not_equals() {
 
 #[test]
 fn test_logical_and() {
-    assert!(eval("x > 5 && approved", &[("x", "10"), ("approved", "true")]));
+    assert!(eval(
+        "x > 5 && approved",
+        &[("x", "10"), ("approved", "true")]
+    ));
     assert!(!eval(
         "x > 5 && approved",
         &[("x", "10"), ("approved", "false")]
@@ -179,17 +182,11 @@ fn test_dollar_prefix_in_comparison() {
 fn test_dollar_prefix_both_sides() {
     assert!(eval(
         "$event.task.id == $session.task.id",
-        &[
-            ("event.task.id", "abc123"),
-            ("session.task.id", "abc123")
-        ]
+        &[("event.task.id", "abc123"), ("session.task.id", "abc123")]
     ));
     assert!(!eval(
         "$event.task.id == $session.task.id",
-        &[
-            ("event.task.id", "abc123"),
-            ("session.task.id", "xyz789")
-        ]
+        &[("event.task.id", "abc123"), ("session.task.id", "xyz789")]
     ));
 }
 
@@ -258,10 +255,10 @@ fn test_complex_expression() {
 fn test_complex_hook_condition() {
     // Real-world hook condition from hooks.yaml (bare names, no $ prefix)
     assert!(eval(
-        r#"event.task.id == session.task.id && session.mode == "interactive""#,
+        r#"event.task.id == session.thread.tail && session.mode == "interactive""#,
         &[
             ("event.task.id", "abc"),
-            ("session.task.id", "abc"),
+            ("session.thread.tail", "abc"),
             ("session.mode", "interactive")
         ]
     ));
@@ -271,18 +268,12 @@ fn test_complex_hook_condition() {
 
 #[test]
 fn test_strip_dollar_prefixes() {
-    assert_eq!(
-        strip_dollar_prefixes("$event.write"),
-        "event.write"
-    );
+    assert_eq!(strip_dollar_prefixes("$event.write"), "event.write");
     assert_eq!(
         strip_dollar_prefixes("$event.task.id == $session.task.id"),
         "event.task.id == session.task.id"
     );
-    assert_eq!(
-        strip_dollar_prefixes(r#"$x == "hello""#),
-        r#"x == "hello""#
-    );
+    assert_eq!(strip_dollar_prefixes(r#"$x == "hello""#), r#"x == "hello""#);
     // Don't strip $ inside strings
     assert_eq!(
         strip_dollar_prefixes(r#"x == "$event""#),
@@ -301,10 +292,7 @@ fn test_rewrite_word_operators() {
     assert_eq!(rewrite_word_operators("notice"), "notice");
     assert_eq!(rewrite_word_operators("android"), "android");
     // Inside strings - should not rewrite
-    assert_eq!(
-        rewrite_word_operators(r#"x == "and""#),
-        r#"x == "and""#
-    );
+    assert_eq!(rewrite_word_operators(r#"x == "and""#), r#"x == "and""#);
 }
 
 // === build_scope_from_flat ===
@@ -418,8 +406,12 @@ fn test_array_indexing() {
     ];
     scope.push("subtasks", subtasks);
 
-    assert!(evaluator.evaluate("subtasks[2].approved", &mut scope).unwrap());
-    assert!(!evaluator.evaluate("subtasks[0].approved", &mut scope).unwrap());
+    assert!(evaluator
+        .evaluate("subtasks[2].approved", &mut scope)
+        .unwrap());
+    assert!(!evaluator
+        .evaluate("subtasks[0].approved", &mut scope)
+        .unwrap());
 }
 
 #[test]
@@ -483,17 +475,17 @@ fn test_missing_subpath_on_existing_map() {
     //   "Unknown property 'fix' - a getter is not registered for type '()'"
     assert!(!eval(
         "data.options.fix",
-        &[("data.scope.kind", "task"), ("data.scope.name", "my-review")],
+        &[
+            ("data.scope.kind", "task"),
+            ("data.scope.name", "my-review")
+        ],
     ));
 }
 
 #[test]
 fn test_not_missing_subpath_on_existing_map() {
     // Negated form: `not data.options.fix` should be true when path is absent
-    assert!(eval(
-        "not data.options.fix",
-        &[("data.scope.kind", "task")],
-    ));
+    assert!(eval("not data.options.fix", &[("data.scope.kind", "task")],));
 }
 
 #[test]

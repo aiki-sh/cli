@@ -9,34 +9,36 @@
 
 use std::path::Path;
 
+pub mod baseline;
 pub mod graph;
 pub mod id;
+pub mod lanes;
+pub mod listener;
 pub mod manager;
+pub mod md;
+pub mod revset;
 pub mod runner;
 pub mod spawner;
-pub mod status_monitor;
 pub mod storage;
 pub mod templates;
 pub mod types;
-pub mod md;
 
-pub use graph::{materialize_graph, materialize_graph_with_ids, EdgeStore, LinkKind, LinkMeta, TaskGraph, LINK_KINDS};
-pub use id::{generate_task_id, is_task_id, is_task_id_prefix, is_valid_slug};
-#[allow(unused_imports)]
+pub use baseline::select_task_snapshot_baseline;
+pub use graph::{materialize_graph, materialize_graph_with_ids, TaskGraph};
+pub use id::{generate_task_id, is_task_id, is_task_id_prefix, is_valid_slug, looks_like_task_id};
+#[cfg(test)]
+pub use id::TaskRef;
 pub use manager::{
-    all_subtasks_closed, find_task, find_task_in_graph, get_subtasks, get_current_scope_set,
-    get_in_progress, get_ready_queue, get_ready_queue_for_agent, get_ready_queue_for_agent_scoped,
-    get_ready_queue_for_human, get_ready_queue_for_scope_set, get_scoped_ready_queue,
-    get_task_activity_by_turn, get_unclosed_subtasks, has_subtasks,
-    resolve_task_id, resolve_task_id_in_graph, ScopeSet,
+    find_task, get_current_scope_set, get_in_progress, get_ready_queue_for_scope_set, get_subtasks,
 };
-#[allow(unused_imports)]
-pub use runner::{run_task_async_with_output, task_run_async, terminate_background_task};
-#[allow(unused_imports)]
-pub use storage::{ensure_tasks_branch, read_events, read_events_with_ids, write_event, write_events_batch, write_link_event, write_link_event_with_autorun, EventWithId};
-#[allow(unused_imports)]
-pub use types::{Task, TaskActivity, TaskComment, TaskEvent, TaskOutcome, TaskPriority, TaskReference, TaskStatus};
 pub use md::MdBuilder;
+pub use revset::build_task_revset_pattern_with_graph;
+pub use storage::{
+    read_events, read_events_with_ids, write_event, write_link_event, write_link_event_with_autorun,
+};
+pub use types::{
+    Task, TaskActivity, TaskComment, TaskEvent, TaskOutcome, TaskPriority, TaskStatus,
+};
 
 use crate::error::{AikiError, Result};
 use crate::events::{AikiEvent, AikiTaskStartedPayload, TaskEventPayload};
@@ -50,17 +52,15 @@ pub fn current_turn_id(session_id: Option<&str>) -> Option<String> {
     let sid = session_id?;
     let (turn_number, _) =
         crate::history::get_current_turn_info(&crate::global::global_aiki_dir(), sid).ok()?;
-    Some(crate::session::turn_state::generate_turn_id(sid, turn_number))
+    Some(crate::session::turn_state::generate_turn_id(
+        sid,
+        turn_number,
+    ))
 }
 
 /// Result of starting tasks via `start_task_core`
 #[derive(Debug, Clone)]
-pub struct StartTaskResult {
-    /// Tasks that were started
-    pub started: Vec<Task>,
-    /// The actual task IDs that were started (may differ from input if parent task with subtasks)
-    pub started_ids: Vec<String>,
-}
+pub struct StartTaskResult;
 
 /// Core task start logic. Validates tasks and emits Started events.
 ///
@@ -77,7 +77,7 @@ pub struct StartTaskResult {
 /// - Quick-start (description → new task) - caller should create task first
 /// - Template creation - caller should create from template first
 /// - Reopen logic - caller should reopen before calling this
-/// - Parent/subtask handling (.0 decompose task) - caller should handle this
+/// - Parent/subtask handling - caller should handle stale subtask cleanup
 ///
 /// # Arguments
 /// * `cwd` - Working directory
@@ -106,12 +106,6 @@ pub fn start_task_core(cwd: &Path, task_ids: &[String]) -> Result<StartTaskResul
     let session_match = find_active_session(cwd);
     let our_session_id = session_match.as_ref().map(|m| m.session_id.clone());
 
-    // Get tasks for result
-    let started_tasks: Vec<Task> = task_ids
-        .iter()
-        .filter_map(|id| find_task(&tasks, id).ok().cloned())
-        .collect();
-
     // Query current turn ID from session
     let turn_id = current_turn_id(our_session_id.as_deref());
 
@@ -129,6 +123,8 @@ pub fn start_task_core(cwd: &Path, task_ids: &[String]) -> Result<StartTaskResul
         agent_type: agent_type_str,
         session_id,
         turn_id,
+        working_copy: crate::jj::get_working_copy_snapshot_rev(cwd),
+        instructions: None,
         timestamp,
     };
     write_event(cwd, &start_event)?;
@@ -157,10 +153,7 @@ pub fn start_task_core(cwd: &Path, task_ids: &[String]) -> Result<StartTaskResul
         }
     }
 
-    Ok(StartTaskResult {
-        started: started_tasks,
-        started_ids: task_ids.to_vec(),
-    })
+    Ok(StartTaskResult)
 }
 
 /// Reopen a task if it is closed. No-op if the task is not closed or not found.
@@ -183,6 +176,31 @@ pub fn reopen_if_closed(
             write_event(cwd, &reopen_event)?;
         }
     }
+    Ok(())
+}
+
+/// Close a task as won't-do with a summary comment.
+pub fn close_task_as_wont_do(cwd: &Path, task_id: &str, summary: &str) -> Result<()> {
+    let timestamp = chrono::Utc::now();
+
+    let comment_event = TaskEvent::CommentAdded {
+        task_ids: vec![task_id.to_string()],
+        text: summary.to_string(),
+        data: std::collections::HashMap::new(),
+        timestamp: timestamp - chrono::Duration::milliseconds(1),
+    };
+    write_event(cwd, &comment_event)?;
+
+    let close_event = TaskEvent::Closed {
+        task_ids: vec![task_id.to_string()],
+        outcome: TaskOutcome::WontDo,
+        confidence: None,
+        summary: Some(summary.to_string()),
+        session_id: None,
+        turn_id: None,
+        timestamp,
+    };
+    write_event(cwd, &close_event)?;
     Ok(())
 }
 

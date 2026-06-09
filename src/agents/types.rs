@@ -11,11 +11,17 @@ use std::fmt;
 /// This is the canonical enum used throughout the codebase.
 /// Naming uses `ClaudeCode` (not `Claude`) to match CLI conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum AgentType {
+    #[serde(alias = "ClaudeCode")]
     ClaudeCode,
+    #[serde(alias = "Codex")]
     Codex,
+    #[serde(alias = "Cursor")]
     Cursor,
+    #[serde(alias = "Gemini")]
     Gemini,
+    #[serde(alias = "Unknown")]
     Unknown,
 }
 
@@ -69,7 +75,7 @@ impl AgentType {
             AgentType::Codex => "noreply@openai.com",
             AgentType::Cursor => "noreply@cursor.com",
             AgentType::Gemini => "noreply@google.com",
-            AgentType::Unknown => "noreply@aiki.dev",
+            AgentType::Unknown => "noreply@aiki.sh",
         }
     }
 
@@ -88,6 +94,54 @@ impl AgentType {
             AgentType::Cursor => "Cursor",
             AgentType::Gemini => "Gemini",
             AgentType::Unknown => "Unknown",
+        }
+    }
+
+    /// Get the CLI binary name for spawnable agents.
+    ///
+    /// Returns `Some("binary")` for agents that have a runtime and can be spawned,
+    /// `None` for agents that can't be spawned (e.g., Cursor, Gemini).
+    #[must_use]
+    pub fn cli_binary(&self) -> Option<&'static str> {
+        match self {
+            AgentType::ClaudeCode => Some("claude"),
+            AgentType::Codex => Some("codex"),
+            AgentType::Cursor | AgentType::Gemini | AgentType::Unknown => None,
+        }
+    }
+
+    /// Check if this agent's CLI binary is available on PATH.
+    ///
+    /// Returns `true` only for spawnable agents whose binary is found.
+    /// Does NOT run `--version` or any other subcommand — just checks existence.
+    #[must_use]
+    pub fn is_installed(&self) -> bool {
+        let Some(binary) = self.cli_binary() else {
+            return false;
+        };
+        which::which(binary).is_ok()
+    }
+
+    /// Get platform-specific install instructions for this agent
+    #[must_use]
+    pub fn install_hint(&self) -> String {
+        match self {
+            AgentType::ClaudeCode => {
+                if cfg!(target_os = "macos") {
+                    "Install: brew install claude-code (or: npm install -g @anthropic-ai/claude-code)".to_string()
+                } else {
+                    "Install: npm install -g @anthropic-ai/claude-code".to_string()
+                }
+            }
+            AgentType::Codex => "Install: npm install -g @openai/codex".to_string(),
+            AgentType::Cursor => {
+                "Install Cursor from https://cursor.com (task execution not yet supported)"
+                    .to_string()
+            }
+            AgentType::Gemini => "Gemini task execution not yet supported".to_string(),
+            AgentType::Unknown => {
+                "No install instructions available for unknown agent type".to_string()
+            }
         }
     }
 }
@@ -191,7 +245,10 @@ mod tests {
 
     #[test]
     fn test_agent_type_from_str() {
-        assert_eq!(AgentType::from_str("claude-code"), Some(AgentType::ClaudeCode));
+        assert_eq!(
+            AgentType::from_str("claude-code"),
+            Some(AgentType::ClaudeCode)
+        );
         assert_eq!(AgentType::from_str("claude"), Some(AgentType::ClaudeCode));
         assert_eq!(AgentType::from_str("CLAUDE"), Some(AgentType::ClaudeCode));
         assert_eq!(AgentType::from_str("codex"), Some(AgentType::Codex));
@@ -225,9 +282,39 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_type_deserializes_legacy_pascal_case() {
+        assert_eq!(
+            serde_yaml::from_str::<AgentType>("ClaudeCode").unwrap(),
+            AgentType::ClaudeCode
+        );
+        assert_eq!(
+            serde_yaml::from_str::<AgentType>("Codex").unwrap(),
+            AgentType::Codex
+        );
+        assert_eq!(
+            serde_yaml::from_str::<AgentType>("Cursor").unwrap(),
+            AgentType::Cursor
+        );
+        assert_eq!(
+            serde_yaml::from_str::<AgentType>("Gemini").unwrap(),
+            AgentType::Gemini
+        );
+        assert_eq!(
+            serde_yaml::from_str::<AgentType>("Unknown").unwrap(),
+            AgentType::Unknown
+        );
+    }
+
+    #[test]
     fn test_assignee_from_str() {
-        assert_eq!(Assignee::from_str("claude-code"), Some(Assignee::Agent(AgentType::ClaudeCode)));
-        assert_eq!(Assignee::from_str("claude"), Some(Assignee::Agent(AgentType::ClaudeCode)));
+        assert_eq!(
+            Assignee::from_str("claude-code"),
+            Some(Assignee::Agent(AgentType::ClaudeCode))
+        );
+        assert_eq!(
+            Assignee::from_str("claude"),
+            Some(Assignee::Agent(AgentType::ClaudeCode))
+        );
         assert_eq!(Assignee::from_str("human"), Some(Assignee::Human));
         assert_eq!(Assignee::from_str("me"), Some(Assignee::Human));
         assert_eq!(Assignee::from_str(""), Some(Assignee::Unassigned));
@@ -261,7 +348,10 @@ mod tests {
 
     #[test]
     fn test_assignee_as_str() {
-        assert_eq!(Assignee::Agent(AgentType::ClaudeCode).as_str(), Some("claude-code"));
+        assert_eq!(
+            Assignee::Agent(AgentType::ClaudeCode).as_str(),
+            Some("claude-code")
+        );
         assert_eq!(Assignee::Human.as_str(), Some("human"));
         assert_eq!(Assignee::Unassigned.as_str(), None);
     }

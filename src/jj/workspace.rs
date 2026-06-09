@@ -65,6 +65,19 @@ impl JJWorkspace {
 
         Ok(())
     }
+
+    /// Check whether the JJ workspace has the expected non-colocated structure.
+    ///
+    /// Returns `true` if `.jj/repo/store/type` exists and the internal git
+    /// backend directory (`.jj/repo/store/git`) is present. Returns `false`
+    /// if the workspace is missing critical files (broken) or was initialized
+    /// in colocated mode (e.g. by a newer jj that defaults to `--colocate`).
+    #[must_use]
+    pub fn is_healthy_non_colocated(&self) -> bool {
+        let store_type = self.workspace_root.join(".jj/repo/store/type");
+        let internal_git = self.workspace_root.join(".jj/repo/store/git");
+        store_type.is_file() && internal_git.is_dir()
+    }
 }
 
 #[cfg(test)]
@@ -157,5 +170,29 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let workspace = JJWorkspace::new(temp_dir.path());
         assert_eq!(workspace.workspace_root(), temp_dir.path());
+    }
+
+    #[test]
+    fn healthy_non_colocated_after_init() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = JJWorkspace::new(temp_dir.path());
+        workspace.init().unwrap();
+
+        assert!(
+            workspace.is_healthy_non_colocated(),
+            "Workspace should be healthy after init"
+        );
+    }
+
+    #[test]
+    fn unhealthy_when_jj_dir_empty() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::create_dir(temp_dir.path().join(".jj")).unwrap();
+
+        let workspace = JJWorkspace::new(temp_dir.path());
+        assert!(
+            !workspace.is_healthy_non_colocated(),
+            "Empty .jj should not be healthy"
+        );
     }
 }

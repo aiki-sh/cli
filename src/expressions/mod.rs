@@ -1,4 +1,4 @@
-use rhai::{Dynamic, Engine, Map, Scope, AST};
+use rhai::{Dynamic, Engine, Map, Scope, Token, AST};
 use std::collections::{BTreeMap, HashMap};
 
 /// Unified expression evaluator backed by Rhai.
@@ -37,6 +37,14 @@ impl ExpressionEvaluator {
         // - Simple undefined vars are falsy
         // - `not undefined_var` → `!false` → true
         // - Boolean operators short-circuit correctly with undefined vars
+        // Remap reserved keywords (like "thread") to identifiers when used
+        // as property names in dotted access (e.g., session.thread.tail).
+        #[allow(deprecated)]
+        engine.on_parse_token(|token, _pos, _state| match token {
+            Token::Reserved(ref s) if &**s == "thread" => Token::Identifier(s.clone()),
+            _ => token,
+        });
+
         #[allow(deprecated)]
         engine.on_var(|name, _index, context| {
             if context.scope().contains(name) {
@@ -339,7 +347,11 @@ fn ensure_scope_defaults(expr: &str, scope: &mut Scope) {
                     i += 1;
                 }
                 segments.push(expr[start..i].to_string());
-                if i < len && bytes[i] == b'.' && i + 1 < len && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_') {
+                if i < len
+                    && bytes[i] == b'.'
+                    && i + 1 < len
+                    && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
+                {
                     i += 1; // skip the dot
                 } else {
                     break;
@@ -349,7 +361,10 @@ fn ensure_scope_defaults(expr: &str, scope: &mut Scope) {
             let top = &segments[0];
 
             // Skip Rhai keywords
-            if matches!(top.as_str(), "true" | "false" | "if" | "else" | "in" | "let" | "const" | "fn" | "this") {
+            if matches!(
+                top.as_str(),
+                "true" | "false" | "if" | "else" | "in" | "let" | "const" | "fn" | "this"
+            ) {
                 continue;
             }
 
@@ -412,7 +427,8 @@ fn ensure_scope_defaults(expr: &str, scope: &mut Scope) {
 fn insert_false_at_path(map: &mut Map, path: &[String]) {
     if path.len() == 1 {
         let key = path[0].as_str();
-        map.entry(key.into()).or_insert_with(|| Dynamic::from(false));
+        map.entry(key.into())
+            .or_insert_with(|| Dynamic::from(false));
     } else if path.len() > 1 {
         let key = path[0].as_str();
         let entry = map

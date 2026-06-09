@@ -1,6 +1,42 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// Format the error message for tasks missing instructions in a thread
+fn format_missing_instructions(missing: &[(String, String)]) -> String {
+    let count = missing.len();
+    let mut msg = format!(
+        "{count} task(s) in this thread are missing instructions:"
+    );
+    for (id, title) in missing {
+        msg.push_str(&format!("\n  - {id} — {title}"));
+    }
+    msg.push_str(
+        "\n\n\
+         Every task MUST have instructions before you run it — even tasks you create yourself.\n\
+         Instructions record your intent and context so that:\n\
+         - If the session crashes or is interrupted, another agent can pick up the work\n\
+         - If the task is retried, the new agent has full context without your conversation history\n\
+         - Reviewers can understand what was intended vs what was done",
+    );
+    // TODO(run-single-shot): restore `aiki run <id> --instructions` suggestion
+    // when ops/now/run-single-shot.md lands (adds --instructions flag to Run).
+    if count == 1 {
+        let id = &missing[0].0;
+        msg.push_str(&format!(
+            "\n\n\
+             Set instructions before running:\n  \
+             aiki task set {id} -i \"<describe what the agent should do>\""
+        ));
+    } else {
+        msg.push_str(
+            "\n\n\
+             Set instructions on each task before running:\n  \
+             aiki task set <id> -i \"<describe what the agent should do>\"",
+        );
+    }
+    msg
+}
+
 /// Format a call stack for display in error messages
 fn format_call_stack(stack: &[String]) -> String {
     if stack.is_empty() {
@@ -20,15 +56,7 @@ fn format_call_stack(stack: &[String]) -> String {
 
 /// Aiki-specific errors with structured error types
 #[derive(Error, Debug)]
-#[allow(dead_code)] // Error variants exist for API completeness
 pub enum AikiError {
-    // Repository errors
-    #[error("Not in a JJ repository. Run 'jj init' or 'aiki init' first")]
-    NotInJjRepo,
-
-    #[error("Failed to initialize JJ workspace")]
-    JjInitFailed,
-
     // File errors
     #[error("File not found: {0}")]
     FileNotFound(PathBuf),
@@ -60,12 +88,6 @@ pub enum AikiError {
     #[error("Invalid variable name: '{0}'. Variable names must start with a letter or underscore, and contain only letters, numbers, and underscores")]
     InvalidVariableName(String),
 
-    #[error("Invalid condition: {0}")]
-    InvalidCondition(String),
-
-    #[error("Action failed with on_failure: stop")]
-    ActionFailed,
-
     // Message assembly errors
     #[error("Invalid message chunk: {0}")]
     InvalidContextChunk(String),
@@ -96,53 +118,20 @@ pub enum AikiError {
     #[error("jj command failed: {0}")]
     JjCommandFailed(String),
 
-    #[error("jj status failed: {0}")]
-    JjStatusFailed(String),
-
-    #[error("git diff failed: {0}")]
-    GitDiffFailed(String),
-
     #[error("Failed to create isolated workspace: {0}")]
     WorkspaceCreationFailed(String),
 
     #[error("Failed to absorb workspace changes: {0}")]
     WorkspaceAbsorbFailed(String),
 
-    // Signing/GPG errors
-    #[error("GPG-SM key generation not yet supported. Use --key to specify an existing key")]
-    GpgSmNotSupported,
-
-    #[error("SSH key file not found: {0}")]
-    SshKeyNotFound(PathBuf),
-
-    #[error("No user.email configured in git config")]
-    NoUserEmailConfigured,
-
-    #[error("Git user.name or user.email not configured")]
-    GitUserNotConfigured,
-
-    #[error("Could not extract key ID from GPG output")]
-    GpgKeyIdExtractionFailed,
-
-    #[error("Failed to generate GPG key: {0}")]
-    GpgKeyGenerationFailed(String),
-
-    #[error("Failed to locate SSH signing key: {0}")]
-    SshKeyLocationFailed(String),
-
-    // Configuration errors
-    #[error("Failed to read config file: {0}")]
-    ConfigReadFailed(String),
-
-    #[error("Failed to write config file: {0}")]
-    ConfigWriteFailed(String),
+    #[error("Lock failed: {0}")]
+    LockFailed(String),
 
     // Hook composition errors (Milestone 1.3)
-    #[error("Not in an Aiki project. No .aiki/ directory found searching upward from: {searched_from}")]
+    #[error(
+        "Not in an Aiki project. No .aiki/ directory found searching upward from: {searched_from}"
+    )]
     NotInAikiProject { searched_from: PathBuf },
-
-    #[error("Invalid path: '{path}'. {reason}")]
-    InvalidPath { path: String, reason: String },
 
     #[error("Invalid hook path: '{path}'. {reason}")]
     InvalidHookPath { path: String, reason: String },
@@ -193,18 +182,37 @@ Alternatively, install the agent globally:
     #[error("Unsupported platform: {0}")]
     UnsupportedPlatform(String),
 
+    // Plugin errors
+    #[error("Failed to auto-fetch plugin '{plugin}': {reason}")]
+    AutoFetchFailed { plugin: String, reason: String },
+
+    /// Like `AutoFetchFailed` but from a disk-persisted marker. The warning was
+    /// already printed on the first failure; callers should skip silently.
+    #[error("Plugin '{plugin}' previously failed to fetch: {reason}")]
+    AutoFetchCached { plugin: String, reason: String },
+
+    #[error("{plugin} is a dependency of: {dependents}. Use --force to remove anyway.")]
+    PluginHasDependents { plugin: String, dependents: String },
+
     // Argument validation errors
     #[error("{0}")]
     InvalidArgument(String),
+
+    #[error("Missing required argument: {0}")]
+    MissingArgument(String),
 
     // Task system errors
     #[error("Task not found: '{0}'")]
     TaskNotFound(String),
 
     #[error("Ambiguous task ID prefix '{prefix}' — matches {count} tasks:\n{matches}")]
-    AmbiguousTaskId { prefix: String, count: usize, matches: String },
+    AmbiguousTaskId {
+        prefix: String,
+        count: usize,
+        matches: String,
+    },
 
-    #[error("Task '{root}' has no subtask '.{subtask}'")]
+    #[error("Task '{root}' has no subtask '{subtask}'")]
     SubtaskNotFound { root: String, subtask: String },
 
     #[error("Task ID prefix '{prefix}' is too short (minimum 3 characters)")]
@@ -212,12 +220,6 @@ Alternatively, install the agent globally:
 
     #[error("No tasks in ready queue")]
     NoTasksReady,
-
-    #[error("Failed to initialize aiki/tasks branch: {0}")]
-    TaskBranchInitFailed(String),
-
-    #[error("Failed to parse task event: {0}")]
-    TaskEventParseFailed(String),
 
     #[error("{0}")]
     TaskCommentRequired(String),
@@ -248,28 +250,22 @@ Alternatively, install the agent globally:
     },
 
     #[error("Invalid link target for '{kind}': '{target}' is not a task. {kind} links require a task ID as target")]
-    InvalidLinkTarget {
-        kind: String,
-        target: String,
-    },
+    InvalidLinkTarget { kind: String, target: String },
 
     #[error("Link would create a cycle in '{kind}' links")]
-    LinkCycle {
-        kind: String,
-    },
+    LinkCycle { kind: String },
 
     #[error("Task '{0}' has no assignee and no --agent specified")]
     TaskNoAssignee(String),
 
-    #[error("Agent '{0}' does not support task execution")]
-    AgentNotSupported(String),
+    #[error("No agent CLIs found. Install claude-code or codex to continue.")]
+    NoAgentsAvailable,
+
+    #[error("Agent '{agent}' is not available.\n  {hint}")]
+    AgentNotInstalled { agent: String, hint: String },
 
     #[error("Failed to spawn agent: {0}")]
     AgentSpawnFailed(String),
-
-    // History/conversation errors
-    #[error("Failed to initialize aiki/conversations branch: {0}")]
-    ConversationsBranchInitFailed(String),
 
     #[error("Cannot resolve --source prompt: no active session found. Use --source prompt:<change_id> to specify explicitly.")]
     NoActiveSessionForPromptSource,
@@ -293,10 +289,7 @@ Alternatively, install the agent globally:
     },
 
     #[error("Variable '{variable}' not found: {hint}")]
-    VariableNotFound {
-        variable: String,
-        hint: String,
-    },
+    VariableNotFound { variable: String, hint: String },
 
     #[error("Invalid template frontmatter\n  File: {file}\n  {details}")]
     TemplateFrontmatterInvalid { file: String, details: String },
@@ -304,7 +297,7 @@ Alternatively, install the agent globally:
     #[error("Invalid template structure\n  File: {file}\n  {details}")]
     TemplateStructureInvalid { file: String, details: String },
 
-    #[error("No templates directory found at: {path}")]
+    #[error("No tasks directory found at: {path}")]
     TemplatesDirectoryNotFound { path: String },
 
     #[error("Template processing failed: {details}")]
@@ -330,6 +323,9 @@ Alternatively, install the agent globally:
     #[error("Nothing to review - no closed tasks in session")]
     NothingToReview,
 
+    #[error("{0}")]
+    ReviewIssuesMissing(String),
+
     // Plugin errors
     #[error("Invalid plugin reference: '{reference}'. {reason}")]
     InvalidPluginRef { reference: String, reason: String },
@@ -339,6 +335,12 @@ Alternatively, install the agent globally:
 
     #[error("Plugin operation failed for '{plugin}': {details}")]
     PluginOperationFailed { plugin: String, details: String },
+
+    // Thread validation errors
+    #[error("{}", format_missing_instructions(.missing))]
+    ThreadMissingInstructions {
+        missing: Vec<(String, String)>, // Vec of (task_id, title)
+    },
 
     // Generic wrapper for underlying errors
     #[error(transparent)]
@@ -354,15 +356,6 @@ pub type Result<T> = std::result::Result<T, AikiError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_error_display() {
-        let err = AikiError::NotInJjRepo;
-        assert_eq!(
-            err.to_string(),
-            "Not in a JJ repository. Run 'jj init' or 'aiki init' first"
-        );
-    }
 
     #[test]
     fn test_unknown_agent_type() {
@@ -470,7 +463,7 @@ mod tests {
             subtask: "99".to_string(),
         };
         let msg = err.to_string();
-        assert!(msg.contains("has no subtask '.99'"));
+        assert!(msg.contains("has no subtask '99'"));
     }
 
     #[test]

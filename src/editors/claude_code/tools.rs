@@ -85,11 +85,8 @@ pub struct LsToolInput {
 
 /// Tool input for WebFetch tool
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)] // Fields needed for serde deserialization
 pub struct WebFetchToolInput {
     pub url: String,
-    #[serde(default)]
-    pub prompt: Option<String>,
 }
 
 /// Tool input for WebSearch tool
@@ -142,10 +139,8 @@ pub enum ClaudeTool {
     WebSearch(WebSearchToolInput),
 
     // Other tools
-    #[allow(dead_code)] // Field stores tool name for potential future use
-    Internal(String), // Task, TodoRead, TodoWrite - store tool name
-    #[allow(dead_code)] // Field stores tool name for potential future use
-    Mcp(String),      // MCP tools - store tool name
+    Internal, // Task, TodoRead, TodoWrite
+    Mcp,      // MCP tools
 
     // Unknown or failed parse
     Unknown(String), // Store tool name for error reporting
@@ -189,10 +184,12 @@ impl ClaudeTool {
             "WebSearch" => try_parse(ClaudeTool::WebSearch, input_json),
 
             // Internal tools
-            "Task" | "TodoRead" | "TodoWrite" => Some(ClaudeTool::Internal(tool_name.to_string())),
+            "Task" | "TodoRead" | "TodoWrite" | "EnterPlanMode" | "ExitPlanMode" => {
+                Some(ClaudeTool::Internal)
+            }
 
             // MCP tools follow naming convention: mcp__<server>__<tool>
-            _ if tool_name.starts_with("mcp__") => Some(ClaudeTool::Mcp(tool_name.to_string())),
+            _ if tool_name.starts_with("mcp__") => Some(ClaudeTool::Mcp),
 
             // Unknown tool - warn and treat as internal to skip silently
             // This helps detect when Claude Code adds new native tools
@@ -222,8 +219,8 @@ impl ClaudeTool {
             | ClaudeTool::LS(_) => ToolType::File,
             ClaudeTool::Bash(_) => ToolType::Shell,
             ClaudeTool::WebFetch(_) | ClaudeTool::WebSearch(_) => ToolType::Web,
-            ClaudeTool::Internal(_) => ToolType::Internal,
-            ClaudeTool::Mcp(_) => ToolType::Mcp,
+            ClaudeTool::Internal => ToolType::Internal,
+            ClaudeTool::Mcp => ToolType::Mcp,
             ClaudeTool::Unknown(_) => ToolType::Internal, // Treat as internal to skip silently
         }
     }

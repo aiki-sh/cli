@@ -47,32 +47,39 @@ pub fn execute_hook(
     }
 
     // Step 2: Try to execute user's .aiki/hooks.yml
-    match HookLoader::with_start_dir(state.cwd()) {
+    let outcome = match HookLoader::with_start_dir(state.cwd()) {
         Ok(mut loader) => {
             let hookfile_path = loader.project_root().join(".aiki/hooks.yml");
             let mut composer = HookComposer::new(&mut loader);
 
             // No user hooks.yml - just return core result
             if !hookfile_path.exists() {
-                return Ok(core_result);
-            }
+                core_result
+            } else {
+                // Execute user's hooks.yml
+                debug_log(|| "Executing user's .aiki/hooks.yml");
+                let user_result =
+                    composer.compose_hook_from_path(&hookfile_path, event_type, state)?;
 
-            // Execute user's hooks.yml
-            debug_log(|| "Executing user's .aiki/hooks.yml");
-            let user_result =
-                composer.compose_hook_from_path(&hookfile_path, event_type, state)?;
-
-            // Combine results: if either failed, return the failure
-            match (core_result, user_result) {
-                (HookOutcome::Success, user) => Ok(user),
-                (core, HookOutcome::Success) => Ok(core),
-                (_, user_fail) => Ok(user_fail), // User failure takes precedence
+                // Combine results: if either failed, return the failure
+                match (core_result, user_result) {
+                    (HookOutcome::Success, user) => user,
+                    (core, HookOutcome::Success) => core,
+                    (_, user_fail) => user_fail, // User failure takes precedence
+                }
             }
         }
         Err(AikiError::NotInAikiProject { .. }) => {
             // Not in an Aiki project - just return core result
-            Ok(core_result)
+            core_result
         }
-        Err(e) => Err(e),
-    }
+        Err(e) => return Err(e),
+    };
+
+    // Execute any pending session terminations queued by session.end actions.
+    // Runs after ALL hooks (core + user) complete so the agent isn't killed
+    // mid-hook. Handlers no longer need to call this themselves.
+    state.execute_pending_session_ends();
+
+    Ok(outcome)
 }

@@ -41,8 +41,8 @@ pub fn install_project_plugins(project_root: &Path) -> Result<usize> {
     let mut all_failures: Vec<(PluginRef, String)> = Vec::new();
 
     for plugin in &refs {
-        let report = super::deps::install_with_deps(plugin, &plugins_base)?;
-        for p in &report.installed {
+        let report = super::install(plugin, &plugins_base, Some(project_root), None)?;
+        for (p, _) in &report.installed {
             if refs.iter().any(|r| r == p) {
                 println!("Installed plugin: {}", p);
             } else {
@@ -64,7 +64,11 @@ pub fn install_project_plugins(project_root: &Path) -> Result<usize> {
             .join("; ");
         return Err(crate::error::AikiError::PluginOperationFailed {
             plugin: "project plugins".to_string(),
-            details: format!("{} plugin(s) failed to install: {}", all_failures.len(), details),
+            details: format!(
+                "{} plugin(s) failed to install: {}",
+                all_failures.len(),
+                details
+            ),
         });
     }
 

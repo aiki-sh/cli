@@ -1,98 +1,84 @@
-# Optimizing Rust Builds on macOS (Apple Silicon)
+45
+23
+> ⚠️ **EXPERIMENTAL** — This repo is under active development. Reach out to glasner@aiki.sh if you have issues.
 
-## Step 1: Disable XProtect for Terminal (Biggest Win)
+# Aiki: Structured AI coding with safe defaults
 
-macOS scans every new binary for malware via XProtect. This adds seconds per
-build script and can make test suites 2-3x slower.
+Aiki gives teams a practical way to let AI edit code without losing control.
+It provides a structured workflow for planning, executing, reviewing, and fixing
+AI-suggested work, while keeping the whole process visible, attributable, and
+safe to adapt.
 
-**Fix:** Add your terminal app as a Developer Tool.
+## What Aiki is
 
-```bash
-open "x-apple.systempreferences:com.apple.preference.security?Privacy_DevTools"
-```
+Aiki is a layer on top of your repo and your AI tools that turns AI edits into
+trackable work:
 
-Toggle on your terminal app (Terminal, iTerm, etc.). Restart the terminal.
+- **Opinionated defaults** for task tracking, provenance, and review/fix loops
+- **Consistent handoffs** across Claude Code, Codex, and other agents
+- **Safe concurrency** via isolated sessions and session-aware workflows
 
-Reference: https://nnethercote.github.io/2025/09/04/faster-rust-builds-on-mac.html
+## Why it matters
 
-## Step 2: Use lld for Debug Builds
+Most teams start with fast AI code changes and immediately lose one of two things:
 
-The default Apple linker is slower than LLVM's `lld` for incremental debug
-builds. Expected improvement: 20-50% faster linking.
+1. **Context** — what changed, why, and who changed it
+2. **Quality control** — why some changes are reviewed, others are skipped
 
-```bash
-brew install llvm
-```
+Aiki addresses both by giving AI work a workflow shape that stays
+human-readable: every change is attached to a task, reviewed in a loop, and
+recorded in history.
 
-Add to your project's `.cargo/config.toml`:
+## What changes when you use Aiki
 
-```toml
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/llvm/bin/ld64.lld"]
-```
+When your team adopts Aiki:
 
-## Step 3: Enable sccache
+- Every AI task is started, described, and tracked as a task.
+- You can inspect work in real time (`aiki task show`), and review exact edits
+  (`aiki task diff`).
+- Reviews and fixes become part of the same workflow instead of a separate ad hoc step.
+- You retain control points (`aiki doctor`, stop conditions, and review gates)
+  without removing automation.
 
-Caches compiled crates across builds. Unchanged crates are skipped entirely on
-subsequent builds.
+### Why JJ fits well
 
-```bash
-cargo install sccache
-```
+Aiki is built on a change-based workflow (Jujutsu/JJ). That makes AI edits
+naturally reviewable and reversible: each task creates a JJ change record with
+stable IDs, so provenance, reruns, and follow-up fixes are easier to track.
 
-Add to `~/.cargo/config.toml` (global):
+## Opinionated defaults, composable underneath
 
-```toml
-[build]
-rustc-wrapper = "sccache"
-```
+Aiki starts with sensible defaults for teams that want guardrails out of the box,
+and gives you extension points when you want more control:
 
-## Step 4: Disable Spotlight Indexing for Project Directories
+- **Customize behavior** via flow hooks in `.aiki/hooks.yml`.
+- **Adapt templates** and **extend with plugins** to encode team-specific policies.
+- **Build your own agent harness** by composing primitives (task links, hooks,
+  templates) instead of rewriting core behavior.
 
-Spotlight indexes build artifacts in `target/`, causing unnecessary I/O
-contention during builds.
+## Run your first workflow (about 2 minutes)
 
-```bash
-mdutil -i off ~/path/to/project
-```
+1. Follow **[Getting Started](docs/getting-started.md)** to install and bootstrap.
+2. In one repo: `aiki init` and then `aiki doctor`.
+3. Run a tiny change in your chat workflow and verify:
+   - `aiki task show <task-id>`
+   - `aiki task diff <task-id>`
 
-Or: System Settings > Siri & Spotlight > Spotlight Privacy > add project folders.
+## Two paths, same foundation
 
-## Step 5: Kill Claude Code Zombie Processes
+### 1) Chat mode (human-in-the-loop)
+Use AI interactively in your editor, with task-level traceability and review
+readiness built in.
 
-Claude Code has a known idle CPU bug where each instance pins ~100% of one CPU
-core even when idle. On a MacBook Air M4 with only 4 performance cores, stale
-sessions quickly starve builds.
+### 2) Headless mode (Plan → Build → Review → Fix)
+Use `aiki plan`, `aiki build`, and `aiki review`/`aiki fix` for repeatable
+spec-to-implementation runs.
 
-```bash
-pkill -f claude
-```
+## Next: deeper docs
 
-Alias for convenience:
-
-```bash
-echo 'alias cc-kill="pkill -f claude"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-Run `cc-kill` between sessions to reclaim cores.
-
-## Step 6: Keep Rust Up to Date
-
-The Rust compiler receives regular performance improvements. As of Rust 1.90+,
-LLD is the default linker on Linux (macOS still requires manual setup per
-Step 2).
-
-```bash
-rustup update stable
-```
-
-## Expected Impact
-
-| Optimization           | Impact                            |
-|------------------------|-----------------------------------|
-| XProtect fix           | Up to 2-3x faster test execution  |
-| lld linker             | 20-50% faster incremental linking |
-| sccache                | Skip unchanged crate compilation  |
-| Spotlight off           | Less I/O contention during builds |
-| Kill zombie processes  | Reclaim CPU cores for builds      |
+- **[Getting Started](docs/getting-started.md)** — install and first run
+- **[SDLC: Plan, Build, Review, Fix](docs/sdlc.md)** — end-to-end flow model
+- **[Customizing Defaults](docs/customizing-defaults.md)** — hook/events and custom flow behavior
+- **[Creating Plugins](docs/creating-plugins.md)** — packages for reusable harness logic
+- **[Task Types and Links](docs/tasks/kinds.md)** — dependency and review graph semantics
+- **[Session Isolation Workflow](docs/session-isolation.md)** — safe multi-agent execution

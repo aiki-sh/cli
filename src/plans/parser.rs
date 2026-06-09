@@ -5,10 +5,10 @@ use std::path::Path;
 /// Parsed metadata from a plan markdown file.
 #[derive(Debug, Clone)]
 pub struct PlanMetadata {
+    /// The path that was parsed
+    pub path: String,
     /// Title extracted from first H1 heading
     pub title: Option<String>,
-    /// First paragraph after the H1 heading
-    pub description: Option<String>,
     /// Whether the plan is marked as a draft in frontmatter
     pub draft: bool,
 }
@@ -17,20 +17,22 @@ pub struct PlanMetadata {
 ///
 /// Extracts:
 /// - Title: first `# ` heading
-/// - Description: first non-empty paragraph after the title
 pub fn parse_plan_metadata(path: &Path) -> PlanMetadata {
+    let path_str = path.to_string_lossy().to_string();
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => {
             return PlanMetadata {
+                path: path_str,
                 title: None,
-                description: None,
                 draft: false,
             }
         }
     };
 
-    parse_plan_content(&content)
+    let mut meta = parse_plan_content(&content);
+    meta.path = path_str;
+    meta
 }
 
 /// Strip YAML frontmatter from content, returning (frontmatter_yaml, body).
@@ -93,46 +95,17 @@ fn parse_plan_content(content: &str) -> PlanMetadata {
     let draft = frontmatter_yaml.map_or(false, parse_draft_from_yaml);
 
     let mut title = None;
-    let mut description = None;
-    let mut found_h1 = false;
-    let mut desc_lines: Vec<&str> = Vec::new();
-    let mut collecting_desc = false;
 
     for line in body.lines() {
-        if !found_h1 {
-            if let Some(h1_text) = line.strip_prefix("# ") {
-                title = Some(h1_text.trim().to_string());
-                found_h1 = true;
-                collecting_desc = true;
-            }
-            continue;
+        if let Some(h1_text) = line.strip_prefix("# ") {
+            title = Some(h1_text.trim().to_string());
+            break;
         }
-
-        if collecting_desc {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                if !desc_lines.is_empty() {
-                    // End of first paragraph
-                    break;
-                }
-                // Skip blank lines between H1 and first paragraph
-                continue;
-            }
-            // Stop if we hit another heading
-            if trimmed.starts_with('#') {
-                break;
-            }
-            desc_lines.push(trimmed);
-        }
-    }
-
-    if !desc_lines.is_empty() {
-        description = Some(desc_lines.join(" "));
     }
 
     PlanMetadata {
+        path: String::new(),
         title,
-        description,
         draft,
     }
 }
@@ -146,31 +119,7 @@ mod tests {
         let content = "# My Feature\n\nThis is the description of my feature.\n\n## Details\n";
         let meta = parse_plan_content(content);
         assert_eq!(meta.title.as_deref(), Some("My Feature"));
-        assert_eq!(
-            meta.description.as_deref(),
-            Some("This is the description of my feature.")
-        );
         assert!(!meta.draft);
-    }
-
-    #[test]
-    fn test_parse_multiline_description() {
-        let content = "# Feature X\n\nFirst line of desc.\nSecond line of desc.\n\n## Next\n";
-        let meta = parse_plan_content(content);
-        assert_eq!(meta.title.as_deref(), Some("Feature X"));
-        assert_eq!(
-            meta.description.as_deref(),
-            Some("First line of desc. Second line of desc.")
-        );
-        assert!(!meta.draft);
-    }
-
-    #[test]
-    fn test_parse_no_description() {
-        let content = "# Title Only\n\n## Immediately a heading\n";
-        let meta = parse_plan_content(content);
-        assert_eq!(meta.title.as_deref(), Some("Title Only"));
-        assert_eq!(meta.description, None);
     }
 
     #[test]
@@ -178,14 +127,12 @@ mod tests {
         let content = "## Not an H1\n\nSome text.\n";
         let meta = parse_plan_content(content);
         assert_eq!(meta.title, None);
-        assert_eq!(meta.description, None);
     }
 
     #[test]
     fn test_parse_empty() {
         let meta = parse_plan_content("");
         assert_eq!(meta.title, None);
-        assert_eq!(meta.description, None);
         assert!(!meta.draft);
     }
 
@@ -204,7 +151,6 @@ mod tests {
 
         let meta = parse_plan_metadata(&path);
         assert_eq!(meta.title.as_deref(), Some("Test Plan"));
-        assert_eq!(meta.description.as_deref(), Some("A description."));
         assert!(!meta.draft);
     }
 
@@ -212,7 +158,6 @@ mod tests {
     fn test_parse_nonexistent_file() {
         let meta = parse_plan_metadata(Path::new("/nonexistent/path.md"));
         assert_eq!(meta.title, None);
-        assert_eq!(meta.description, None);
     }
 
     // --- Frontmatter tests ---
@@ -222,7 +167,6 @@ mod tests {
         let content = "---\ndraft: true\n---\n\n# My Feature\n\nDescription here.\n";
         let meta = parse_plan_content(content);
         assert_eq!(meta.title.as_deref(), Some("My Feature"));
-        assert_eq!(meta.description.as_deref(), Some("Description here."));
         assert!(meta.draft);
     }
 
@@ -239,7 +183,6 @@ mod tests {
         let content = "---\nstatus: Draft\n---\n\n# My Feature\n\nDescription here.\n";
         let meta = parse_plan_content(content);
         assert_eq!(meta.title.as_deref(), Some("My Feature"));
-        assert_eq!(meta.description.as_deref(), Some("Description here."));
         assert!(!meta.draft);
     }
 
@@ -255,12 +198,14 @@ mod tests {
     fn test_parse_frontmatter_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("draft.md");
-        std::fs::write(&path, "---\ndraft: true\n---\n\n# Draft Plan\n\nStill writing.\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "---\ndraft: true\n---\n\n# Draft Plan\n\nStill writing.\n",
+        )
+        .unwrap();
 
         let meta = parse_plan_metadata(&path);
         assert_eq!(meta.title.as_deref(), Some("Draft Plan"));
-        assert_eq!(meta.description.as_deref(), Some("Still writing."));
         assert!(meta.draft);
     }
 

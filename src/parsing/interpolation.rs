@@ -46,7 +46,7 @@ pub fn parse_template(text: &str) -> Vec<VariableRef> {
                     if c2 == '}' {
                         if chars.peek().map(|(_, ch)| *ch) == Some('}') {
                             chars.next(); // consume second }
-                            // end_pos is byte offset of first }, +2 for both } chars
+                                          // end_pos is byte offset of first }, +2 for both } chars
                             let ref_end = end_pos + 2;
                             found_close = true;
 

@@ -48,20 +48,21 @@ pub fn handle_turn_started(mut payload: AikiTurnStartedPayload) -> Result<HookRe
     // If the latest event for this session is an Autoreply event, set source to Autoreply
     // Defensive: if history lookup fails, we default to User source (no autoreply)
     // Uses global JJ repo at ~/.aiki/.jj/ for cross-repo conversation history
-    let source = match history::has_pending_autoreply(&global::global_aiki_dir(), payload.session.uuid()) {
-        Ok(true) => TurnSource::Autoreply,
-        Ok(false) => TurnSource::User,
-        Err(e) => {
-            debug_log(|| {
-                format!(
-                    "Autoreply check failed for session {}, defaulting to User source: {}",
-                    payload.session.uuid(),
-                    e
-                )
-            });
-            TurnSource::User
-        }
-    };
+    let source =
+        match history::has_pending_autoreply(&global::global_aiki_dir(), payload.session.uuid()) {
+            Ok(true) => TurnSource::Autoreply,
+            Ok(false) => TurnSource::User,
+            Err(e) => {
+                debug_log(|| {
+                    format!(
+                        "Autoreply check failed for session {}, defaulting to User source: {}",
+                        payload.session.uuid(),
+                        e
+                    )
+                });
+                TurnSource::User
+            }
+        };
 
     // Increment turn counter and generate turn_id
     let turn_number = turn_state.start_turn(source.clone());
@@ -119,7 +120,7 @@ pub fn handle_turn_started(mut payload: AikiTurnStartedPayload) -> Result<HookRe
             // Hook execution failed - log warning and use original prompt
             eprintln!("turn.started flow failed: {}", e);
             eprintln!("Continuing with original prompt...\n");
-            // Return built context (already initialized with original prompt)
+            // Return only injected context; the editor already has the original prompt.
             return Ok(HookResult {
                 context: state.build_context(),
                 decision: Decision::Allow,

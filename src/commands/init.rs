@@ -1,16 +1,15 @@
-use crate::commands::agents_template::{AIKI_BLOCK_TEMPLATE, AIKI_BLOCK_VERSION};
 use crate::config;
 use crate::editors::zed as ide_config;
 use crate::error::Result;
 use crate::global;
+use crate::instructions;
 use crate::jj;
-use crate::repos::RepoDetector;
+use crate::prerequisites;
 use crate::repos;
-use crate::signing;
+use crate::repos::RepoDetector;
 use anyhow::Context;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
 use std::path::Path;
 
 /// Default content for .aiki/hooks.yml created by `aiki init`.
@@ -115,6 +114,8 @@ include:
 "#;
 
 pub fn run(quiet: bool) -> Result<()> {
+    prerequisites::check_prerequisites(quiet)?;
+
     // Get current directory
     let current_dir = env::current_dir().context("Failed to get current directory")?;
 
@@ -149,6 +150,12 @@ pub fn run(quiet: bool) -> Result<()> {
             // Even on re-init, ensure hookfile exists
             ensure_hooks_yml(&repo_root, quiet)?;
 
+            // Sync built-in templates on re-init (picks up new/updated templates)
+            crate::tasks::templates::sync::sync_default_templates(&repo_root, quiet)?;
+
+            // Ensure instruction files exist even on re-init
+            instructions::ensure_instruction_files(&repo_root, quiet)?;
+
             if quiet {
                 // Silent success for auto mode
                 return Ok(());
@@ -167,21 +174,30 @@ pub fn run(quiet: bool) -> Result<()> {
 
     // Check if JJ is already initialized
     if RepoDetector::has_jj(&repo_root) {
-        if !quiet {
-            println!("✓ Found existing JJ repository");
+        let workspace = jj::JJWorkspace::new(&repo_root);
+        if workspace.is_healthy_non_colocated() {
+            if !quiet {
+                println!("✓ Found existing JJ repository");
+            }
+        } else {
+            if !quiet {
+                println!("⚠ JJ workspace exists but is not non-colocated");
+                println!("  Warning: if you use jj for version control, removing .jj will delete your jj history");
+                println!("  Run: rm -rf .jj && aiki init");
+            } else {
+                eprintln!(
+                    "Warning: JJ workspace is not non-colocated. Run: rm -rf .jj && aiki init"
+                );
+            }
         }
     } else {
         if !quiet {
             println!("Initializing JJ repository...");
         }
-        // Create JJ workspace manager for the repository root
         let workspace = jj::JJWorkspace::new(&repo_root);
-
-        // Initialize pure JJ storage (independent from Git)
         workspace
             .init()
             .context("Failed to initialize JJ repository")?;
-
         if !quiet {
             println!("✓ Initialized JJ repository");
         }
@@ -218,104 +234,6 @@ pub fn run(quiet: bool) -> Result<()> {
         println!("✓ Configured Git hooks (→ {})", global_hooks.display());
     }
 
-    // Configure commit signing
-    match signing::detect_signing_config()? {
-        Some(signing_config) => {
-            config::update_jj_signing_config(
-                &repo_root,
-                &signing_config.backend.to_string(),
-                Some(&signing_config.key),
-                "own",
-            )?;
-
-            // For SSH backend, create allowed-signers file
-            if matches!(signing_config.backend, signing::SigningBackend::Ssh) {
-                let email = signing::get_user_email(&repo_root)?;
-                signing::create_ssh_allowed_signers(&repo_root, &email, &signing_config.key)?;
-            }
-
-            if !quiet {
-                println!(
-                    "✓ Configured JJ commit signing ({:?})",
-                    signing_config.backend
-                );
-                println!("  Using key: {}", signing_config.key);
-            }
-        }
-        None => {
-            if !quiet {
-                println!("⚠ No signing keys detected");
-                println!();
-                println!("Commit signing provides cryptographic proof of AI authorship.");
-                println!();
-
-                // Check if we're in an interactive terminal
-                let is_interactive = atty::is(atty::Stream::Stdin);
-
-                if !is_interactive {
-                    println!("Run 'aiki doctor --fix' to set up signing interactively.");
-                    println!();
-                    println!("Continuing without signing...");
-                    println!();
-                } else {
-                    println!("What would you like to do?");
-                    println!("  1. Generate new signing key (recommended)");
-                    println!("  2. I have a key, let me specify it manually");
-                    println!("  3. Skip signing for now");
-                    println!();
-
-                    let choice = prompt_choice("Choice", 1, 3)?;
-
-                    match choice {
-                        1 => {
-                            // Launch wizard in generate mode
-                            let wizard = signing::SignSetupWizard::new(repo_root.clone());
-                            wizard.run(None)?;
-                        }
-                        2 => {
-                            // Manual key configuration
-                            println!();
-                            println!("Manual Key Configuration");
-                            println!("========================");
-                            println!();
-
-                            println!("Which backend?");
-                            println!("  1. GPG");
-                            println!("  2. SSH");
-                            println!();
-
-                            let backend_choice = prompt_choice("Choice", 1, 2)?;
-                            let backend = if backend_choice == 1 {
-                                signing::SigningBackend::Gpg
-                            } else {
-                                signing::SigningBackend::Ssh
-                            };
-
-                            let key = prompt_string(
-                                if backend == signing::SigningBackend::Gpg {
-                                    "GPG Key ID (e.g., 4ED556E9729E000F)"
-                                } else {
-                                    "SSH public key path (e.g., ~/.ssh/id_ed25519.pub)"
-                                },
-                                None,
-                            )?;
-
-                            let wizard = signing::SignSetupWizard::new(repo_root.clone());
-                            wizard.run(Some(signing::SetupMode::Manual { backend, key }))?;
-                        }
-                        3 => {
-                            println!();
-                            println!("Skipping signing setup.");
-                            println!("You can set up signing later by running: aiki sign setup");
-                            println!();
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-            }
-        }
-    }
-
     // Configure IDE settings (Zed)
     if !quiet {
         println!("\nConfiguring IDE settings...");
@@ -345,8 +263,19 @@ pub fn run(quiet: bool) -> Result<()> {
         }
         match config::install_otel_receiver() {
             Ok(()) => {
-                if !quiet {
-                    println!("✓ OTel receiver installed (socket-activated on 127.0.0.1:19876)");
+                // Wait for launchd/systemd to actually bind the socket
+                match config::wait_for_otel_receiver() {
+                    Ok(()) => {
+                        if !quiet {
+                            println!("✓ OTel receiver installed (listening on 127.0.0.1:19876)");
+                        }
+                    }
+                    Err(_) => {
+                        if !quiet {
+                            println!("⚠ OTel receiver installed but not yet listening");
+                            println!("  Run: aiki doctor --fix");
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -419,11 +348,17 @@ pub fn run(quiet: bool) -> Result<()> {
     // Ensure hookfile exists for workflow automation
     ensure_hooks_yml(&repo_root, quiet)?;
 
-    // Ensure AGENTS.md has task system instructions
+    // Ensure instruction file has <aiki> block and symlink exists
     if !quiet {
         println!("\nConfiguring agent instructions...");
     }
-    ensure_agents_md(&repo_root, quiet)?;
+    instructions::ensure_instruction_files(&repo_root, quiet)?;
+
+    // Sync built-in templates
+    if !quiet {
+        println!("\nSyncing built-in templates...");
+    }
+    crate::tasks::templates::sync::sync_default_templates(&repo_root, quiet)?;
 
     // Install plugins referenced by project templates
     let plugin_refs = crate::plugins::project::derive_project_plugin_refs(&repo_root);
@@ -457,47 +392,6 @@ pub fn run(quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn prompt_choice(prompt: &str, min: usize, max: usize) -> Result<usize> {
-    loop {
-        print!("{} [{}]: ", prompt, min);
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim();
-
-        if input.is_empty() {
-            return Ok(min);
-        }
-
-        match input.parse::<usize>() {
-            Ok(n) if n >= min && n <= max => return Ok(n),
-            _ => println!("Please enter a number between {} and {}", min, max),
-        }
-    }
-}
-
-fn prompt_string(prompt: &str, default: Option<&str>) -> Result<String> {
-    if let Some(def) = default {
-        print!("{} [{}]: ", prompt, def);
-    } else {
-        print!("{}: ", prompt);
-    }
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let input = input.trim().to_string();
-
-    if input.is_empty() {
-        if let Some(def) = default {
-            return Ok(def.to_string());
-        }
-    }
-
-    Ok(input)
-}
-
 /// Ensure .aiki/hooks.yml exists with default workflow automation.
 /// Never overwrites an existing hookfile — user customizations are sacred.
 fn ensure_hooks_yml(repo_root: &Path, quiet: bool) -> Result<()> {
@@ -516,47 +410,10 @@ fn ensure_hooks_yml(repo_root: &Path, quiet: bool) -> Result<()> {
         return Ok(()); // No .aiki dir yet — will be created later in init flow
     }
 
-    fs::write(&hooks_path, HOOKS_YML_TEMPLATE)
-        .context("Failed to create .aiki/hooks.yml")?;
+    fs::write(&hooks_path, HOOKS_YML_TEMPLATE).context("Failed to create .aiki/hooks.yml")?;
 
     if !quiet {
         println!("Created .aiki/hooks.yml with default workflow automation");
-    }
-
-    Ok(())
-}
-
-/// Ensure AGENTS.md exists with the <aiki> block for task system instructions
-fn ensure_agents_md(repo_root: &Path, quiet: bool) -> Result<()> {
-    let agents_path = repo_root.join("AGENTS.md");
-
-    if agents_path.exists() {
-        // Read existing file
-        let content = fs::read_to_string(&agents_path).context("Failed to read AGENTS.md")?;
-
-        // Check for <aiki> block
-        if !content.contains("<aiki version=") {
-            // Prepend block
-            let updated = format!("{}\n{}", AIKI_BLOCK_TEMPLATE, content);
-            fs::write(&agents_path, updated).context("Failed to update AGENTS.md")?;
-            if !quiet {
-                println!("✓ Added <aiki> block to AGENTS.md");
-            }
-        } else if !content.contains(&format!("<aiki version=\"{}\">", AIKI_BLOCK_VERSION)) {
-            // Version is outdated
-            if !quiet {
-                println!("⚠ AGENTS.md has outdated <aiki> block");
-                println!("  Run `aiki doctor --fix` to update");
-            }
-        } else if !quiet {
-            println!("✓ AGENTS.md already has <aiki> block");
-        }
-    } else {
-        // Create new AGENTS.md with just the block
-        fs::write(&agents_path, AIKI_BLOCK_TEMPLATE).context("Failed to create AGENTS.md")?;
-        if !quiet {
-            println!("✓ Created AGENTS.md with task system instructions");
-        }
     }
 
     Ok(())
@@ -598,12 +455,17 @@ fn init_global_directories(quiet: bool) -> Result<()> {
             let stderr = String::from_utf8_lossy(&result.stderr);
             // Ignore "already exists" errors (idempotent)
             if !stderr.contains("already exists") {
-                return Err(anyhow::anyhow!("Failed to initialize global JJ repo: {}", stderr).into());
+                return Err(
+                    anyhow::anyhow!("Failed to initialize global JJ repo: {}", stderr).into(),
+                );
             }
         }
 
         if !quiet {
-            println!("✓ Initialized global JJ repository at {}", global_jj.display());
+            println!(
+                "✓ Initialized global JJ repository at {}",
+                global_jj.display()
+            );
         }
     } else if !quiet {
         println!("✓ Global JJ repository exists");

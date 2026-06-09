@@ -16,9 +16,7 @@ pub struct AikiSessionWillCompactPayload {
 /// Currently a no-op. In the future, this could persist workspace path
 /// or active task IDs to a recovery file so session.compacted can
 /// recover even if session state is lost.
-pub fn handle_session_will_compact(
-    payload: AikiSessionWillCompactPayload,
-) -> Result<HookResult> {
+pub fn handle_session_will_compact(payload: AikiSessionWillCompactPayload) -> Result<HookResult> {
     use super::prelude::execute_hook;
 
     debug_log(|| {

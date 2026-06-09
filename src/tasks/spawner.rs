@@ -34,10 +34,19 @@ pub enum SpawnAction {
     },
 }
 
+/// Result of spawn evaluation, including actions and metadata.
+#[derive(Debug, Clone)]
+pub struct SpawnResult {
+    /// Actions to take (create tasks/subtasks)
+    pub actions: Vec<SpawnAction>,
+    /// Whether any spawn entry was skipped due to max iterations being reached.
+    /// When true, the caller should set `loop.max_reached = true` on the task.
+    pub loop_max_reached: bool,
+}
+
 /// Build a Rhai Scope from the post-transition task state.
 ///
 /// The scope provides access to:
-/// - `approved` → bool
 /// - `status` → String (always "closed")
 /// - `outcome` → String ("done" or "wont_do")
 /// - `data.*` → nested map from task.data
@@ -46,14 +55,6 @@ pub enum SpawnAction {
 /// - `subtasks.{slug}.*` → nested map for subtasks with slugs
 pub fn build_spawn_scope(task: &Task, graph: &TaskGraph) -> Scope<'static> {
     let mut scope = Scope::new();
-
-    // approved: from task data, default false
-    let approved = task
-        .data
-        .get("approved")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-    scope.push("approved", approved);
 
     // status: always "closed" (spawn conditions run post-close)
     scope.push("status", "closed".to_string());
@@ -106,12 +107,6 @@ pub fn build_spawn_scope(task: &Task, graph: &TaskGraph) -> Scope<'static> {
         if let Some(ref slug) = child.slug {
             let mut child_map: Map = BTreeMap::new();
             child_map.insert("status".into(), Dynamic::from(child.status.to_string()));
-            let child_approved = child
-                .data
-                .get("approved")
-                .map(|v| v == "true")
-                .unwrap_or(false);
-            child_map.insert("approved".into(), Dynamic::from(child_approved));
             if let Some(ref outcome) = child.closed_outcome {
                 child_map.insert("outcome".into(), Dynamic::from(outcome.to_string()));
             }
@@ -119,7 +114,10 @@ pub fn build_spawn_scope(task: &Task, graph: &TaskGraph) -> Scope<'static> {
             let mut child_data_map: Map = BTreeMap::new();
             for (key, value) in &child.data {
                 if !key.starts_with('_') {
-                    child_data_map.insert(key.as_str().into(), crate::expressions::coerce_to_dynamic(value));
+                    child_data_map.insert(
+                        key.as_str().into(),
+                        crate::expressions::coerce_to_dynamic(value),
+                    );
                 }
             }
             child_map.insert("data".into(), Dynamic::from_map(child_data_map));
@@ -171,7 +169,10 @@ fn dynamic_to_json_element(val: &Dynamic) -> Result<String, String> {
         Ok(val.as_float().unwrap().to_string())
     } else if val.is_string() {
         let s = val.clone().into_string().unwrap();
-        Ok(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+        Ok(format!(
+            "\"{}\"",
+            s.replace('\\', "\\\\").replace('"', "\\\"")
+        ))
     } else if val.is_array() {
         let arr = val.read_lock::<rhai::Array>().unwrap();
         let items: Vec<String> = arr
@@ -326,27 +327,52 @@ pub fn evaluate_spawns(
     task: &Task,
     graph: &TaskGraph,
     spawns_config: &[SpawnEntry],
-) -> Vec<SpawnAction> {
+) -> SpawnResult {
     let mut evaluator = ExpressionEvaluator::new();
     // Check for data.options.once flag - if set, skip all spawns
     if let Some(once) = task.data.get("options.once") {
         if once == "true" {
-            return Vec::new();
+            return SpawnResult {
+                actions: Vec::new(),
+                loop_max_reached: false,
+            };
         }
     }
     let scope = build_spawn_scope(task, graph);
 
     let mut task_actions: Vec<SpawnAction> = Vec::new();
     let mut subtask_actions: Vec<SpawnAction> = Vec::new();
+    let mut loop_max_reached = false;
 
     for (index, entry) in spawns_config.iter().enumerate() {
+        // Check max iterations FIRST (if specified)
+        if let Some(max_iters) = entry.max_iterations {
+            if max_iters > 0 {
+                // max_iterations: 0 means "no limit" — skip check
+                let current_index1 = task
+                    .data
+                    .get("loop.index1")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(1);
+
+                if current_index1 >= max_iters {
+                    eprintln!( // stderr-ok: spawn evaluation, never called during monitoring
+                        "[aiki] Warning: Loop terminated: max iterations ({}) reached for spawn entry {}",
+                        max_iters, index
+                    );
+                    loop_max_reached = true;
+                    continue;
+                }
+            }
+        }
+
         // Evaluate the when condition
         let mut eval_scope = scope.clone();
         let condition_result = evaluator.evaluate(&entry.when, &mut eval_scope);
         let is_true = match condition_result {
             Ok(b) => b,
             Err(_) => {
-                eprintln!(
+                eprintln!( // stderr-ok: spawn evaluation, never called during monitoring
                     "[aiki] Warning: spawn condition evaluation failed for task {}, spawn index {}: skipping",
                     task.id, index
                 );
@@ -364,7 +390,7 @@ pub fn evaluate_spawns(
         } else if let Some(ref task_config) = entry.task {
             (task_config, false)
         } else {
-            eprintln!(
+            eprintln!( // stderr-ok: spawn evaluation, never called during monitoring
                 "[aiki] Warning: spawn entry {} for task {} has neither 'task' nor 'subtask': skipping",
                 index, task.id
             );
@@ -379,7 +405,7 @@ pub fn evaluate_spawns(
             match evaluate_spawn_data(&mut evaluator, &config.data, &mut data_scope) {
                 Ok(data) => data,
                 Err(e) => {
-                    eprintln!(
+                    eprintln!( // stderr-ok: spawn evaluation, never called during monitoring
                         "[aiki] Warning: spawn data evaluation failed for task {}, spawn index {}: {} — skipping",
                         task.id, index, e
                     );
@@ -416,10 +442,15 @@ pub fn evaluate_spawns(
     }
 
     // Subtask precedence: if any subtasks, skip all standalone tasks
-    if !subtask_actions.is_empty() {
+    let actions = if !subtask_actions.is_empty() {
         subtask_actions
     } else {
         task_actions
+    };
+
+    SpawnResult {
+        actions,
+        loop_max_reached,
     }
 }
 
@@ -442,7 +473,6 @@ mod tests {
             assignee: None,
             sources: Vec::new(),
             template: None,
-            working_copy: None,
             instructions: None,
             data: HashMap::new(),
             created_at: Utc::now(),
@@ -451,8 +481,10 @@ mod tests {
             last_session_id: None,
             stopped_reason: None,
             closed_outcome: Some(TaskOutcome::Done),
+            confidence: None,
             summary: None,
             turn_started: None,
+            closed_at: None,
             turn_closed: None,
             turn_stopped: None,
             comments: Vec::new(),
@@ -463,16 +495,28 @@ mod tests {
         materialize_graph(&[])
     }
 
+    fn make_link(from: &str, to: &str, kind: &str) -> TaskEvent {
+        TaskEvent::LinkAdded {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: kind.to_string(),
+            autorun: None,
+            timestamp: Utc::now(),
+        }
+    }
+
     #[test]
     fn test_evaluate_simple_not_approved() {
         let mut task = make_closed_task("spawner");
-        task.data.insert("approved".to_string(), "false".to_string());
+        task.data
+            .insert("approved".to_string(), "false".to_string());
 
         let graph = empty_graph();
         let spawns = vec![SpawnEntry {
-            when: "not approved".to_string(),
+            max_iterations: None,
+            when: "not data.approved".to_string(),
             task: Some(SpawnTaskConfig {
-                template: "aiki/fix".to_string(),
+                template: "fix".to_string(),
                 priority: None,
                 assignee: None,
                 autorun: false,
@@ -481,10 +525,10 @@ mod tests {
             subtask: None,
         }];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            SpawnAction::CreateTask { template, .. } => assert_eq!(template, "aiki/fix"),
+            SpawnAction::CreateTask { template, .. } => assert_eq!(template, "fix"),
             _ => panic!("Expected CreateTask"),
         }
     }
@@ -496,9 +540,10 @@ mod tests {
 
         let graph = empty_graph();
         let spawns = vec![SpawnEntry {
-            when: "not approved".to_string(),
+            max_iterations: None,
+            when: "not data.approved".to_string(),
             task: Some(SpawnTaskConfig {
-                template: "aiki/fix".to_string(),
+                template: "fix".to_string(),
                 priority: None,
                 assignee: None,
                 autorun: false,
@@ -507,19 +552,19 @@ mod tests {
             subtask: None,
         }];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         assert!(actions.is_empty());
     }
 
     #[test]
     fn test_evaluate_data_condition() {
         let mut task = make_closed_task("spawner");
-        task.data
-            .insert("issues_found".to_string(), "5".to_string());
+        task.data.insert("issue_count".to_string(), "5".to_string());
 
         let graph = empty_graph();
         let spawns = vec![SpawnEntry {
-            when: "data.issues_found > 3".to_string(),
+            max_iterations: None,
+            when: "data.issue_count > 3".to_string(),
             task: Some(SpawnTaskConfig {
                 template: "aiki/follow-up".to_string(),
                 priority: None,
@@ -530,23 +575,25 @@ mod tests {
             subtask: None,
         }];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         assert_eq!(actions.len(), 1);
     }
 
     #[test]
     fn test_subtask_precedence() {
         let mut task = make_closed_task("spawner");
-        task.data.insert("approved".to_string(), "false".to_string());
+        task.data
+            .insert("approved".to_string(), "false".to_string());
         task.data
             .insert("needs_breakdown".to_string(), "true".to_string());
 
         let graph = empty_graph();
         let spawns = vec![
             SpawnEntry {
-                when: "not approved".to_string(),
+                max_iterations: None,
+                when: "not data.approved".to_string(),
                 task: Some(SpawnTaskConfig {
-                    template: "aiki/fix".to_string(),
+                    template: "fix".to_string(),
                     priority: None,
                     assignee: None,
                     autorun: false,
@@ -555,6 +602,7 @@ mod tests {
                 subtask: None,
             },
             SpawnEntry {
+                max_iterations: None,
                 when: "data.needs_breakdown".to_string(),
                 task: None,
                 subtask: Some(SpawnTaskConfig {
@@ -567,7 +615,7 @@ mod tests {
             },
         ];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         // Only subtask should be returned (subtask precedence)
         assert_eq!(actions.len(), 1);
         match &actions[0] {
@@ -579,24 +627,21 @@ mod tests {
     #[test]
     fn test_data_value_evaluation() {
         let mut task = make_closed_task("spawner");
-        task.data
-            .insert("issues_found".to_string(), "7".to_string());
+        task.data.insert("issue_count".to_string(), "7".to_string());
 
         let graph = empty_graph();
         let mut spawn_data = HashMap::new();
         spawn_data.insert(
             "issue_count".to_string(),
-            serde_yaml::Value::from("data.issues_found"),
+            serde_yaml::Value::from("data.issue_count"),
         );
-        spawn_data.insert(
-            "max_iterations".to_string(),
-            serde_yaml::Value::from(3),
-        );
+        spawn_data.insert("max_iterations".to_string(), serde_yaml::Value::from(3));
 
         let spawns = vec![SpawnEntry {
+            max_iterations: None,
             when: "true".to_string(),
             task: Some(SpawnTaskConfig {
-                template: "aiki/fix".to_string(),
+                template: "fix".to_string(),
                 priority: Some("p0".to_string()),
                 assignee: None,
                 autorun: false,
@@ -605,12 +650,10 @@ mod tests {
             subtask: None,
         }];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            SpawnAction::CreateTask {
-                data, priority, ..
-            } => {
+            SpawnAction::CreateTask { data, priority, .. } => {
                 assert_eq!(data.get("issue_count"), Some(&"7".to_string()));
                 assert_eq!(data.get("max_iterations"), Some(&"3".to_string()));
                 assert_eq!(priority, &Some("p0".to_string()));
@@ -634,9 +677,10 @@ mod tests {
         );
 
         let spawns = vec![SpawnEntry {
+            max_iterations: None,
             when: "true".to_string(),
             task: Some(SpawnTaskConfig {
-                template: "aiki/fix".to_string(),
+                template: "fix".to_string(),
                 priority: None,
                 assignee: None,
                 autorun: false,
@@ -645,7 +689,7 @@ mod tests {
             subtask: None,
         }];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         // Spawn entry should be skipped because "urgent" fails Rhai evaluation
         assert!(actions.is_empty());
     }
@@ -662,15 +706,13 @@ mod tests {
             "label".to_string(),
             serde_yaml::Value::from("\"urgent\""), // Rhai string literal
         );
-        spawn_data.insert(
-            "max_iterations".to_string(),
-            serde_yaml::Value::from(3),
-        );
+        spawn_data.insert("max_iterations".to_string(), serde_yaml::Value::from(3));
 
         let spawns = vec![SpawnEntry {
+            max_iterations: None,
             when: "true".to_string(),
             task: Some(SpawnTaskConfig {
-                template: "aiki/fix".to_string(),
+                template: "fix".to_string(),
                 priority: None,
                 assignee: None,
                 autorun: false,
@@ -679,7 +721,7 @@ mod tests {
             subtask: None,
         }];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             SpawnAction::CreateTask { data, .. } => {
@@ -696,9 +738,10 @@ mod tests {
         let graph = empty_graph();
         let spawns = vec![
             SpawnEntry {
+                max_iterations: None,
                 when: "true".to_string(),
                 task: Some(SpawnTaskConfig {
-                    template: "aiki/fix".to_string(),
+                    template: "fix".to_string(),
                     priority: None,
                     assignee: None,
                     autorun: false,
@@ -707,6 +750,7 @@ mod tests {
                 subtask: None,
             },
             SpawnEntry {
+                max_iterations: None,
                 when: "true".to_string(),
                 task: Some(SpawnTaskConfig {
                     template: "aiki/urgent-fix".to_string(),
@@ -719,7 +763,7 @@ mod tests {
             },
         ];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         assert_eq!(actions.len(), 2);
     }
 
@@ -730,9 +774,10 @@ mod tests {
         let spawns = vec![
             // Invalid expression syntax
             SpawnEntry {
+                max_iterations: None,
                 when: "invalid $$$ syntax".to_string(),
                 task: Some(SpawnTaskConfig {
-                    template: "aiki/fix".to_string(),
+                    template: "fix".to_string(),
                     priority: None,
                     assignee: None,
                     autorun: false,
@@ -742,6 +787,7 @@ mod tests {
             },
             // Valid expression
             SpawnEntry {
+                max_iterations: None,
                 when: "true".to_string(),
                 task: Some(SpawnTaskConfig {
                     template: "aiki/follow-up".to_string(),
@@ -754,7 +800,7 @@ mod tests {
             },
         ];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         // Only the valid one should succeed
         assert_eq!(actions.len(), 1);
         match &actions[0] {
@@ -769,6 +815,7 @@ mod tests {
         let graph = empty_graph();
         let spawns = vec![
             SpawnEntry {
+                max_iterations: None,
                 when: "false".to_string(), // won't trigger
                 task: Some(SpawnTaskConfig {
                     template: "aiki/a".to_string(),
@@ -780,6 +827,7 @@ mod tests {
                 subtask: None,
             },
             SpawnEntry {
+                max_iterations: None,
                 when: "true".to_string(), // index 1
                 task: Some(SpawnTaskConfig {
                     template: "aiki/b".to_string(),
@@ -791,6 +839,7 @@ mod tests {
                 subtask: None,
             },
             SpawnEntry {
+                max_iterations: None,
                 when: "true".to_string(), // index 2
                 task: Some(SpawnTaskConfig {
                     template: "aiki/c".to_string(),
@@ -803,7 +852,7 @@ mod tests {
             },
         ];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         assert_eq!(actions.len(), 2);
         match &actions[0] {
             SpawnAction::CreateTask { spawn_index, .. } => assert_eq!(*spawn_index, 1),
@@ -828,13 +877,12 @@ mod tests {
                 assignee: None,
                 sources: Vec::new(),
                 template: None,
-                working_copy: None,
                 instructions: None,
                 data: HashMap::new(),
                 timestamp: Utc::now(),
             },
             TaskEvent::Created {
-                task_id: "parent.1".to_string(),
+                task_id: "review-subtask".to_string(),
                 name: "Review subtask".to_string(),
                 slug: Some("review".to_string()),
                 task_type: None,
@@ -842,7 +890,6 @@ mod tests {
                 assignee: None,
                 sources: Vec::new(),
                 template: None,
-                working_copy: None,
                 instructions: None,
                 data: {
                     let mut d = HashMap::new();
@@ -851,9 +898,12 @@ mod tests {
                 },
                 timestamp: Utc::now(),
             },
+            make_link("review-subtask", "parent", "subtask-of"),
             TaskEvent::Closed {
-                task_ids: vec!["parent.1".to_string()],
+                session_id: None,
+                task_ids: vec!["review-subtask".to_string()],
                 outcome: TaskOutcome::Done,
+                confidence: None,
                 summary: None,
                 turn_id: None,
                 timestamp: Utc::now(),
@@ -864,12 +914,15 @@ mod tests {
 
         // Create the parent task for scope building
         let mut parent_task = make_closed_task("parent");
-        parent_task.data.insert("approved".to_string(), "false".to_string());
+        parent_task
+            .data
+            .insert("approved".to_string(), "false".to_string());
 
         let spawns = vec![SpawnEntry {
-            when: "not subtasks.review.approved".to_string(),
+            max_iterations: None,
+            when: "not subtasks.review.data.approved".to_string(),
             task: Some(SpawnTaskConfig {
-                template: "aiki/fix".to_string(),
+                template: "fix".to_string(),
                 priority: None,
                 assignee: None,
                 autorun: false,
@@ -878,7 +931,7 @@ mod tests {
             subtask: None,
         }];
 
-        let actions = evaluate_spawns(&parent_task, &graph, &spawns);
+        let actions = evaluate_spawns(&parent_task, &graph, &spawns).actions;
         assert_eq!(actions.len(), 1);
     }
 
@@ -889,6 +942,7 @@ mod tests {
 
         let graph = empty_graph();
         let spawns = vec![SpawnEntry {
+            max_iterations: None,
             when: r#"outcome == "done""#.to_string(),
             task: Some(SpawnTaskConfig {
                 template: "aiki/follow-up".to_string(),
@@ -900,7 +954,7 @@ mod tests {
             subtask: None,
         }];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         assert_eq!(actions.len(), 1);
     }
 
@@ -911,6 +965,7 @@ mod tests {
 
         let graph = empty_graph();
         let spawns = vec![SpawnEntry {
+            max_iterations: None,
             when: r#"outcome == "done""#.to_string(),
             task: Some(SpawnTaskConfig {
                 template: "aiki/follow-up".to_string(),
@@ -922,7 +977,7 @@ mod tests {
             subtask: None,
         }];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         assert!(actions.is_empty());
     }
 
@@ -943,9 +998,10 @@ mod tests {
         );
 
         let spawns = vec![SpawnEntry {
+            max_iterations: None,
             when: "true".to_string(),
             task: Some(SpawnTaskConfig {
-                template: "aiki/fix".to_string(),
+                template: "fix".to_string(),
                 priority: None,
                 assignee: None,
                 autorun: false,
@@ -954,7 +1010,7 @@ mod tests {
             subtask: None,
         }];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             SpawnAction::CreateTask { data, .. } => {
@@ -981,15 +1037,13 @@ mod tests {
         );
 
         let mut spawn_data = HashMap::new();
-        spawn_data.insert(
-            "config".to_string(),
-            serde_yaml::Value::Mapping(inner_map),
-        );
+        spawn_data.insert("config".to_string(), serde_yaml::Value::Mapping(inner_map));
 
         let spawns = vec![SpawnEntry {
+            max_iterations: None,
             when: "true".to_string(),
             task: Some(SpawnTaskConfig {
-                template: "aiki/fix".to_string(),
+                template: "fix".to_string(),
                 priority: None,
                 assignee: None,
                 autorun: false,
@@ -998,7 +1052,7 @@ mod tests {
             subtask: None,
         }];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             SpawnAction::CreateTask { data, .. } => {
@@ -1017,9 +1071,10 @@ mod tests {
         let graph = empty_graph();
 
         let spawns = vec![SpawnEntry {
+            max_iterations: None,
             when: "true".to_string(),
             task: Some(SpawnTaskConfig {
-                template: "aiki/fix".to_string(),
+                template: "fix".to_string(),
                 priority: None,
                 assignee: None,
                 autorun: true,
@@ -1028,7 +1083,7 @@ mod tests {
             subtask: None,
         }];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             SpawnAction::CreateTask { autorun, .. } => {
@@ -1044,9 +1099,10 @@ mod tests {
         let graph = empty_graph();
 
         let spawns = vec![SpawnEntry {
+            max_iterations: None,
             when: "true".to_string(),
             task: Some(SpawnTaskConfig {
-                template: "aiki/fix".to_string(),
+                template: "fix".to_string(),
                 priority: None,
                 assignee: None,
                 autorun: false,
@@ -1055,7 +1111,7 @@ mod tests {
             subtask: None,
         }];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             SpawnAction::CreateTask { autorun, .. } => {
@@ -1071,6 +1127,7 @@ mod tests {
         let graph = empty_graph();
 
         let spawns = vec![SpawnEntry {
+            max_iterations: None,
             when: "true".to_string(),
             task: None,
             subtask: Some(SpawnTaskConfig {
@@ -1082,7 +1139,7 @@ mod tests {
             }),
         }];
 
-        let actions = evaluate_spawns(&task, &graph, &spawns);
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             SpawnAction::CreateSubtask { autorun, .. } => {
@@ -1090,5 +1147,349 @@ mod tests {
             }
             _ => panic!("Expected CreateSubtask"),
         }
+    }
+
+    // --- max_iterations tests ---
+
+    #[test]
+    fn test_max_iterations_terminates_loop() {
+        // Test Strategy #5: loop.index1 == max_iterations → skip
+        let mut task = make_closed_task("spawner");
+        task.data.insert("loop.index1".to_string(), "5".to_string());
+
+        let graph = empty_graph();
+        let spawns = vec![SpawnEntry {
+            max_iterations: Some(5),
+            when: "true".to_string(),
+            task: Some(SpawnTaskConfig {
+                template: "self".to_string(),
+                priority: None,
+                assignee: None,
+                autorun: true,
+                data: HashMap::new(),
+            }),
+            subtask: None,
+        }];
+
+        let result = evaluate_spawns(&task, &graph, &spawns);
+        assert!(
+            result.actions.is_empty(),
+            "Should skip spawn when max iterations reached"
+        );
+        assert!(
+            result.loop_max_reached,
+            "loop_max_reached should be true when max iterations hit"
+        );
+    }
+
+    #[test]
+    fn test_below_max_iterations_continues() {
+        // Test Strategy #6: loop.index1 < max_iterations → evaluate when normally
+        let mut task = make_closed_task("spawner");
+        task.data.insert("loop.index1".to_string(), "4".to_string());
+
+        let graph = empty_graph();
+        let spawns = vec![SpawnEntry {
+            max_iterations: Some(5),
+            when: "true".to_string(),
+            task: Some(SpawnTaskConfig {
+                template: "self".to_string(),
+                priority: None,
+                assignee: None,
+                autorun: true,
+                data: HashMap::new(),
+            }),
+            subtask: None,
+        }];
+
+        let result = evaluate_spawns(&task, &graph, &spawns);
+        assert_eq!(
+            result.actions.len(),
+            1,
+            "Should continue when below max iterations"
+        );
+        assert!(
+            !result.loop_max_reached,
+            "loop_max_reached should be false when below max"
+        );
+    }
+
+    #[test]
+    fn test_max_iterations_off_by_one_boundary() {
+        // Test Strategy #7: exact boundary test
+        let graph = empty_graph();
+        let make_spawn = || SpawnEntry {
+            max_iterations: Some(5),
+            when: "true".to_string(),
+            task: Some(SpawnTaskConfig {
+                template: "self".to_string(),
+                priority: None,
+                assignee: None,
+                autorun: true,
+                data: HashMap::new(),
+            }),
+            subtask: None,
+        };
+
+        // index1 == max_iterations (5 >= 5) → terminate
+        let mut task = make_closed_task("spawner");
+        task.data.insert("loop.index1".to_string(), "5".to_string());
+        let actions = evaluate_spawns(&task, &graph, &[make_spawn()]).actions;
+        assert!(
+            actions.is_empty(),
+            "index1 == max_iterations should terminate"
+        );
+
+        // index1 == max_iterations - 1 (4 < 5) → continue
+        let mut task = make_closed_task("spawner");
+        task.data.insert("loop.index1".to_string(), "4".to_string());
+        let actions = evaluate_spawns(&task, &graph, &[make_spawn()]).actions;
+        assert_eq!(
+            actions.len(),
+            1,
+            "index1 == max_iterations - 1 should continue"
+        );
+
+        // index1 > max_iterations (6 >= 5) → terminate
+        let mut task = make_closed_task("spawner");
+        task.data.insert("loop.index1".to_string(), "6".to_string());
+        let actions = evaluate_spawns(&task, &graph, &[make_spawn()]).actions;
+        assert!(
+            actions.is_empty(),
+            "index1 > max_iterations should terminate"
+        );
+    }
+
+    #[test]
+    fn test_missing_loop_index1_defaults_to_1() {
+        // Test Strategy #8: no loop.index1 in data → defaults to 1 (first iteration)
+        let task = make_closed_task("spawner");
+        // No loop.index1 in data
+
+        let graph = empty_graph();
+        let spawns = vec![SpawnEntry {
+            max_iterations: Some(5),
+            when: "true".to_string(),
+            task: Some(SpawnTaskConfig {
+                template: "self".to_string(),
+                priority: None,
+                assignee: None,
+                autorun: true,
+                data: HashMap::new(),
+            }),
+            subtask: None,
+        }];
+
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
+        assert_eq!(
+            actions.len(),
+            1,
+            "Missing loop.index1 should default to 1 and not skip"
+        );
+    }
+
+    #[test]
+    fn test_max_iterations_none_skips_check() {
+        // Test Strategy #9: max_iterations: None → no cap
+        let mut task = make_closed_task("spawner");
+        task.data
+            .insert("loop.index1".to_string(), "999".to_string());
+
+        let graph = empty_graph();
+        let spawns = vec![SpawnEntry {
+            max_iterations: None,
+            when: "true".to_string(),
+            task: Some(SpawnTaskConfig {
+                template: "self".to_string(),
+                priority: None,
+                assignee: None,
+                autorun: true,
+                data: HashMap::new(),
+            }),
+            subtask: None,
+        }];
+
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
+        assert_eq!(
+            actions.len(),
+            1,
+            "max_iterations: None should not limit iterations"
+        );
+    }
+
+    #[test]
+    fn test_max_iterations_zero_means_no_limit() {
+        // max_iterations: 0 means "no limit" — skip check
+        let mut task = make_closed_task("spawner");
+        task.data
+            .insert("loop.index1".to_string(), "999".to_string());
+
+        let graph = empty_graph();
+        let spawns = vec![SpawnEntry {
+            max_iterations: Some(0),
+            when: "true".to_string(),
+            task: Some(SpawnTaskConfig {
+                template: "self".to_string(),
+                priority: None,
+                assignee: None,
+                autorun: true,
+                data: HashMap::new(),
+            }),
+            subtask: None,
+        }];
+
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
+        assert_eq!(actions.len(), 1, "max_iterations: 0 should mean no limit");
+    }
+
+    #[test]
+    fn test_max_iterations_precedence_over_when() {
+        // Test Strategy #10: max_iterations reached → skip even if when is true
+        let mut task = make_closed_task("spawner");
+        task.data
+            .insert("loop.index1".to_string(), "10".to_string());
+        task.data
+            .insert("approved".to_string(), "false".to_string());
+
+        let graph = empty_graph();
+        let spawns = vec![SpawnEntry {
+            max_iterations: Some(10),
+            when: "not data.approved".to_string(), // would be true
+            task: Some(SpawnTaskConfig {
+                template: "self".to_string(),
+                priority: None,
+                assignee: None,
+                autorun: true,
+                data: HashMap::new(),
+            }),
+            subtask: None,
+        }];
+
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
+        assert!(
+            actions.is_empty(),
+            "max_iterations should take precedence over when condition"
+        );
+    }
+
+    #[test]
+    fn test_backward_compat_old_style_inline_iteration_check() {
+        // Test Strategy #11: Old-style until with inline iteration check works as before
+        // (no max_iterations field, condition does its own check via a custom counter)
+        let mut task = make_closed_task("spawner");
+        task.data
+            .insert("iteration_count".to_string(), "10".to_string());
+        task.data
+            .insert("approved".to_string(), "false".to_string());
+
+        let graph = empty_graph();
+        // Old-style: iteration check is part of the when condition, no max_iterations
+        let spawns = vec![SpawnEntry {
+            max_iterations: None,
+            when: "not data.approved and data.iteration_count < 10".to_string(),
+            task: Some(SpawnTaskConfig {
+                template: "self".to_string(),
+                priority: None,
+                assignee: None,
+                autorun: true,
+                data: HashMap::new(),
+            }),
+            subtask: None,
+        }];
+
+        let actions = evaluate_spawns(&task, &graph, &spawns).actions;
+        // iteration_count is 10, condition checks < 10, so false → no spawn
+        assert!(
+            actions.is_empty(),
+            "Old-style inline check should still terminate"
+        );
+
+        // Now with iteration_count < 10
+        let mut task2 = make_closed_task("spawner2");
+        task2
+            .data
+            .insert("iteration_count".to_string(), "9".to_string());
+        task2
+            .data
+            .insert("approved".to_string(), "false".to_string());
+        let actions2 = evaluate_spawns(&task2, &graph, &spawns).actions;
+        assert_eq!(
+            actions2.len(),
+            1,
+            "Old-style inline check should allow spawn when under limit"
+        );
+    }
+
+    #[test]
+    fn test_backward_compat_both_old_and_new_present() {
+        // Test Strategy #12: Both inline check and max_iterations present
+        // → terminates at whichever limit is reached first
+        let graph = empty_graph();
+
+        // Case 1: max_iterations reached first (max_iters=5, inline check <10)
+        let mut task1 = make_closed_task("spawner1");
+        task1
+            .data
+            .insert("loop.index1".to_string(), "5".to_string());
+        task1
+            .data
+            .insert("iteration_count".to_string(), "5".to_string());
+        task1
+            .data
+            .insert("approved".to_string(), "false".to_string());
+        let spawns = vec![SpawnEntry {
+            max_iterations: Some(5), // reached at 5
+            when: "not data.approved and data.iteration_count < 10".to_string(), // allows up to 10
+            task: Some(SpawnTaskConfig {
+                template: "self".to_string(),
+                priority: None,
+                assignee: None,
+                autorun: true,
+                data: HashMap::new(),
+            }),
+            subtask: None,
+        }];
+        let result = evaluate_spawns(&task1, &graph, &spawns);
+        assert!(
+            result.actions.is_empty(),
+            "max_iterations should stop loop before inline check"
+        );
+        assert!(
+            result.loop_max_reached,
+            "loop_max_reached should be true when max iterations hit"
+        );
+
+        // Case 2: inline check reached first (max_iters=20, inline check <5)
+        let mut task2 = make_closed_task("spawner2");
+        task2
+            .data
+            .insert("loop.index1".to_string(), "5".to_string());
+        task2
+            .data
+            .insert("iteration_count".to_string(), "5".to_string());
+        task2
+            .data
+            .insert("approved".to_string(), "false".to_string());
+        let spawns2 = vec![SpawnEntry {
+            max_iterations: Some(20), // allows up to 20
+            when: "not data.approved and data.iteration_count < 5".to_string(), // stops at 5
+            task: Some(SpawnTaskConfig {
+                template: "self".to_string(),
+                priority: None,
+                assignee: None,
+                autorun: true,
+                data: HashMap::new(),
+            }),
+            subtask: None,
+        }];
+        let result2 = evaluate_spawns(&task2, &graph, &spawns2);
+        assert!(
+            result2.actions.is_empty(),
+            "Inline check should stop loop before max_iterations"
+        );
+        assert!(
+            !result2.loop_max_reached,
+            "loop_max_reached should be false when inline check stops loop"
+        );
     }
 }

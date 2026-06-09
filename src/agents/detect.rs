@@ -87,10 +87,7 @@ mod tests {
 
     #[test]
     fn test_match_agent_claude() {
-        assert_eq!(
-            match_agent("claude", ""),
-            Some(AgentType::ClaudeCode)
-        );
+        assert_eq!(match_agent("claude", ""), Some(AgentType::ClaudeCode));
         assert_eq!(
             match_agent("claude-code", "/usr/local/bin/claude"),
             Some(AgentType::ClaudeCode)
@@ -99,36 +96,33 @@ mod tests {
 
     #[test]
     fn test_match_agent_cursor() {
-        assert_eq!(
-            match_agent("cursor", ""),
-            Some(AgentType::Cursor)
-        );
+        assert_eq!(match_agent("cursor", ""), Some(AgentType::Cursor));
         // Note: paths are lowercased in detect_agent_from_process_tree before calling match_agent
         assert_eq!(
-            match_agent("cursor helper", "/applications/cursor.app/contents/macos/cursor helper"),
+            match_agent(
+                "cursor helper",
+                "/applications/cursor.app/contents/macos/cursor helper"
+            ),
             Some(AgentType::Cursor)
         );
         // Code binary inside Cursor app - detected via exe_path
         assert_eq!(
-            match_agent("code", "/applications/cursor.app/contents/resources/app/bin/code"),
+            match_agent(
+                "code",
+                "/applications/cursor.app/contents/resources/app/bin/code"
+            ),
             Some(AgentType::Cursor)
         );
     }
 
     #[test]
     fn test_match_agent_codex() {
-        assert_eq!(
-            match_agent("codex", ""),
-            Some(AgentType::Codex)
-        );
+        assert_eq!(match_agent("codex", ""), Some(AgentType::Codex));
     }
 
     #[test]
     fn test_match_agent_gemini() {
-        assert_eq!(
-            match_agent("gemini", ""),
-            Some(AgentType::Gemini)
-        );
+        assert_eq!(match_agent("gemini", ""), Some(AgentType::Gemini));
     }
 
     #[test]

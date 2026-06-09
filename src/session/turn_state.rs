@@ -90,16 +90,14 @@ fn query_max_turn_from_jj(session_uuid: &str, repo_path: &Path) -> Option<u32> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let turn = stdout
-        .lines()
-        .find_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.starts_with("turn=") {
-                trimmed.strip_prefix("turn=")?.parse::<u32>().ok()
-            } else {
-                None
-            }
-        });
+    let turn = stdout.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.starts_with("turn=") {
+            trimmed.strip_prefix("turn=")?.parse::<u32>().ok()
+        } else {
+            None
+        }
+    });
 
     if let Some(turn) = turn {
         debug_log(|| {

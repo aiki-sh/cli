@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::fs;
+use std::io::Write;
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 /// Save the current git core.hooksPath configuration before installing aiki hooks
 ///
@@ -94,7 +97,9 @@ pub fn install_global_git_hooks() -> Result<()> {
 pub fn install_claude_code_hooks_global() -> Result<()> {
     let home_dir = dirs::home_dir().context("Could not find home directory")?;
     let settings_path = home_dir.join(".claude/settings.json");
-    let aiki_path = get_aiki_binary_path();
+    // Use bare "aiki" so hooks resolve via PATH, not a stale absolute path
+    // (e.g. a workspace temp binary that no longer exists).
+    let aiki_path = "aiki";
 
     // Create ~/.claude if it doesn't exist
     if let Some(parent) = settings_path.parent() {
@@ -116,7 +121,8 @@ pub fn install_claude_code_hooks_global() -> Result<()> {
     }
 
     // Tool matcher for Pre/PostToolUse hooks (covers all file, shell, web, and MCP tools)
-    let tool_matcher = "Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep|LS|Bash|WebFetch|WebSearch|mcp__.*";
+    let tool_matcher =
+        "Edit|Write|MultiEdit|NotebookEdit|Read|Glob|Grep|LS|Bash|WebFetch|WebSearch|mcp__.*";
 
     // SessionStart hook for auto-initialization and context re-injection
     // Empty matcher matches all sources: startup, resume, compact, clear
@@ -124,7 +130,7 @@ pub fn install_claude_code_hooks_global() -> Result<()> {
         "matcher": "",
         "hooks": [{
             "type": "command",
-            "command": format!("{} hooks stdin --agent claude-code --event SessionStart", aiki_path),
+            "command": format!("{} hooks stdin --claude SessionStart", aiki_path),
             "timeout": 10
         }]
     }]);
@@ -134,7 +140,7 @@ pub fn install_claude_code_hooks_global() -> Result<()> {
         "matcher": "",
         "hooks": [{
             "type": "command",
-            "command": format!("{} hooks stdin --agent claude-code --event PreCompact", aiki_path),
+            "command": format!("{} hooks stdin --claude PreCompact", aiki_path),
             "timeout": 10
         }]
     }]);
@@ -144,7 +150,7 @@ pub fn install_claude_code_hooks_global() -> Result<()> {
         "matcher": "",
         "hooks": [{
             "type": "command",
-            "command": format!("{} hooks stdin --agent claude-code --event UserPromptSubmit", aiki_path),
+            "command": format!("{} hooks stdin --claude UserPromptSubmit", aiki_path),
             "timeout": 5
         }]
     }]);
@@ -154,7 +160,7 @@ pub fn install_claude_code_hooks_global() -> Result<()> {
         "matcher": tool_matcher,
         "hooks": [{
             "type": "command",
-            "command": format!("{} hooks stdin --agent claude-code --event PreToolUse", aiki_path),
+            "command": format!("{} hooks stdin --claude PreToolUse", aiki_path),
             "timeout": 5
         }]
     }]);
@@ -164,7 +170,7 @@ pub fn install_claude_code_hooks_global() -> Result<()> {
         "matcher": tool_matcher,
         "hooks": [{
             "type": "command",
-            "command": format!("{} hooks stdin --agent claude-code --event PostToolUse", aiki_path),
+            "command": format!("{} hooks stdin --claude PostToolUse", aiki_path),
             "timeout": 5
         }]
     }]);
@@ -174,7 +180,7 @@ pub fn install_claude_code_hooks_global() -> Result<()> {
         "matcher": "",
         "hooks": [{
             "type": "command",
-            "command": format!("{} hooks stdin --agent claude-code --event Stop", aiki_path),
+            "command": format!("{} hooks stdin --claude Stop", aiki_path),
             "timeout": 5
         }]
     }]);
@@ -184,7 +190,7 @@ pub fn install_claude_code_hooks_global() -> Result<()> {
         "matcher": "",
         "hooks": [{
             "type": "command",
-            "command": format!("{} hooks stdin --agent claude-code --event SessionEnd", aiki_path),
+            "command": format!("{} hooks stdin --claude SessionEnd", aiki_path),
             "timeout": 5
         }]
     }]);
@@ -213,7 +219,8 @@ pub fn install_claude_code_hooks_global() -> Result<()> {
 pub fn install_cursor_hooks_global() -> Result<()> {
     let home_dir = dirs::home_dir().context("Could not find home directory")?;
     let hooks_path = home_dir.join(".cursor/hooks.json");
-    let aiki_path = get_aiki_binary_path();
+    // Use bare "aiki" so hooks resolve via PATH, not a stale absolute path.
+    let aiki_path = "aiki";
 
     // Create ~/.cursor if it doesn't exist
     if let Some(parent) = hooks_path.parent() {
@@ -244,7 +251,7 @@ pub fn install_cursor_hooks_global() -> Result<()> {
         .unwrap_or_default();
 
     let aiki_init_hook = json!({
-        "command": format!("{} hooks stdin --agent cursor --event beforeSubmitPrompt", aiki_path)
+        "command": format!("{} hooks stdin --cursor beforeSubmitPrompt", aiki_path)
     });
 
     // Check if already installed
@@ -279,7 +286,7 @@ pub fn install_cursor_hooks_global() -> Result<()> {
             .unwrap_or_default();
 
         let aiki_hook = json!({
-            "command": format!("{} hooks stdin --agent cursor --event {}", aiki_path, event_name)
+            "command": format!("{} hooks stdin --cursor {}", aiki_path, event_name)
         });
 
         let already_installed = existing.iter().any(|hook| {
@@ -315,9 +322,8 @@ pub fn install_cursor_hooks_global() -> Result<()> {
 
 /// Install global Codex hooks in ~/.codex/config.toml
 ///
-/// Adds both OTel receiver config and notify command:
-/// - [otel] section with exporter.otlp-http (struct variant) and log_user_prompt
-/// - notify array with aiki hooks stdin command
+/// Adds OTel receiver config in `~/.codex/config.toml` and native Codex hook
+/// definitions in `~/.codex/hooks.json`.
 ///
 /// The exporter field is a tagged enum in codex's config:
 /// - Unit variants: "none", "statsig"
@@ -328,7 +334,6 @@ pub fn install_cursor_hooks_global() -> Result<()> {
 pub fn install_codex_hooks_global() -> Result<()> {
     let home_dir = dirs::home_dir().context("Could not find home directory")?;
     let config_path = home_dir.join(".codex/config.toml");
-    let aiki_path = get_aiki_binary_path();
 
     // Create ~/.codex if it doesn't exist
     if let Some(parent) = config_path.parent() {
@@ -375,10 +380,7 @@ pub fn install_codex_hooks_global() -> Result<()> {
                         "trace_exporter".to_string(),
                         toml::Value::String("none".to_string()),
                     );
-                    otel.insert(
-                        "log_user_prompt".to_string(),
-                        toml::Value::Boolean(true),
-                    );
+                    otel.insert("log_user_prompt".to_string(), toml::Value::Boolean(true));
                 }
             } else {
                 // Same endpoint: ensure trace_exporter is disabled and log_user_prompt is set
@@ -387,24 +389,21 @@ pub fn install_codex_hooks_global() -> Result<()> {
                         "trace_exporter".to_string(),
                         toml::Value::String("none".to_string()),
                     );
-                    otel.insert(
-                        "log_user_prompt".to_string(),
-                        toml::Value::Boolean(true),
-                    );
+                    otel.insert("log_user_prompt".to_string(), toml::Value::Boolean(true));
                 }
             }
         } else if otel.get("exporter").and_then(|v| v.as_str()).is_some() {
             // Has exporter as a unit variant (e.g., "none" or "statsig") - replace with our struct
             if let Some(otel) = config_table.get_mut("otel").and_then(|v| v.as_table_mut()) {
-                otel.insert("exporter".to_string(), build_otlp_http_exporter(aiki_endpoint));
+                otel.insert(
+                    "exporter".to_string(),
+                    build_otlp_http_exporter(aiki_endpoint),
+                );
                 otel.insert(
                     "trace_exporter".to_string(),
                     toml::Value::String("none".to_string()),
                 );
-                otel.insert(
-                    "log_user_prompt".to_string(),
-                    toml::Value::Boolean(true),
-                );
+                otel.insert("log_user_prompt".to_string(), toml::Value::Boolean(true));
                 // Remove legacy flat fields if present from old aiki versions
                 otel.remove("endpoint");
                 otel.remove("protocol");
@@ -412,15 +411,15 @@ pub fn install_codex_hooks_global() -> Result<()> {
         } else {
             // No exporter configured: add our struct variant
             if let Some(otel) = config_table.get_mut("otel").and_then(|v| v.as_table_mut()) {
-                otel.insert("exporter".to_string(), build_otlp_http_exporter(aiki_endpoint));
+                otel.insert(
+                    "exporter".to_string(),
+                    build_otlp_http_exporter(aiki_endpoint),
+                );
                 otel.insert(
                     "trace_exporter".to_string(),
                     toml::Value::String("none".to_string()),
                 );
-                otel.insert(
-                    "log_user_prompt".to_string(),
-                    toml::Value::Boolean(true),
-                );
+                otel.insert("log_user_prompt".to_string(), toml::Value::Boolean(true));
                 // Remove legacy flat fields if present from old aiki versions
                 otel.remove("endpoint");
                 otel.remove("protocol");
@@ -431,41 +430,78 @@ pub fn install_codex_hooks_global() -> Result<()> {
         let mut otel_table = toml::map::Map::new();
         // Enable log exporter (semantic events like codex.user_prompt, codex.tool_result)
         // exporter is a tagged enum: { otlp-http = { endpoint, protocol } }
-        otel_table.insert("exporter".to_string(), build_otlp_http_exporter(aiki_endpoint));
+        otel_table.insert(
+            "exporter".to_string(),
+            build_otlp_http_exporter(aiki_endpoint),
+        );
         // Disable trace exporter (we only want logs, not distributed tracing spans)
         otel_table.insert(
             "trace_exporter".to_string(),
             toml::Value::String("none".to_string()),
         );
-        otel_table.insert(
-            "log_user_prompt".to_string(),
-            toml::Value::Boolean(true),
-        );
+        otel_table.insert("log_user_prompt".to_string(), toml::Value::Boolean(true));
         config_table.insert("otel".to_string(), toml::Value::Table(otel_table));
     }
 
-    // Configure notify command
-    let notify_cmd = vec![
-        toml::Value::String(aiki_path),
-        toml::Value::String("hooks".to_string()),
-        toml::Value::String("stdin".to_string()),
-        toml::Value::String("--agent".to_string()),
-        toml::Value::String("codex".to_string()),
-        toml::Value::String("--event".to_string()),
-        toml::Value::String("agent-turn-complete".to_string()),
+    // Remove legacy notify config if present
+    config_table.remove("notify");
+
+    // Enable hooks feature (disabled by default in Codex)
+    let features_table = config_table
+        .entry("features")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .context("features section is not a table")?;
+    features_table.insert(
+        "codex_hooks".to_string(),
+        toml::Value::Boolean(true),
+    );
+
+    // Codex native hooks inherit the session sandbox. Add ~/.aiki so hook
+    // handlers can write global session state under workspace-write mode.
+    ensure_codex_writable_root(config_table)?;
+
+    // Write updated config atomically to prevent corruption from concurrent
+    // `aiki init` calls (e.g. multiple agent sessions starting at once).
+    let content = toml::to_string_pretty(&config).context("Failed to serialize config.toml")?;
+    atomic_write_file(&config_path, content.as_bytes())
+        .context("Failed to write ~/.codex/config.toml")?;
+
+    // Write hooks.json where Codex discovers native hook definitions.
+    let hooks_path = home_dir.join(".codex/hooks.json");
+    let hook_events = [
+        ("SessionStart", "sessionStart"),
+        ("UserPromptSubmit", "userPromptSubmit"),
+        ("PreToolUse", "preToolUse"),
+        ("Stop", "stop"),
     ];
-    config_table.insert("notify".to_string(), toml::Value::Array(notify_cmd));
 
-    // Write updated config
-    let content =
-        toml::to_string_pretty(&config).context("Failed to serialize config.toml")?;
-    fs::write(&config_path, content).context("Failed to write ~/.codex/config.toml")?;
+    let mut hooks_map = serde_json::Map::new();
+    for (event_key, event_arg) in &hook_events {
+        let hook_entry = serde_json::json!([{
+            "hooks": [{
+                "type": "command",
+                "command": format!("aiki hooks stdin --codex {}", event_arg),
+            }]
+        }]);
+        hooks_map.insert(event_key.to_string(), hook_entry);
+    }
 
-    println!("✓ Installed Codex hooks at {}", config_path.display());
+    let hooks_json = serde_json::json!({ "hooks": hooks_map });
+    let hooks_content =
+        serde_json::to_string_pretty(&hooks_json).context("Failed to serialize hooks.json")?;
+    atomic_write_file(&hooks_path, hooks_content.as_bytes())
+        .context("Failed to write ~/.codex/hooks.json")?;
+
+    println!("✓ Installed Codex config at {}", config_path.display());
     println!("  - [otel.exporter]: Log events → {}", aiki_endpoint);
     println!("  - [otel.trace_exporter]: Disabled (no trace spans)");
-    println!("  - notify: Turn completion tracking");
+    println!("  - [sandbox_workspace_write]: writable_roots includes ~/.aiki");
     println!("  - log_user_prompt: true (prompt content capture enabled)");
+    println!("✓ Installed Codex hooks at {}", hooks_path.display());
+    println!(
+        "  - SessionStart, UserPromptSubmit, PreToolUse, Stop"
+    );
 
     Ok(())
 }
@@ -503,6 +539,78 @@ fn get_otlp_http_endpoint(otel: &toml::map::Map<String, toml::Value>) -> Option<
         .and_then(|http| http.get("endpoint"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// Ensure ~/.aiki is writable inside Codex's workspace-write sandbox.
+///
+/// Codex native hooks execute inside the session sandbox, so they need the
+/// global Aiki directory added as an extra writable root in order to create
+/// session files and update the global JJ repo.
+fn ensure_codex_writable_root(
+    config_table: &mut toml::map::Map<String, toml::Value>,
+) -> Result<()> {
+    let global_aiki = crate::global::global_aiki_dir();
+    let global_aiki = global_aiki
+        .to_str()
+        .context("Global aiki directory contains invalid UTF-8")?
+        .to_string();
+
+    let sandbox = config_table
+        .entry("sandbox_workspace_write".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+
+    let sandbox_table = sandbox
+        .as_table_mut()
+        .context("sandbox_workspace_write must be a table")?;
+
+    let writable_roots = sandbox_table
+        .entry("writable_roots".to_string())
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+
+    let writable_roots = writable_roots
+        .as_array_mut()
+        .context("sandbox_workspace_write.writable_roots must be an array")?;
+
+    let already_present = writable_roots
+        .iter()
+        .any(|v| v.as_str().is_some_and(|s| s == global_aiki));
+
+    if !already_present {
+        writable_roots.push(toml::Value::String(global_aiki));
+    }
+
+    Ok(())
+}
+
+/// Write a file atomically by writing to a temp file then renaming.
+///
+/// `rename()` is atomic on POSIX — the target is either the old content or the
+/// new content, never a partial mix. This prevents corruption when multiple
+/// processes write the same config file concurrently.
+fn atomic_write_file(path: &Path, content: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("Cannot write to a file with no parent directory")?;
+
+    let tmp_path = parent.join(format!(
+        ".{}.tmp.{}.{:?}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config"),
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+
+    // Write to temp file, fsync, then rename
+    let mut file = fs::File::create(&tmp_path).context("Failed to create temporary config file")?;
+    file.write_all(content)
+        .context("Failed to write temporary config file")?;
+    file.sync_all()
+        .context("Failed to sync temporary config file")?;
+    drop(file);
+
+    fs::rename(&tmp_path, path).context("Failed to rename temporary config file")?;
+    Ok(())
 }
 
 /// Install the OTel receiver as a socket-activated service.
@@ -556,35 +664,51 @@ pub fn restart_otel_receiver() -> Result<()> {
         "macos" => restart_otel_receiver_macos(),
         "linux" => restart_otel_receiver_linux(),
         other => {
-            eprintln!(
-                "⚠ OTel receiver restart not supported on {} yet",
-                other
-            );
+            eprintln!("⚠ OTel receiver restart not supported on {} yet", other);
             Ok(())
         }
     }
 }
 
+/// Wait for the OTel receiver socket to become ready (up to ~2s).
+/// Returns Ok if the socket is listening, Err if it times out.
+pub fn wait_for_otel_receiver() -> Result<()> {
+    let addr: SocketAddr = "127.0.0.1:19876".parse().unwrap();
+    for _ in 0..10 {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("OTel receiver did not become ready within 2 seconds")
+}
+
 fn restart_otel_receiver_macos() -> Result<()> {
     let home_dir = dirs::home_dir().context("Could not find home directory")?;
     let plist_path = home_dir.join("Library/LaunchAgents/com.aiki.otel-receive.plist");
+    let domain_target = format!("gui/{}", unsafe { libc::getuid() });
+    let service_target = format!("{}/com.aiki.otel-receive", domain_target);
 
-    // Unload (stop)
+    // Bootout (stop) — ignore errors, may not be loaded
     let _ = Command::new("launchctl")
-        .args(["unload", "-w"])
-        .arg(&plist_path)
+        .args(["bootout", &service_target])
         .output();
 
-    // Reload (start)
+    // Clear the disabled override left by any prior `launchctl unload -w`.
+    // Without this, bootstrap fails with EIO (error 5).
+    let _ = Command::new("launchctl")
+        .args(["enable", &service_target])
+        .output();
+
+    // Bootstrap (start)
     let output = Command::new("launchctl")
-        .args(["load", "-w"])
+        .args(["bootstrap", &domain_target])
         .arg(&plist_path)
         .output()
-        .context("Failed to run launchctl load")?;
+        .context("Failed to run launchctl bootstrap")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("launchctl load failed: {}", stderr.trim());
+        anyhow::bail!("launchctl bootstrap failed: {}", stderr.trim());
     }
 
     Ok(())
@@ -608,30 +732,37 @@ fn install_otel_receiver_macos(aiki_path: &str) -> Result<()> {
     let home_dir = dirs::home_dir().context("Could not find home directory")?;
     let agents_dir = home_dir.join("Library/LaunchAgents");
     let plist_path = agents_dir.join("com.aiki.otel-receive.plist");
+    let domain_target = format!("gui/{}", unsafe { libc::getuid() });
+    let service_target = format!("{}/com.aiki.otel-receive", domain_target);
 
     fs::create_dir_all(&agents_dir).context("Failed to create ~/Library/LaunchAgents")?;
 
-    // Unload existing if present (ignore errors - may not be loaded)
+    // Bootout existing if present (ignore errors — may not be loaded)
     if plist_path.exists() {
         let _ = Command::new("launchctl")
-            .args(["unload", "-w"])
-            .arg(&plist_path)
+            .args(["bootout", &service_target])
             .output();
     }
 
     let plist_content = generate_launchd_plist(aiki_path);
     fs::write(&plist_path, &plist_content).context("Failed to write launchd plist")?;
 
-    // Load the agent
+    // Clear the disabled override left by any prior `launchctl unload -w`.
+    // Without this, bootstrap fails with EIO (error 5).
+    let _ = Command::new("launchctl")
+        .args(["enable", &service_target])
+        .output();
+
+    // Bootstrap the agent (registers plist + activates socket)
     let output = Command::new("launchctl")
-        .args(["load", "-w"])
+        .args(["bootstrap", &domain_target])
         .arg(&plist_path)
         .output()
-        .context("Failed to run launchctl load")?;
+        .context("Failed to run launchctl bootstrap")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("launchctl load failed: {}", stderr.trim());
+        anyhow::bail!("launchctl bootstrap failed: {}", stderr.trim());
     }
 
     Ok(())
@@ -765,85 +896,6 @@ fn generate_systemd_service(aiki_path: &str) -> String {
     )
 }
 
-/// Read JJ repository config from .jj/repo/config.toml
-pub fn read_jj_repo_config(repo_path: &Path) -> Result<toml::Value> {
-    let config_path = repo_path.join(".jj").join("repo").join("config.toml");
-
-    if !config_path.exists() {
-        // Return empty config if file doesn't exist
-        return Ok(toml::Value::Table(toml::map::Map::new()));
-    }
-
-    let config_content =
-        fs::read_to_string(&config_path).context("Failed to read .jj/repo/config.toml")?;
-
-    toml::from_str(&config_content).context("Failed to parse .jj/repo/config.toml")
-}
-
-/// Write JJ repository config to .jj/repo/config.toml
-pub fn write_jj_repo_config(repo_path: &Path, config: &toml::Value) -> Result<()> {
-    let config_path = repo_path.join(".jj").join("repo").join("config.toml");
-
-    // Ensure .jj/repo directory exists
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent).context("Failed to create .jj/repo directory")?;
-    }
-
-    let config_content =
-        toml::to_string_pretty(config).context("Failed to serialize config to TOML")?;
-
-    fs::write(&config_path, config_content).context("Failed to write .jj/repo/config.toml")
-}
-
-/// Update JJ signing configuration in .jj/repo/config.toml
-pub fn update_jj_signing_config(
-    repo_path: &Path,
-    backend: &str,
-    key: Option<&str>,
-    behavior: &str,
-) -> Result<()> {
-    let mut config = read_jj_repo_config(repo_path)?;
-
-    // Ensure config is a table
-    let config_table = config
-        .as_table_mut()
-        .context("Config root is not a table")?;
-
-    // Create [signing] section
-    let mut signing_table = toml::map::Map::new();
-    signing_table.insert(
-        "behavior".to_string(),
-        toml::Value::String(behavior.to_string()),
-    );
-    signing_table.insert(
-        "backend".to_string(),
-        toml::Value::String(backend.to_string()),
-    );
-
-    // For SSH backend, add key and allowed-signers configuration
-    if backend == "ssh" {
-        if let Some(key_path) = key {
-            signing_table.insert("key".to_string(), toml::Value::String(key_path.to_string()));
-        }
-
-        // Add [signing.backends.ssh] configuration
-        let mut ssh_config = toml::map::Map::new();
-        ssh_config.insert(
-            "allowed-signers".to_string(),
-            toml::Value::String(".jj/allowed-signers".to_string()),
-        );
-
-        let mut backends = toml::map::Map::new();
-        backends.insert("ssh".to_string(), toml::Value::Table(ssh_config));
-        signing_table.insert("backends".to_string(), toml::Value::Table(backends));
-    }
-
-    // Insert signing section into config
-    config_table.insert("signing".to_string(), toml::Value::Table(signing_table));
-
-    write_jj_repo_config(repo_path, &config)
-}
-
 /// Check if Claude Code is installed
 #[cfg(test)]
 mod tests {
@@ -905,5 +957,95 @@ mod tests {
         assert!(previous_path_file.exists());
         let content = fs::read_to_string(&previous_path_file).unwrap();
         assert_eq!(content, ".custom-hooks");
+    }
+
+    #[test]
+    fn atomic_write_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        atomic_write_file(&path, b"[hooks]\ncommand = true\n").unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "[hooks]\ncommand = true\n");
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        fs::write(&path, "old content that is longer than new").unwrap();
+        atomic_write_file(&path, b"new").unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "new", "old content must not bleed through");
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        atomic_write_file(&path, b"content").unwrap();
+
+        let temps: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(temps.is_empty(), "temp file should be cleaned up by rename");
+    }
+
+    #[test]
+    fn atomic_write_concurrent_writers_never_corrupt() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Seed the file so we can detect bleed-through from old content
+        fs::write(&path, "x".repeat(4096)).unwrap();
+
+        let num_writers = 20;
+        let rounds = 50;
+        let barrier = Arc::new(Barrier::new(num_writers));
+
+        // Each thread writes a distinct, self-consistent payload.
+        // After all writes, the file must contain exactly one payload — not a mix.
+        std::thread::scope(|s| {
+            for writer_id in 0..num_writers {
+                let barrier = Arc::clone(&barrier);
+                let path = path.clone();
+                s.spawn(move || {
+                    // All threads start together to maximize contention
+                    barrier.wait();
+                    for round in 0..rounds {
+                        let tag = format!("w{writer_id}r{round}");
+                        // Vary length to reproduce the short-write-over-long-write bug
+                        let payload =
+                            format!("[{tag}]\nkey = \"{}\"\n", tag.repeat(1 + (writer_id % 5)));
+                        atomic_write_file(&path, payload.as_bytes()).unwrap();
+                    }
+                });
+            }
+        });
+
+        // The file must be valid: it should start with `[` and be parseable,
+        // and it must NOT contain leftover bytes from a different write.
+        let final_content = fs::read_to_string(&path).unwrap();
+        assert!(
+            final_content.starts_with('['),
+            "file should start with TOML section header, got: {:?}",
+            &final_content[..final_content.len().min(40)]
+        );
+        // Parse to confirm it's valid TOML (not a mix of two writes)
+        let parsed: Result<toml::Value, _> = toml::from_str(&final_content);
+        assert!(
+            parsed.is_ok(),
+            "file must be valid TOML after concurrent writes, got error: {:?}\ncontent: {:?}",
+            parsed.err(),
+            &final_content[..final_content.len().min(200)]
+        );
     }
 }

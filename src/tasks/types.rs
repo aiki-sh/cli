@@ -14,6 +14,8 @@ pub type FastHashMap<K, V> = hashbrown::HashMap<K, V, ahash::RandomState>;
 pub enum TaskStatus {
     /// Ready to work on
     Open,
+    /// Reserved by orchestrator (pre-spawn lock, no session yet)
+    Reserved,
     /// Currently being worked on
     InProgress,
     /// Was in progress, now stopped (has reason)
@@ -26,6 +28,7 @@ impl fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TaskStatus::Open => write!(f, "open"),
+            TaskStatus::Reserved => write!(f, "reserved"),
             TaskStatus::InProgress => write!(f, "in_progress"),
             TaskStatus::Stopped => write!(f, "stopped"),
             TaskStatus::Closed => write!(f, "closed"),
@@ -105,6 +108,61 @@ impl TaskOutcome {
     }
 }
 
+/// Confidence reported when an agent closes done work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConfidenceLevel {
+    Low = 1,
+    Medium = 2,
+    High = 3,
+    Verified = 4,
+}
+
+impl ConfidenceLevel {
+    #[must_use]
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Low),
+            2 => Some(Self::Medium),
+            3 => Some(Self::High),
+            4 => Some(Self::Verified),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Verified => "verified",
+        }
+    }
+}
+
+impl fmt::Display for ConfidenceLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_u8())
+    }
+}
+
+impl std::str::FromStr for ConfidenceLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value: u8 = s
+            .parse()
+            .map_err(|_| "Confidence must be a number 1-4".to_string())?;
+        Self::from_u8(value).ok_or_else(|| "Confidence must be 1-4".to_string())
+    }
+}
+
 /// Events stored on aiki/tasks branch
 #[derive(Debug, Clone)]
 pub enum TaskEvent {
@@ -120,10 +178,8 @@ pub enum TaskEvent {
         assignee: Option<String>,
         /// Sources that spawned this task (e.g., "file:ops/now/design.md", "task:abc123")
         sources: Vec<String>,
-        /// Template used to create this task (e.g., "aiki/review@1.0.0")
+        /// Template used to create this task (e.g., "review@1.0.0")
         template: Option<String>,
-        /// Working copy change_id at creation time (for historical template lookup)
-        working_copy: Option<String>,
         /// Instructions from template (with variables substituted)
         instructions: Option<String>,
         /// Custom data/metadata for the task
@@ -138,12 +194,17 @@ pub enum TaskEvent {
         session_id: Option<String>,
         /// Turn ID (UUID v5) from the session's current turn
         turn_id: Option<String>,
+        /// Immutable snapshot revset captured from `@` at start time.
+        working_copy: Option<String>,
+        /// Instructions set atomically at start time (for quick-start with -i)
+        instructions: Option<String>,
         timestamp: DateTime<Utc>,
     },
     /// Task(s) were stopped (batch operation)
     Stopped {
         task_ids: Vec<String>,
         reason: Option<String>,
+        session_id: Option<String>,
         /// Turn ID (UUID v5) from the session's current turn
         turn_id: Option<String>,
         timestamp: DateTime<Utc>,
@@ -152,8 +213,10 @@ pub enum TaskEvent {
     Closed {
         task_ids: Vec<String>,
         outcome: TaskOutcome,
+        confidence: Option<ConfidenceLevel>,
         /// Summary of what was accomplished (replaces closing comment pattern)
         summary: Option<String>,
+        session_id: Option<String>,
         /// Turn ID (UUID v5) from the session's current turn
         turn_id: Option<String>,
         timestamp: DateTime<Utc>,
@@ -216,6 +279,26 @@ pub enum TaskEvent {
         reason: Option<String>,
         timestamp: DateTime<Utc>,
     },
+    /// Task(s) were reserved by orchestrator (pre-spawn lock, no session yet)
+    Reserved {
+        task_ids: Vec<String>,
+        /// Who is reserving (e.g., "claude-code")
+        agent_type: String,
+        timestamp: DateTime<Utc>,
+    },
+    /// Task(s) reservation was released (spawn failed or orchestrator gave up)
+    Released {
+        task_ids: Vec<String>,
+        reason: Option<String>,
+        timestamp: DateTime<Utc>,
+    },
+    /// Changes from these tasks have been absorbed into the parent workspace
+    Absorbed {
+        task_ids: Vec<String>,
+        session_id: String,
+        turn_id: Option<String>,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 impl TaskEvent {
@@ -231,8 +314,63 @@ impl TaskEvent {
             | TaskEvent::Updated { timestamp, .. }
             | TaskEvent::FieldsCleared { timestamp, .. }
             | TaskEvent::LinkAdded { timestamp, .. }
-            | TaskEvent::LinkRemoved { timestamp, .. } => *timestamp,
+            | TaskEvent::LinkRemoved { timestamp, .. }
+            | TaskEvent::Reserved { timestamp, .. }
+            | TaskEvent::Released { timestamp, .. }
+            | TaskEvent::Absorbed { timestamp, .. } => *timestamp,
         }
+    }
+
+    /// Variant name for deduplication (e.g., "Created", "Started").
+    fn variant_name(&self) -> &'static str {
+        match self {
+            TaskEvent::Created { .. } => "Created",
+            TaskEvent::Started { .. } => "Started",
+            TaskEvent::Stopped { .. } => "Stopped",
+            TaskEvent::Closed { .. } => "Closed",
+            TaskEvent::Reopened { .. } => "Reopened",
+            TaskEvent::CommentAdded { .. } => "CommentAdded",
+            TaskEvent::Updated { .. } => "Updated",
+            TaskEvent::FieldsCleared { .. } => "FieldsCleared",
+            TaskEvent::LinkAdded { .. } => "LinkAdded",
+            TaskEvent::LinkRemoved { .. } => "LinkRemoved",
+            TaskEvent::Reserved { .. } => "Reserved",
+            TaskEvent::Released { .. } => "Released",
+            TaskEvent::Absorbed { .. } => "Absorbed",
+        }
+    }
+
+    /// Primary task ID for this event (first task_id from single or batch events).
+    fn primary_task_id(&self) -> &str {
+        match self {
+            TaskEvent::Created { task_id, .. }
+            | TaskEvent::Reopened { task_id, .. }
+            | TaskEvent::Updated { task_id, .. }
+            | TaskEvent::FieldsCleared { task_id, .. }
+            | TaskEvent::LinkAdded { from: task_id, .. }
+            | TaskEvent::LinkRemoved { from: task_id, .. } => task_id,
+            TaskEvent::Started { task_ids, .. }
+            | TaskEvent::Stopped { task_ids, .. }
+            | TaskEvent::Closed { task_ids, .. }
+            | TaskEvent::CommentAdded { task_ids, .. }
+            | TaskEvent::Reserved { task_ids, .. }
+            | TaskEvent::Released { task_ids, .. }
+            | TaskEvent::Absorbed { task_ids, .. } => {
+                task_ids.first().map(|s| s.as_str()).unwrap_or("")
+            }
+        }
+    }
+
+    /// Deduplication key: (task_id, variant_name, timestamp).
+    ///
+    /// The same logical event read from different JJ workspaces produces the
+    /// same key, enabling cross-workspace dedup in the drain loop.
+    pub fn dedup_key(&self) -> (String, &'static str, DateTime<Utc>) {
+        (
+            self.primary_task_id().to_string(),
+            self.variant_name(),
+            self.timestamp(),
+        )
     }
 }
 
@@ -262,10 +400,8 @@ pub struct Task {
     pub assignee: Option<String>,
     /// Sources that spawned this task (e.g., "file:ops/now/design.md", "task:abc123")
     pub sources: Vec<String>,
-    /// Template used to create this task (e.g., "aiki/review@1.0.0")
+    /// Template used to create this task (e.g., "review@1.0.0")
     pub template: Option<String>,
-    /// Working copy change_id at creation time (for historical template lookup)
-    pub working_copy: Option<String>,
     /// Instructions from template (with variables substituted)
     pub instructions: Option<String>,
     /// Custom data/metadata for the task
@@ -281,10 +417,14 @@ pub struct Task {
     pub stopped_reason: Option<String>,
     /// Closure outcome (if closed)
     pub closed_outcome: Option<TaskOutcome>,
+    /// Agent-reported confidence for done closes, when provided
+    pub confidence: Option<ConfidenceLevel>,
     /// Summary of what was accomplished when task was closed
     pub summary: Option<String>,
     /// Turn ID when this task was most recently started
     pub turn_started: Option<String>,
+    /// When the task was closed
+    pub closed_at: Option<DateTime<Utc>>,
     /// Turn ID when this task was closed
     pub turn_closed: Option<String>,
     /// Turn ID when this task was stopped (if currently stopped)
@@ -303,6 +443,67 @@ impl Task {
         self.summary
             .as_deref()
             .or_else(|| self.comments.last().map(|c| c.text.as_str()))
+    }
+
+    /// Agent name for phase header (reads data["agent_type"] or falls back to assignee)
+    pub fn agent_label(&self) -> Option<&str> {
+        self.data
+            .get("agent_type")
+            .map(|s| s.as_str())
+            .or(self.assignee.as_deref())
+    }
+
+    /// Most recent heartbeat text from comments. Falls back to empty string.
+    pub fn latest_heartbeat(&self) -> &str {
+        self.comments
+            .iter()
+            .rev()
+            .find(|c| {
+                c.data
+                    .get("type")
+                    .map(|t| t == "heartbeat")
+                    .unwrap_or(false)
+            })
+            .map(|c| c.text.as_str())
+            .unwrap_or("")
+    }
+
+    /// Formatted elapsed time since started_at, e.g. "1m 23s"
+    /// For closed/stopped tasks, uses closed_at as the end time.
+    pub fn elapsed_str(&self) -> Option<String> {
+        let started = self.started_at?;
+        let end = if self.is_terminal() {
+            self.closed_at.unwrap_or_else(chrono::Utc::now)
+        } else {
+            chrono::Utc::now()
+        };
+        let elapsed = end - started;
+        let secs = elapsed.num_seconds();
+        if secs < 60 {
+            Some(format!("{}s", secs))
+        } else {
+            Some(format!("{}m {}s", secs / 60, secs % 60))
+        }
+    }
+
+    /// Summary or fallback to task name for done state
+    pub fn display_summary(&self) -> &str {
+        self.effective_summary().unwrap_or(&self.name)
+    }
+
+    /// Reason task was stopped, or fallback
+    pub fn display_stopped_reason(&self) -> &str {
+        self.stopped_reason.as_deref().unwrap_or("stopped")
+    }
+
+    /// First 6 chars of task ID for display
+    pub fn short_id(&self) -> &str {
+        &self.id[..6.min(self.id.len())]
+    }
+
+    /// True for Closed or Stopped
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status, TaskStatus::Closed | TaskStatus::Stopped)
     }
 
     /// Returns true if this task is an orchestrator (coordinates subtask execution).
@@ -337,13 +538,6 @@ pub struct TaskActivity {
     /// Tasks that were stopped
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stopped: Vec<TaskReference>,
-}
-
-impl TaskActivity {
-    /// Check if there was any activity
-    pub fn is_empty(&self) -> bool {
-        self.closed.is_empty() && self.started.is_empty() && self.stopped.is_empty()
-    }
 }
 
 #[cfg(test)]
@@ -387,6 +581,25 @@ mod tests {
         assert_eq!(TaskOutcome::WontDo.to_string(), "wont_do");
     }
 
+    #[test]
+    fn test_confidence_level_parse_and_display() {
+        assert_eq!("1".parse::<ConfidenceLevel>(), Ok(ConfidenceLevel::Low));
+        assert_eq!(
+            "4".parse::<ConfidenceLevel>(),
+            Ok(ConfidenceLevel::Verified)
+        );
+        assert_eq!(
+            "0".parse::<ConfidenceLevel>(),
+            Err("Confidence must be 1-4".to_string())
+        );
+        assert_eq!(
+            "hi".parse::<ConfidenceLevel>(),
+            Err("Confidence must be a number 1-4".to_string())
+        );
+        assert_eq!(ConfidenceLevel::High.to_string(), "3");
+        assert_eq!(ConfidenceLevel::Verified.label(), "verified");
+    }
+
     fn make_task_for_summary() -> Task {
         Task {
             id: "abcdefghijklmnopqrstuvwxyzabcdef".to_string(),
@@ -398,7 +611,6 @@ mod tests {
             assignee: None,
             sources: Vec::new(),
             template: None,
-            working_copy: None,
             instructions: None,
             data: std::collections::HashMap::new(),
             created_at: chrono::Utc::now(),
@@ -407,8 +619,10 @@ mod tests {
             last_session_id: None,
             stopped_reason: None,
             closed_outcome: None,
+            confidence: None,
             summary: None,
             turn_started: None,
+            closed_at: None,
             turn_closed: None,
             turn_stopped: None,
             comments: Vec::new(),

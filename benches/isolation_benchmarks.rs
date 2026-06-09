@@ -1,7 +1,5 @@
 use aiki::repo_id;
-use aiki::session::isolation::{
-    absorb_workspace, cleanup_workspace, create_isolated_workspace,
-};
+use aiki::session::isolation::{absorb_workspace, cleanup_workspace, create_isolated_workspace};
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::fs;
 use tempfile::TempDir;
@@ -85,8 +83,7 @@ fn bench_absorb_workspace(c: &mut Criterion) {
                 (temp_dir, ws)
             },
             |(temp_dir, ws)| {
-                absorb_workspace(temp_dir.path(), &ws, None)
-                    .expect("Failed to absorb workspace");
+                absorb_workspace(temp_dir.path(), &ws, None).expect("Failed to absorb workspace");
 
                 // Cleanup after absorb
                 let _ = cleanup_workspace(temp_dir.path(), &ws);
@@ -119,12 +116,10 @@ fn bench_full_isolation_lifecycle(c: &mut Criterion) {
                 fs::write(ws.path.join("result.txt"), "agent output\n").unwrap();
 
                 // Absorb back to main
-                absorb_workspace(temp_dir.path(), &ws, None)
-                    .expect("Failed to absorb workspace");
+                absorb_workspace(temp_dir.path(), &ws, None).expect("Failed to absorb workspace");
 
                 // Cleanup
-                cleanup_workspace(temp_dir.path(), &ws)
-                    .expect("Failed to cleanup workspace");
+                cleanup_workspace(temp_dir.path(), &ws).expect("Failed to cleanup workspace");
             },
             criterion::BatchSize::LargeInput,
         );

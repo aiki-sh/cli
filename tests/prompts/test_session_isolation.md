@@ -27,16 +27,16 @@ Create 10 tasks:
 
 Launch all 10 with --async:
 
-    aiki task run <id-01> --async
-    aiki task run <id-02> --async
-    aiki task run <id-03> --async
-    aiki task run <id-04> --async
-    aiki task run <id-05> --async
-    aiki task run <id-06> --async
-    aiki task run <id-07> --async
-    aiki task run <id-08> --async
-    aiki task run <id-09> --async
-    aiki task run <id-10> --async
+    aiki run <id-01> --async
+    aiki run <id-02> --async
+    aiki run <id-03> --async
+    aiki run <id-04> --async
+    aiki run <id-05> --async
+    aiki run <id-06> --async
+    aiki run <id-07> --async
+    aiki run <id-08> --async
+    aiki run <id-09> --async
+    aiki run <id-10> --async
 
 ### 1.2 Monitor workspaces
 
@@ -119,11 +119,11 @@ Each agent replaces the placeholder in its assigned section:
 
 Launch all 5 with --async:
 
-    aiki task run <id-s1> --async
-    aiki task run <id-s2> --async
-    aiki task run <id-s3> --async
-    aiki task run <id-s4> --async
-    aiki task run <id-s5> --async
+    aiki run <id-s1> --async
+    aiki run <id-s2> --async
+    aiki run <id-s3> --async
+    aiki run <id-s4> --async
+    aiki run <id-s5> --async
 
 ### 2.2 Wait and verify merges
 
@@ -182,11 +182,11 @@ Each agent tries to replace the same line with a different value:
 
 Launch all 5 with --async:
 
-    aiki task run <id-c1> --async
-    aiki task run <id-c2> --async
-    aiki task run <id-c3> --async
-    aiki task run <id-c4> --async
-    aiki task run <id-c5> --async
+    aiki run <id-c1> --async
+    aiki run <id-c2> --async
+    aiki run <id-c3> --async
+    aiki run <id-c4> --async
+    aiki run <id-c5> --async
 
 ### 3.2 Wait and verify conflict handling
 
@@ -211,14 +211,136 @@ Resolve any conflicts (pick any agent's version or delete the file):
 
 ---
 
+## Phase 4: Human edits while agent works (concurrent human+agent)
+
+An agent works in an isolated workspace while the human edits the main workspace simultaneously.
+Both sets of changes must be preserved after the agent's workspace is absorbed.
+
+This tests the most common real-world scenario: a human continues working while an agent handles a delegated task.
+
+### 4.0 Setup
+
+Create two files — one for the human to edit, one for the agent to edit:
+
+```
+# human-file.txt
+This file will be edited by the human.
+HUMAN PLACEHOLDER
+End of human file.
+```
+
+```
+# agent-file.txt
+This file will be edited by the agent.
+AGENT PLACEHOLDER
+End of agent file.
+```
+
+Commit both files so the agent's workspace will see them:
+
+    jj commit -m "Add files for isolation test phase 4"
+
+### 4.1 Launch the agent
+
+Create and launch one agent task (async so you can continue):
+
+    aiki task add "Agent P4: In agent-file.txt, replace 'AGENT PLACEHOLDER' with 'Agent P4 was here at <timestamp>'. Then add 3 more lines below it with interesting facts about concurrency."
+    aiki run <id-p4> --async
+
+### 4.2 Simulate human edits while agent is working
+
+**Immediately** after launching the agent (before it finishes), make edits in the main workspace:
+
+1. Edit `human-file.txt` in the **default workspace** (NOT the agent workspace):
+   ```bash
+   # From the repo root (default workspace):
+   sed -i '' 's/HUMAN PLACEHOLDER/Human was here — edited while agent was working/' human-file.txt
+   ```
+2. Also create a brand new file that the agent doesn't know about:
+   ```bash
+   echo "This file was created by the human during phase 4" > human-new-file.txt
+   ```
+3. Verify the human edits are in the working copy:
+   ```bash
+   cat human-file.txt
+   cat human-new-file.txt
+   ```
+
+### 4.3 Wait for agent and verify both sets of changes
+
+    aiki task wait <id-p4>
+
+After the agent finishes:
+
+- `cat agent-file.txt` — verify the agent's edits are present (placeholder replaced + extra lines)
+- `cat human-file.txt` — verify the human's edit is still present ("Human was here — edited while agent was working")
+- `cat human-new-file.txt` — verify the human's new file still exists
+- `jj status` — check for any conflicts
+- `jj log -r ..@` — verify the agent's change was absorbed as a separate commit
+- `jj show <agent-change-id>` — confirm the change only touches `agent-file.txt` (not human files)
+
+**Critical checks:**
+- Human's edit to `human-file.txt` was NOT overwritten by the agent's workspace absorption
+- Human's new file `human-new-file.txt` was NOT deleted
+- Agent's edit to `agent-file.txt` was properly absorbed
+- No conflict markers in any file (the edits are to different files, so no conflicts expected)
+
+### 4.4 Bonus: Same file, different sections (human + agent)
+
+To also test the case where human and agent edit the **same file** in different places:
+
+Create `shared-human-agent.txt`:
+
+```
+=== HUMAN SECTION ===
+human placeholder
+
+=== AGENT SECTION ===
+agent placeholder
+```
+
+Commit it:
+
+    jj commit -m "Add shared-human-agent.txt for phase 4 bonus"
+
+Launch the agent:
+
+    aiki task add "Agent P4B: In shared-human-agent.txt, replace 'agent placeholder' with 'Agent P4B edited this section at <timestamp>'. Do NOT touch the human section."
+    aiki run <id-p4b> --async
+
+While the agent is running, edit the human section in the default workspace:
+
+```bash
+sed -i '' 's/human placeholder/Human edited this section while agent was working/' shared-human-agent.txt
+```
+
+Wait for the agent:
+
+    aiki task wait <id-p4b>
+
+Verify:
+
+- `cat shared-human-agent.txt` — both sections should have their respective edits
+- No conflict markers — the edits are in different sections
+- `jj status` — no conflicts reported
+
+### 4.5 Cleanup phase 4
+
+    rm -f human-file.txt agent-file.txt human-new-file.txt shared-human-agent.txt
+
+Record phase 4 results before continuing.
+
+---
+
 ## Final Summary
 
 Close the parent task with results:
 
-    aiki task close <PARENT> --summary "Results: Phase 1 (10 separate files): PASS/FAIL. Phase 2 (same file, different sections): PASS/FAIL. Phase 3 (same file, same line — conflict): PASS/FAIL. Details: ..."
+    aiki task close <PARENT> --summary "Results: Phase 1 (10 separate files): PASS/FAIL. Phase 2 (same file, different sections): PASS/FAIL. Phase 3 (same file, same line — conflict): PASS/FAIL. Phase 4 (human+agent concurrent): PASS/FAIL. Details: ..."
 
 **Report format:** For each phase and sub-check, state PASS or FAIL with details. Include any error output verbatim. Pay special attention to:
 - Were all workspaces created and cleaned up?
 - Were all changes absorbed with correct metadata?
 - Did non-conflicting same-file merges succeed cleanly?
 - Were conflicts detected and reported correctly (no silent data loss)?
+- Were human edits preserved when agent workspace was absorbed? (Phase 4)

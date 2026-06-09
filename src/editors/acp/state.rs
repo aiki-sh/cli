@@ -28,13 +28,9 @@ pub enum StateMessage {
         session_id: SessionId,
     },
     /// Clear response accumulator for a session (on new prompt)
-    ClearAccumulator {
-        session_id: SessionId,
-    },
+    ClearAccumulator { session_id: SessionId },
     /// Reset autoreply counter for a session (on new user prompt)
-    ResetAutoreplyCounter {
-        session_id: SessionId,
-    },
+    ResetAutoreplyCounter { session_id: SessionId },
     /// Track session/new request ID to match with response for session.started event
     TrackNewSession {
         request_id: serde_json::Value, // Raw JSON-RPC "id" field (normalized at consumption)

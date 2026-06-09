@@ -65,96 +65,61 @@ enum CursorEvent {
 
 /// beforeSubmitPrompt hook payload
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)] // Fields needed for serde deserialization
 struct BeforeSubmitPromptPayload {
     #[serde(rename = "conversationId")]
     conversation_id: String,
-    #[serde(rename = "generationId")]
-    generation_id: String,
-    model: String,
     #[serde(rename = "cursorVersion")]
     cursor_version: String,
     #[serde(rename = "workspaceRoots")]
     workspace_roots: Vec<String>,
-    #[serde(rename = "userEmail")]
-    user_email: Option<String>,
     #[serde(default)]
     prompt: String,
 }
 
 /// stop hook payload
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)] // Fields needed for serde deserialization
 struct StopPayload {
     #[serde(rename = "conversationId")]
     conversation_id: String,
-    #[serde(rename = "generationId")]
-    generation_id: String,
-    model: String,
     #[serde(rename = "cursorVersion")]
     cursor_version: String,
     #[serde(rename = "workspaceRoots")]
     workspace_roots: Vec<String>,
-    #[serde(rename = "userEmail")]
-    user_email: Option<String>,
-    status: String,
-    loop_count: u32,
 }
 
 /// beforeShellExecution hook payload
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)] // Fields needed for serde deserialization
 struct BeforeShellExecutionPayload {
     #[serde(rename = "conversationId")]
     conversation_id: String,
-    #[serde(rename = "generationId")]
-    generation_id: String,
-    model: String,
     #[serde(rename = "cursorVersion")]
     cursor_version: String,
-    #[serde(rename = "workspaceRoots")]
-    workspace_roots: Vec<String>,
-    #[serde(rename = "userEmail")]
-    user_email: Option<String>,
     command: String,
     cwd: String,
 }
 
 /// afterShellExecution hook payload
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)] // Fields needed for serde deserialization
 struct AfterShellExecutionPayload {
     #[serde(rename = "conversationId")]
     conversation_id: String,
-    #[serde(rename = "generationId")]
-    generation_id: String,
-    model: String,
     #[serde(rename = "cursorVersion")]
     cursor_version: String,
     #[serde(rename = "workspaceRoots")]
     workspace_roots: Vec<String>,
-    #[serde(rename = "userEmail")]
-    user_email: Option<String>,
     command: String,
     output: String,
-    duration: u64,
 }
 
 /// beforeMCPExecution hook payload
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)] // Fields needed for serde deserialization
 pub struct BeforeMcpExecutionPayload {
     #[serde(rename = "conversationId")]
     pub conversation_id: String,
-    #[serde(rename = "generationId")]
-    pub generation_id: String,
-    pub model: String,
     #[serde(rename = "cursorVersion")]
     pub cursor_version: String,
     #[serde(rename = "workspaceRoots")]
     pub workspace_roots: Vec<String>,
-    #[serde(rename = "userEmail")]
-    pub user_email: Option<String>,
     #[serde(rename = "toolName")]
     pub tool_name: String,
     #[serde(rename = "toolInput")]
@@ -163,43 +128,28 @@ pub struct BeforeMcpExecutionPayload {
 
 /// afterMCPExecution hook payload
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)] // Fields needed for serde deserialization
 struct AfterMcpExecutionPayload {
     #[serde(rename = "conversationId")]
     conversation_id: String,
-    #[serde(rename = "generationId")]
-    generation_id: String,
-    model: String,
     #[serde(rename = "cursorVersion")]
     cursor_version: String,
     #[serde(rename = "workspaceRoots")]
     workspace_roots: Vec<String>,
-    #[serde(rename = "userEmail")]
-    user_email: Option<String>,
     #[serde(rename = "toolName")]
     tool_name: String,
-    #[serde(rename = "toolInput")]
-    tool_input: String,
     #[serde(rename = "resultJson")]
     result_json: String,
-    duration: u64,
 }
 
 /// afterFileEdit hook payload
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)] // Fields needed for serde deserialization
 struct AfterFileEditPayload {
     #[serde(rename = "conversationId")]
     conversation_id: String,
-    #[serde(rename = "generationId")]
-    generation_id: String,
-    model: String,
     #[serde(rename = "cursorVersion")]
     cursor_version: String,
     #[serde(rename = "workspaceRoots")]
     workspace_roots: Vec<String>,
-    #[serde(rename = "userEmail")]
-    user_email: Option<String>,
     #[serde(rename = "filePath")]
     file_path: String,
     edits: Vec<EditPayload>,
@@ -217,7 +167,6 @@ struct EditPayload {
 /// Cursor fires this when the session terminates.
 /// Reasons: "completed", "aborted", "error", "window_close", "user_close"
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)] // Fields needed for serde deserialization
 struct SessionEndPayload {
     #[serde(rename = "conversationId")]
     conversation_id: String,
@@ -228,12 +177,6 @@ struct SessionEndPayload {
     /// Reason for session termination
     #[serde(default)]
     reason: String,
-    /// Session duration in milliseconds
-    #[serde(default)]
-    duration_ms: u64,
-    /// Whether this was a background agent
-    #[serde(default, rename = "isBackgroundAgent")]
-    is_background_agent: bool,
 }
 
 // ============================================================================
@@ -371,7 +314,7 @@ fn build_change_completed_event(payload: AfterFileEditPayload) -> AikiEvent {
         cwd,
         timestamp: chrono::Utc::now(),
         tool_name: "edit".to_string(), // Cursor doesn't distinguish Edit/Write
-        success: true, // afterFileEdit implies success
+        success: true,                 // afterFileEdit implies success
         turn: crate::events::Turn::unknown(), // Cursor events don't have turn context
         operation: ChangeOperation::Write(WriteOperation {
             file_paths: vec![file_path],
@@ -387,9 +330,11 @@ fn build_turn_completed_event(payload: StopPayload) -> AikiEvent {
         cwd: get_cwd(&payload.workspace_roots),
         timestamp: chrono::Utc::now(),
         turn: crate::events::Turn::unknown(), // Set by handle_turn_completed
-        response: String::new(), // Cursor doesn't provide response text in stop hook
-        modified_files: Vec::new(), // Cursor doesn't track modified files in stop hook
-        tasks: Default::default(), // Populated by handle_turn_completed
+        response: String::new(),              // Cursor doesn't provide response text in stop hook
+        modified_files: Vec::new(),           // Cursor doesn't track modified files in stop hook
+        tasks: Default::default(),            // Populated by handle_turn_completed
+        tokens: None,
+        model: None,
     })
 }
 
@@ -400,6 +345,7 @@ fn build_session_ended_event(payload: SessionEndPayload) -> AikiEvent {
         cwd: get_cwd(&payload.workspace_roots),
         timestamp: chrono::Utc::now(),
         reason: payload.reason,
+        tokens: None,
     })
 }
 

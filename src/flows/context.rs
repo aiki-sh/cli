@@ -24,7 +24,7 @@
 //! assembler.add_chunk(chunk1);
 //!
 //! // Build final message
-//! let result = assembler.build();
+//! let result = assembler.build_with_original();
 //! // Result: "First line\noriginal content\nLast line"
 //! ```
 
@@ -187,36 +187,6 @@ impl ContextChunk {
         }
     }
 
-    /// Generate a deterministic checksum ID for this chunk.
-    ///
-    /// This is used for deduplication and change tracking. The same content
-    /// will always produce the same ID.
-    ///
-    /// # Normalization
-    ///
-    /// Trailing newlines are automatically stripped during YAML deserialization,
-    /// so `prepend: |` and `prepend: "text"` produce identical check IDs.
-    ///
-    /// # Returns
-    ///
-    /// An 8-character hex-encoded hash of the chunk's YAML representation.
-    #[must_use]
-    #[allow(dead_code)] // Part of ContextChunk API
-    pub fn check_id(&self) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        // Data is already normalized during deserialization
-        let yaml = serde_yaml::to_string(self).expect("ContextChunk should always serialize");
-
-        let mut hasher = DefaultHasher::new();
-        yaml.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        // Return first 8 hex chars for readability (truncate u64 to 32 bits)
-        format!("{:08x}", (hash & 0xFFFF_FFFF) as u32)
-    }
-
     /// Get prepend items as a vector of strings.
     ///
     /// Returns an empty vector if prepend is None.
@@ -279,25 +249,33 @@ impl ContextChunk {
     where
         F: FnMut(&str) -> Result<String, crate::error::AikiError>,
     {
-        let resolved_prepend: Option<TextLines> = self.prepend.map(|text_lines| -> crate::error::Result<TextLines> {
-            match text_lines {
-                TextLines::Single(s) => Ok(TextLines::Single(resolver(&s)?)),
-                TextLines::Multiple(lines) => {
-                    let resolved: Result<Vec<_>, crate::error::AikiError> = lines.iter().map(|line| resolver(line)).collect();
-                    Ok(TextLines::Multiple(resolved?))
+        let resolved_prepend: Option<TextLines> = self
+            .prepend
+            .map(|text_lines| -> crate::error::Result<TextLines> {
+                match text_lines {
+                    TextLines::Single(s) => Ok(TextLines::Single(resolver(&s)?)),
+                    TextLines::Multiple(lines) => {
+                        let resolved: Result<Vec<_>, crate::error::AikiError> =
+                            lines.iter().map(|line| resolver(line)).collect();
+                        Ok(TextLines::Multiple(resolved?))
+                    }
                 }
-            }
-        }).transpose()?;
+            })
+            .transpose()?;
 
-        let resolved_append: Option<TextLines> = self.append.map(|text_lines| -> crate::error::Result<TextLines> {
-            match text_lines {
-                TextLines::Single(s) => Ok(TextLines::Single(resolver(&s)?)),
-                TextLines::Multiple(lines) => {
-                    let resolved: Result<Vec<_>, crate::error::AikiError> = lines.iter().map(|line| resolver(line)).collect();
-                    Ok(TextLines::Multiple(resolved?))
+        let resolved_append: Option<TextLines> = self
+            .append
+            .map(|text_lines| -> crate::error::Result<TextLines> {
+                match text_lines {
+                    TextLines::Single(s) => Ok(TextLines::Single(resolver(&s)?)),
+                    TextLines::Multiple(lines) => {
+                        let resolved: Result<Vec<_>, crate::error::AikiError> =
+                            lines.iter().map(|line| resolver(line)).collect();
+                        Ok(TextLines::Multiple(resolved?))
+                    }
                 }
-            }
-        }).transpose()?;
+            })
+            .transpose()?;
 
         Ok(Self {
             prepend: resolved_prepend,
@@ -318,7 +296,7 @@ impl Default for ContextChunk {
 ///
 /// 1. Create assembler with optional original content
 /// 2. Add chunks from different flows
-/// 3. Call `build()` to produce final message
+/// 3. Call `build_with_original()` to produce final message
 ///
 /// # Example
 ///
@@ -339,7 +317,7 @@ impl Default for ContextChunk {
 /// };
 /// assembler.add_chunk(chunk2);
 ///
-/// assert_eq!(assembler.build(), "Top\nMiddle\nBottom");
+/// assert_eq!(assembler.build_with_original(), "Top\nMiddle\nBottom");
 /// ```
 #[derive(Debug, Clone)]
 pub struct ContextAssembler {
@@ -388,7 +366,21 @@ impl ContextAssembler {
     ///
     /// The assembled message as a single string.
     #[must_use]
-    pub fn build(&self) -> String {
+    #[allow(dead_code)]
+    pub fn build_with_original(&self) -> String {
+        self.build_inner(true)
+    }
+
+    /// Build the final message from accumulated chunks without including original content.
+    ///
+    /// This is useful for hook protocols that already carry the user's original
+    /// prompt separately and only need Aiki-injected context.
+    #[must_use]
+    pub fn build_without_original(&self) -> String {
+        self.build_inner(false)
+    }
+
+    fn build_inner(&self, include_original: bool) -> String {
         let mut prepends = Vec::new();
         let mut appends = Vec::new();
 
@@ -405,9 +397,11 @@ impl ContextAssembler {
             parts.push(prepends.join("\n"));
         }
 
-        if let Some(ref orig) = self.original {
-            if !orig.is_empty() {
-                parts.push(orig.clone());
+        if include_original {
+            if let Some(ref orig) = self.original {
+                if !orig.is_empty() {
+                    parts.push(orig.clone());
+                }
             }
         }
 
@@ -418,45 +412,10 @@ impl ContextAssembler {
         parts.join(&self.separator)
     }
 
-    /// Get the number of chunks accumulated.
-    #[must_use]
-    #[allow(dead_code)] // Part of ContextAssembler API
-    pub fn chunk_count(&self) -> usize {
-        self.chunks.len()
-    }
-
     /// Check if the assembler has any chunks.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty()
-    }
-
-    /// Clear all accumulated chunks, resetting the assembler.
-    ///
-    /// This is useful for error recovery where you want to discard all
-    /// accumulated chunks without allocating a new assembler.
-    ///
-    /// The original content and separator are preserved.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use aiki::flows::context::{ContextChunk, ContextAssembler, TextLines};
-    ///
-    /// let mut assembler = ContextAssembler::new(Some("original".to_string()), "\n");
-    /// assembler.add_chunk(ContextChunk {
-    ///     prepend: Some(TextLines::Single("bad".to_string())),
-    ///     append: None,
-    /// });
-    ///
-    /// // Error occurred, reset
-    /// assembler.clear();
-    /// assert!(assembler.is_empty());
-    /// assert_eq!(assembler.build(), "original"); // Original preserved
-    /// ```
-    #[allow(dead_code)] // Part of ContextAssembler API
-    pub fn clear(&mut self) {
-        self.chunks.clear();
     }
 }
 
@@ -497,7 +456,7 @@ mod tests {
         let mut assembler = ContextAssembler::new(Some("original".to_string()), "\n");
         assembler.add_chunk(chunk);
 
-        assert_eq!(assembler.build(), "prepended\noriginal");
+        assert_eq!(assembler.build_with_original(), "prepended\noriginal");
     }
 
     #[test]
@@ -510,7 +469,7 @@ mod tests {
         let mut assembler = ContextAssembler::new(Some("original".to_string()), "\n");
         assembler.add_chunk(chunk);
 
-        assert_eq!(assembler.build(), "original\nappended");
+        assert_eq!(assembler.build_with_original(), "original\nappended");
     }
 
     #[test]
@@ -523,7 +482,7 @@ mod tests {
         let mut assembler = ContextAssembler::new(Some("middle".to_string()), "\n");
         assembler.add_chunk(chunk);
 
-        assert_eq!(assembler.build(), "before\nmiddle\nafter");
+        assert_eq!(assembler.build_with_original(), "before\nmiddle\nafter");
     }
 
     #[test]
@@ -539,136 +498,7 @@ mod tests {
         let mut assembler = ContextAssembler::new(Some("original".to_string()), "\n");
         assembler.add_chunk(chunk);
 
-        assert_eq!(assembler.build(), "line1\nline2\noriginal\nline3");
-    }
-
-    #[test]
-    fn test_check_id_is_deterministic() {
-        let chunk1 = ContextChunk {
-            prepend: Some(TextLines::Single("test".to_string())),
-            append: Some(TextLines::Single("content".to_string())),
-        };
-
-        let chunk2 = ContextChunk {
-            prepend: Some(TextLines::Single("test".to_string())),
-            append: Some(TextLines::Single("content".to_string())),
-        };
-
-        assert_eq!(chunk1.check_id(), chunk2.check_id());
-    }
-
-    #[test]
-    fn test_check_id_differs_for_different_content() {
-        let chunk1 = ContextChunk {
-            prepend: Some(TextLines::Single("test1".to_string())),
-            append: None,
-        };
-
-        let chunk2 = ContextChunk {
-            prepend: Some(TextLines::Single("test2".to_string())),
-            append: None,
-        };
-
-        assert_ne!(chunk1.check_id(), chunk2.check_id());
-    }
-
-    #[test]
-    fn test_yaml_forms_produce_same_check_id() {
-        // Form 1: Block scalar with trailing newline (as it appears in raw YAML)
-        let yaml_block = r#"
-prepend: |
-  line1
-  line2
-"#;
-
-        // Form 2: Array syntax
-        let yaml_array = r#"
-prepend:
-  - "line1"
-  - "line2"
-"#;
-
-        // Form 3: Inline string with \n
-        let yaml_inline = r#"
-prepend: "line1\nline2"
-"#;
-
-        let chunk_block: ContextChunk = serde_yaml::from_str(yaml_block).unwrap();
-        let chunk_array: ContextChunk = serde_yaml::from_str(yaml_array).unwrap();
-        let chunk_inline: ContextChunk = serde_yaml::from_str(yaml_inline).unwrap();
-
-        // Forms 1 and 3 should produce identical check IDs (both single strings)
-        assert_eq!(
-            chunk_block.check_id(),
-            chunk_inline.check_id(),
-            "Block scalar and inline string should have same check ID"
-        );
-
-        // Form 2 (array) will have a different check ID because the structure differs
-        // This is intentional - changing YAML structure is considered a flow edit
-        assert_ne!(
-            chunk_block.check_id(),
-            chunk_array.check_id(),
-            "Array form should have different check ID from single string"
-        );
-    }
-
-    #[test]
-    fn test_check_id_normalization_via_yaml() {
-        // Test normalization through YAML deserialization (the real-world path)
-        // Block scalar form (has trailing newline in YAML)
-        let yaml_block = r#"
-prepend: |
-  Header text
-append: |
-  Footer text
-"#;
-
-        // Inline string form (no trailing newline)
-        let yaml_inline = r#"
-prepend: "Header text"
-append: "Footer text"
-"#;
-
-        let chunk_block: ContextChunk = serde_yaml::from_str(yaml_block).unwrap();
-        let chunk_inline: ContextChunk = serde_yaml::from_str(yaml_inline).unwrap();
-
-        // Should produce identical check IDs after normalization during deserialization
-        assert_eq!(
-            chunk_block.check_id(),
-            chunk_inline.check_id(),
-            "Trailing newlines should be normalized during YAML deserialization"
-        );
-    }
-
-    #[test]
-    fn test_check_id_normalization_arrays_via_yaml() {
-        // Test array normalization through YAML deserialization
-        // Array with block scalars (each item has trailing newline in YAML)
-        let yaml_block = r#"
-prepend:
-  - |
-    line1
-  - |
-    line2
-"#;
-
-        // Array with inline strings (no trailing newlines)
-        let yaml_inline = r#"
-prepend:
-  - "line1"
-  - "line2"
-"#;
-
-        let chunk_block: ContextChunk = serde_yaml::from_str(yaml_block).unwrap();
-        let chunk_inline: ContextChunk = serde_yaml::from_str(yaml_inline).unwrap();
-
-        // Should produce identical check IDs after normalization during deserialization
-        assert_eq!(
-            chunk_block.check_id(),
-            chunk_inline.check_id(),
-            "Array items should have trailing newlines normalized during YAML deserialization"
-        );
+        assert_eq!(assembler.build_with_original(), "line1\nline2\noriginal\nline3");
     }
 
     #[test]
@@ -685,7 +515,7 @@ prepend: |
         let mut assembler = ContextAssembler::new(Some("original".to_string()), "\n");
         assembler.add_chunk(chunk);
 
-        let result = assembler.build();
+        let result = assembler.build_with_original();
         // The block scalar preserves the trailing newline in the string
         assert!(result.starts_with("Line 1\nLine 2"));
     }
@@ -704,7 +534,7 @@ append:
         let mut assembler = ContextAssembler::new(Some("original".to_string()), "\n");
         assembler.add_chunk(chunk);
 
-        assert_eq!(assembler.build(), "Line 1\nLine 2\noriginal\nLine 3");
+        assert_eq!(assembler.build_with_original(), "Line 1\nLine 2\noriginal\nLine 3");
     }
 
     #[test]
@@ -732,7 +562,10 @@ append:
         let mut assembler2 = ContextAssembler::new(Some("Body".to_string()), "\n");
         assembler2.add_chunk(chunk2);
 
-        assert_eq!(assembler1.build(), assembler2.build());
+        assert_eq!(
+            assembler1.build_with_original(),
+            assembler2.build_with_original()
+        );
     }
 
     #[test]
@@ -793,7 +626,7 @@ mod assembler_tests {
         };
         assembler.add_chunk(chunk);
 
-        assert_eq!(assembler.build(), "before\noriginal\nafter");
+        assert_eq!(assembler.build_with_original(), "before\noriginal\nafter");
     }
 
     #[test]
@@ -813,7 +646,19 @@ mod assembler_tests {
         assembler.add_chunk(chunk2);
 
         // Order: all prepends, original, all appends
-        assert_eq!(assembler.build(), "first\nsecond\noriginal\nend");
+        assert_eq!(assembler.build_with_original(), "first\nsecond\noriginal\nend");
+    }
+
+    #[test]
+    fn test_build_without_original_when_original_exists() {
+        let mut assembler = ContextAssembler::new(Some("original".to_string()), "\n\n");
+
+        assembler.add_chunk(ContextChunk {
+            prepend: Some(TextLines::Single("before".to_string())),
+            append: Some(TextLines::Single("after".to_string())),
+        });
+
+        assert_eq!(assembler.build_without_original(), "before\n\nafter");
     }
 
     #[test]
@@ -826,7 +671,7 @@ mod assembler_tests {
         };
         assembler.add_chunk(chunk);
 
-        assert_eq!(assembler.build(), "start\nend");
+        assert_eq!(assembler.build_with_original(), "start\nend");
     }
 
     #[test]
@@ -839,14 +684,14 @@ mod assembler_tests {
         };
         assembler.add_chunk(chunk);
 
-        assert_eq!(assembler.build(), "A | middle | B");
+        assert_eq!(assembler.build_with_original(), "A | middle | B");
     }
 
     #[test]
     fn test_build_empty_chunks() {
         let assembler = ContextAssembler::new(Some("only original".to_string()), "\n");
 
-        assert_eq!(assembler.build(), "only original");
+        assert_eq!(assembler.build_with_original(), "only original");
     }
 
     #[test]
@@ -860,19 +705,7 @@ mod assembler_tests {
         assembler.add_chunk(chunk);
 
         // Empty original should be skipped
-        assert_eq!(assembler.build(), "before\nafter");
-    }
-
-    #[test]
-    fn test_chunk_count() {
-        let mut assembler = ContextAssembler::new(None, "\n");
-        assert_eq!(assembler.chunk_count(), 0);
-
-        assembler.add_chunk(ContextChunk::new());
-        assert_eq!(assembler.chunk_count(), 1);
-
-        assembler.add_chunk(ContextChunk::new());
-        assert_eq!(assembler.chunk_count(), 2);
+        assert_eq!(assembler.build_with_original(), "before\nafter");
     }
 
     #[test]
@@ -882,55 +715,6 @@ mod assembler_tests {
 
         assembler.add_chunk(ContextChunk::new());
         assert!(!assembler.is_empty());
-    }
-
-    #[test]
-    fn test_clear() {
-        let mut assembler = ContextAssembler::new(Some("original".to_string()), "\n\n");
-
-        // Add some chunks
-        assembler.add_chunk(ContextChunk {
-            prepend: Some(TextLines::Single("header".to_string())),
-            append: None,
-        });
-        assembler.add_chunk(ContextChunk {
-            prepend: None,
-            append: Some(TextLines::Single("footer".to_string())),
-        });
-
-        assert_eq!(assembler.chunk_count(), 2);
-        assert!(!assembler.is_empty());
-
-        // Clear all chunks
-        assembler.clear();
-
-        assert_eq!(assembler.chunk_count(), 0);
-        assert!(assembler.is_empty());
-
-        // Original content should be preserved
-        assert_eq!(assembler.build(), "original");
-    }
-
-    #[test]
-    fn test_clear_and_reuse() {
-        let mut assembler = ContextAssembler::new(Some("original".to_string()), "\n\n");
-
-        // First batch of chunks
-        assembler.add_chunk(ContextChunk {
-            prepend: Some(TextLines::Single("bad".to_string())),
-            append: None,
-        });
-
-        // Error occurred, clear
-        assembler.clear();
-
-        // Add good chunks
-        assembler.add_chunk(ContextChunk {
-            prepend: Some(TextLines::Single("good".to_string())),
-            append: None,
-        });
-
-        assert_eq!(assembler.build(), "good\n\noriginal");
     }
 
     #[test]
@@ -945,7 +729,7 @@ mod assembler_tests {
         assembler.add_chunk(chunk);
 
         // Should have double newlines between sections
-        assert_eq!(assembler.build(), "before\n\nmiddle\n\nafter");
+        assert_eq!(assembler.build_with_original(), "before\n\nmiddle\n\nafter");
     }
 
     #[test]
@@ -972,7 +756,7 @@ mod assembler_tests {
             append: Some(TextLines::Single("Confirm you understand".to_string())),
         });
 
-        let result = assembler.build();
+        let result = assembler.build_with_original();
 
         // Verify structure: prepends (joined with \n), original, appends
         // with \n\n between major sections
@@ -995,7 +779,7 @@ mod assembler_tests {
             ])),
         });
 
-        let result = assembler.build();
+        let result = assembler.build_with_original();
 
         // Trailers should be joined with single newline (not double)
         assert_eq!(
@@ -1016,7 +800,7 @@ mod assembler_tests {
             append: Some(TextLines::Single("Café ☕ — Naïve résumé".to_string())),
         });
 
-        let result = assembler.build();
+        let result = assembler.build_with_original();
 
         // Verify Unicode is preserved correctly
         assert!(result.contains("🎯 Priority: مرتفع"));
@@ -1028,31 +812,6 @@ mod assembler_tests {
             result,
             "🎯 Priority: مرتفع\n\n中文内容 🚀\n\nCafé ☕ — Naïve résumé"
         );
-    }
-
-    #[test]
-    fn test_unicode_in_check_id() {
-        // Verify check_id handles Unicode correctly and deterministically
-        let chunk1 = ContextChunk {
-            prepend: Some(TextLines::Single("Hello 世界 🌍".to_string())),
-            append: None,
-        };
-
-        let chunk2 = ContextChunk {
-            prepend: Some(TextLines::Single("Hello 世界 🌍".to_string())),
-            append: None,
-        };
-
-        let chunk3 = ContextChunk {
-            prepend: Some(TextLines::Single("Hello world".to_string())),
-            append: None,
-        };
-
-        // Same Unicode content should produce same check_id
-        assert_eq!(chunk1.check_id(), chunk2.check_id());
-
-        // Different content should produce different check_id
-        assert_ne!(chunk1.check_id(), chunk3.check_id());
     }
 
     #[test]
@@ -1069,7 +828,7 @@ mod assembler_tests {
             append: Some(TextLines::Single(long_append.clone())),
         });
 
-        let result = assembler.build();
+        let result = assembler.build_with_original();
 
         // Verify all content is present
         assert!(result.starts_with(&long_prepend));
@@ -1079,25 +838,6 @@ mod assembler_tests {
         // Verify expected length (with separators)
         let expected_len = long_prepend.len() + 2 + long_original.len() + 2 + long_append.len();
         assert_eq!(result.len(), expected_len);
-    }
-
-    #[test]
-    fn test_very_long_check_id_performance() {
-        // Verify check_id works efficiently with large content
-        let large_content = "X".repeat(100_000);
-
-        let chunk = ContextChunk {
-            prepend: Some(TextLines::Single(large_content)),
-            append: None,
-        };
-
-        // Should complete without panic or excessive memory usage
-        let id = chunk.check_id();
-
-        // Check ID should still be 8 hex chars (format! ensures this)
-        assert_eq!(id.len(), 8);
-        // Verify it's valid hex
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -1121,7 +861,7 @@ mod assembler_tests {
             append: Some(TextLines::Single("THIRD_APP".to_string())),
         });
 
-        let result = assembler.build();
+        let result = assembler.build_with_original();
 
         // Expected: all prepends joined with \n, then separator, then original, then separator, then all appends joined with \n
         // Note: prepends/appends are ALWAYS joined with \n internally, separator is only between major sections
@@ -1175,7 +915,7 @@ mod assembler_tests {
             append: None,
         });
 
-        let result = assembler.build();
+        let result = assembler.build_with_original();
 
         // All prepends should come first in order (P1, P2, P3) joined with \n
         // Then separator (-)

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use crate::cache::debug_log;
 use crate::error::Result;
 use crate::events::FileOperation;
+use crate::events::TokenUsage;
 use crate::events::{
     parse_mcp_server, AikiChangeCompletedPayload, AikiChangePermissionAskedPayload, AikiEvent,
     AikiMcpCompletedPayload, AikiMcpPermissionAskedPayload, AikiReadCompletedPayload,
@@ -11,8 +12,7 @@ use crate::events::{
     AikiSessionEndedPayload, AikiSessionResumedPayload, AikiSessionStartPayload,
     AikiSessionWillCompactPayload, AikiShellCompletedPayload, AikiShellPermissionAskedPayload,
     AikiTurnCompletedPayload, AikiTurnStartedPayload, AikiWebCompletedPayload,
-    AikiWebPermissionAskedPayload, ChangeOperation, DeleteOperation, MoveOperation,
-    WriteOperation,
+    AikiWebPermissionAskedPayload, ChangeOperation, DeleteOperation, MoveOperation, WriteOperation,
 };
 use crate::tools::ToolType;
 
@@ -164,8 +164,22 @@ struct PreCompactPayload {
 pub fn build_aiki_event_from_stdin() -> Result<AikiEvent> {
     // Parse event - serde discriminates by hook_event_name
     let event: ClaudeEvent = super::super::read_stdin_json()?;
+    Ok(claude_event_to_aiki(event))
+}
 
-    let aiki_event = match event {
+/// Build AikiEvent from a pre-read JSON payload buffer.
+///
+/// Used by the sync fallback path when stdin was already consumed
+/// (e.g. async SessionEnd spawn failed).
+pub fn build_aiki_event_from_json(payload: &[u8]) -> Result<AikiEvent> {
+    let event: ClaudeEvent =
+        serde_json::from_slice(payload).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(claude_event_to_aiki(event))
+}
+
+/// Convert a parsed ClaudeEvent into an AikiEvent.
+fn claude_event_to_aiki(event: ClaudeEvent) -> AikiEvent {
+    match event {
         ClaudeEvent::SessionStart { payload } => build_session_started_event(payload),
         ClaudeEvent::UserPromptSubmit { payload } => build_turn_started_event(payload),
         ClaudeEvent::PreToolUse { payload } => build_permission_asked_event_for_tool_type(payload),
@@ -173,9 +187,7 @@ pub fn build_aiki_event_from_stdin() -> Result<AikiEvent> {
         ClaudeEvent::PreCompact { payload } => build_session_will_compact_event(payload),
         ClaudeEvent::Stop { payload } => build_turn_completed_event(payload),
         ClaudeEvent::SessionEnd { payload } => build_session_ended_event(payload),
-    };
-
-    Ok(aiki_event)
+    }
 }
 
 /// Build appropriate pre-tool event based on tool type
@@ -187,7 +199,14 @@ fn build_permission_asked_event_for_tool_type(payload: PreToolUsePayload) -> Aik
         ToolType::Shell => build_shell_permission_asked_event(payload, tool),
         ToolType::Mcp => build_mcp_permission_asked_event(payload),
         ToolType::Web => build_web_permission_asked_event(payload, tool),
-        ToolType::Internal => AikiEvent::Unsupported,
+        ToolType::Internal => {
+            // Special handling for ExitPlanMode: absorb workspace before showing approval prompt
+            if payload.tool_name == "ExitPlanMode" {
+                let session = create_session(&payload.session_id, &payload.cwd);
+                let _ = crate::flows::core::workspace_absorb_all(&session);
+            }
+            AikiEvent::Unsupported
+        }
     }
 }
 
@@ -237,6 +256,7 @@ fn build_session_started_event(payload: SessionStartPayload) -> AikiEvent {
             session,
             cwd,
             timestamp,
+            transcript_path: None,
         }),
     }
 }
@@ -303,9 +323,7 @@ fn build_change_permission_asked_event_write(
             Vec::new()
         }
         _ => {
-            eprintln!(
-                "[aiki] Warning: Unexpected tool type in change.permission_asked (write)"
-            );
+            eprintln!("[aiki] Warning: Unexpected tool type in change.permission_asked (write)");
             Vec::new()
         }
     };
@@ -530,10 +548,7 @@ fn build_change_completed_event_write(payload: PostToolUsePayload, tool: ClaudeT
 /// Claude Code doesn't currently have a dedicated delete file tool (deletes come
 /// through shell commands like rm/rmdir), but we implement this handler properly
 /// for future compatibility and to ensure the event pipeline doesn't drop operations.
-fn build_change_completed_event_delete(
-    payload: PostToolUsePayload,
-    tool: ClaudeTool,
-) -> AikiEvent {
+fn build_change_completed_event_delete(payload: PostToolUsePayload, tool: ClaudeTool) -> AikiEvent {
     // Extract file paths from tool - if no paths available, use empty list
     let file_paths = match tool {
         ClaudeTool::Edit(input) | ClaudeTool::Write(input) | ClaudeTool::NotebookEdit(input) => {
@@ -569,10 +584,7 @@ fn build_change_completed_event_delete(
 /// Claude Code doesn't currently have a dedicated move/rename tool (moves come
 /// through shell commands like mv), but we implement this handler properly
 /// for future compatibility and to ensure the event pipeline doesn't drop operations.
-fn build_change_completed_event_move(
-    payload: PostToolUsePayload,
-    tool: ClaudeTool,
-) -> AikiEvent {
+fn build_change_completed_event_move(payload: PostToolUsePayload, tool: ClaudeTool) -> AikiEvent {
     // Extract source/destination paths from tool - if no paths available, use empty lists
     let (source_paths, destination_paths) = match tool {
         ClaudeTool::Edit(input) | ClaudeTool::Write(input) | ClaudeTool::NotebookEdit(input) => {
@@ -813,12 +825,14 @@ fn build_web_completed_event(payload: PostToolUsePayload, tool: ClaudeTool) -> A
     })
 }
 
+use crate::editors::transcript::{TranscriptEntry, TurnTranscript};
+
 /// Build turn.completed event (maps from Stop hook)
 fn build_turn_completed_event(payload: StopPayload) -> AikiEvent {
-    let response = payload
+    let transcript = payload
         .transcript_path
         .as_deref()
-        .and_then(|path| extract_last_assistant_response(path))
+        .map(|p| TurnTranscript::parse(p, parse_transcript_lines))
         .unwrap_or_default();
 
     AikiEvent::TurnCompleted(AikiTurnCompletedPayload {
@@ -826,29 +840,21 @@ fn build_turn_completed_event(payload: StopPayload) -> AikiEvent {
         cwd: PathBuf::from(&payload.cwd),
         timestamp: chrono::Utc::now(),
         turn: crate::events::Turn::unknown(), // Set by handle_turn_completed
-        response,
+        response: transcript.response,
         modified_files: vec![],
         tasks: Default::default(), // Populated by handle_turn_completed
+        tokens: transcript.tokens,
+        model: transcript.model,
     })
 }
 
-/// Extract the last assistant response text from a Claude Code JSONL transcript file.
+/// Parse Claude Code JSONL content into transcript entries.
 ///
-/// The transcript is a JSONL file where each line is a JSON object. Assistant entries
-/// have `"type": "assistant"` with a `message.content` array containing blocks like
-/// `{"type": "text", "text": "..."}`. We find the last assistant entry and concatenate
-/// all text blocks.
-fn extract_last_assistant_response(path: &str) -> Option<String> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            debug_log(|| format!("Failed to read transcript file '{}': {}", path, e));
-            return None;
-        }
-    };
+/// Resets on `"user"` entries so only the current (last) turn's entries are returned.
+fn parse_transcript_lines(content: &str) -> Vec<TranscriptEntry> {
+    let mut entries: Vec<TranscriptEntry> = Vec::new();
 
-    // Walk lines in reverse to find the last assistant entry
-    for line in content.lines().rev() {
+    for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -858,35 +864,72 @@ fn extract_last_assistant_response(path: &str) -> Option<String> {
             continue;
         };
 
-        if entry.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        let entry_type = entry.get("type").and_then(|t| t.as_str());
+
+        // Reset on user entry so we only return entries from the current turn
+        if entry_type == Some("user") {
+            entries.clear();
             continue;
         }
 
-        // Extract text from message.content array
-        let Some(content_arr) = entry
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_array())
-        else {
+        if entry_type != Some("assistant") {
+            continue;
+        }
+
+        let Some(message) = entry.get("message") else {
             continue;
         };
 
-        let text: String = content_arr
-            .iter()
-            .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
-            .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
-            // Skip streaming placeholder entries that Claude Code writes before the real response
-            .filter(|t| *t != "(no content)")
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut transcript_entry = TranscriptEntry::default();
 
-        if !text.is_empty() {
-            return Some(text);
+        // Extract text from message.content array
+        if let Some(content_arr) = message.get("content").and_then(|c| c.as_array()) {
+            let text: String = content_arr
+                .iter()
+                .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+                // Skip streaming placeholder entries that Claude Code writes before the real response
+                .filter(|t| *t != "(no content)")
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            if !text.is_empty() {
+                transcript_entry.response = Some(text);
+            }
         }
+
+        // Extract model string
+        if let Some(model) = message.get("model").and_then(|m| m.as_str()) {
+            transcript_entry.model = Some(model.to_string());
+        }
+
+        // Extract token usage from message.usage
+        if let Some(usage) = message.get("usage") {
+            let input = usage.get("input_tokens").and_then(|v| v.as_u64());
+            let output = usage.get("output_tokens").and_then(|v| v.as_u64());
+            if let (Some(input), Some(output)) = (input, output) {
+                let cache_read = usage
+                    .get("cache_read_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let cache_created = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+
+                transcript_entry.tokens = Some(TokenUsage {
+                    input,
+                    output,
+                    cache_read,
+                    cache_created,
+                });
+            }
+        }
+
+        entries.push(transcript_entry);
     }
 
-    debug_log(|| format!("No assistant response found in transcript '{}'", path));
-    None
+    entries
 }
 
 /// Build session.ended event (maps from SessionEnd hook)
@@ -896,6 +939,7 @@ fn build_session_ended_event(payload: SessionEndPayload) -> AikiEvent {
         cwd: PathBuf::from(&payload.cwd),
         timestamp: chrono::Utc::now(),
         reason: payload.reason,
+        tokens: None,
     })
 }
 
@@ -986,8 +1030,7 @@ mod tests {
     #[test]
     fn test_session_start_deserialization_defaults_to_startup() {
         // When source field is missing, it should default to "startup"
-        let json =
-            r#"{"hook_event_name":"SessionStart","session_id":"abc","cwd":"/tmp"}"#;
+        let json = r#"{"hook_event_name":"SessionStart","session_id":"abc","cwd":"/tmp"}"#;
         let event: ClaudeEvent = serde_json::from_str(json).unwrap();
         match event {
             ClaudeEvent::SessionStart { payload } => {
@@ -1007,5 +1050,261 @@ mod tests {
             }
             _ => panic!("Expected PreCompact variant"),
         }
+    }
+
+    #[test]
+    fn test_parse_transcript_with_usage_and_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = r#"{"type":"user","message":{"content":"hello"}}
+{"type":"assistant","message":{"model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"Hi there!"}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":30,"cache_creation_input_tokens":10}}}"#;
+        std::fs::write(&path, content).unwrap();
+
+        let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
+        assert_eq!(extract.response, "Hi there!");
+        assert_eq!(extract.model.as_deref(), Some("claude-sonnet-4-20250514"));
+        let tokens = extract.tokens.unwrap();
+        assert_eq!(tokens.input, 100);
+        assert_eq!(tokens.output, 50);
+        assert_eq!(tokens.cache_read, 30);
+        assert_eq!(tokens.cache_created, 10);
+    }
+
+    #[test]
+    fn test_parse_transcript_without_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Response without usage"}]}}"#;
+        std::fs::write(&path, content).unwrap();
+
+        let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
+        assert_eq!(extract.response, "Response without usage");
+        assert!(extract.tokens.is_none());
+        assert!(extract.model.is_none());
+    }
+
+    #[test]
+    fn test_parse_transcript_partial_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        // Has usage but missing cache fields
+        let content = r#"{"type":"assistant","message":{"model":"claude-opus-4-20250514","content":[{"type":"text","text":"Hello"}],"usage":{"input_tokens":200,"output_tokens":80}}}"#;
+        std::fs::write(&path, content).unwrap();
+
+        let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
+        assert_eq!(extract.response, "Hello");
+        assert_eq!(extract.model.as_deref(), Some("claude-opus-4-20250514"));
+        let tokens = extract.tokens.unwrap();
+        assert_eq!(tokens.input, 200);
+        assert_eq!(tokens.output, 80);
+        assert_eq!(tokens.cache_read, 0);
+        assert_eq!(tokens.cache_created, 0);
+    }
+
+    #[test]
+    fn test_parse_transcript_no_file() {
+        let t = TurnTranscript::parse("/nonexistent/path.jsonl", parse_transcript_lines);
+        assert_eq!(t.response, "");
+        assert!(t.tokens.is_none());
+    }
+
+    #[test]
+    fn test_parse_transcript_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        let t = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
+        assert_eq!(t.response, "");
+        assert!(t.tokens.is_none());
+    }
+
+    #[test]
+    fn test_build_turn_completed_populates_tokens_and_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = r#"{"type":"assistant","message":{"model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"Done!"}],"usage":{"input_tokens":500,"output_tokens":100,"cache_read_input_tokens":50,"cache_creation_input_tokens":0}}}"#;
+        std::fs::write(&path, content).unwrap();
+
+        let payload = StopPayload {
+            session_id: "test-session".to_string(),
+            cwd: "/tmp/test".to_string(),
+            transcript_path: Some(path.to_str().unwrap().to_string()),
+        };
+        let event = build_turn_completed_event(payload);
+        match event {
+            AikiEvent::TurnCompleted(p) => {
+                assert_eq!(p.response, "Done!");
+                assert_eq!(p.model.as_deref(), Some("claude-sonnet-4-20250514"));
+                let tokens = p.tokens.unwrap();
+                assert_eq!(tokens.input, 500);
+                assert_eq!(tokens.output, 100);
+                assert_eq!(tokens.cache_read, 50);
+                assert_eq!(tokens.cache_created, 0);
+            }
+            _ => panic!("Expected TurnCompleted"),
+        }
+    }
+
+    #[test]
+    fn test_extract_sums_tokens_across_multiple_assistant_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        // Simulate a turn with three assistant entries (tool-use rounds)
+        let content = [
+            r#"{"type":"user","message":{"content":"Do something complex"}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"Let me check..."}],"usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"(no content)"}],"usage":{"input_tokens":150,"output_tokens":30,"cache_read_input_tokens":20,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"Here is the result."}],"usage":{"input_tokens":200,"output_tokens":50,"cache_read_input_tokens":30,"cache_creation_input_tokens":10}}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, content).unwrap();
+
+        let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
+        // Response text should be from the last entry with non-empty/non-placeholder text
+        assert_eq!(extract.response, "Here is the result.");
+        assert_eq!(extract.model.as_deref(), Some("claude-sonnet-4-20250514"));
+        // Tokens should be summed across all three assistant entries
+        let tokens = extract.tokens.unwrap();
+        assert_eq!(tokens.input, 450);    // 100 + 150 + 200
+        assert_eq!(tokens.output, 100);   // 20 + 30 + 50
+        assert_eq!(tokens.cache_read, 60);     // 10 + 20 + 30
+        assert_eq!(tokens.cache_created, 15);  // 5 + 0 + 10
+    }
+
+    #[test]
+    fn test_extract_resets_accumulators_on_user_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        // Two turns: first turn has large tokens, second turn has small tokens.
+        // Only the second turn's tokens should be returned.
+        let content = [
+            r#"{"type":"user","message":{"content":"First question"}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"First answer"}],"usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":200,"cache_creation_input_tokens":100}}}"#,
+            r#"{"type":"user","message":{"content":"Second question"}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-20250514","content":[{"type":"text","text":"Second answer"}],"usage":{"input_tokens":50,"output_tokens":25,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, content).unwrap();
+
+        let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
+        assert_eq!(extract.response, "Second answer");
+        assert_eq!(extract.model.as_deref(), Some("claude-opus-4-20250514"));
+        // Only second turn's tokens, not accumulated from the first turn
+        let tokens = extract.tokens.unwrap();
+        assert_eq!(tokens.input, 50);
+        assert_eq!(tokens.output, 25);
+        assert_eq!(tokens.cache_read, 10);
+        assert_eq!(tokens.cache_created, 5);
+    }
+
+    #[test]
+    fn test_extract_tool_use_only_turn_returns_tokens() {
+        // Tool-use turn: stop_reason=tool_use, no text blocks, only tool_use content.
+        // Should still return tokens even though there's no response text.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = [
+            r#"{"type":"user","message":{"content":"Fix the bug"}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_01","name":"Edit","input":{"file":"src/main.rs"}}],"usage":{"input_tokens":5000,"output_tokens":150,"cache_read_input_tokens":4800,"cache_creation_input_tokens":0}}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, content).unwrap();
+
+        let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
+        assert_eq!(extract.response, "");
+        assert_eq!(extract.model.as_deref(), Some("claude-opus-4-6"));
+        let tokens = extract.tokens.unwrap();
+        assert_eq!(tokens.input, 5000);
+        assert_eq!(tokens.output, 150);
+        assert_eq!(tokens.cache_read, 4800);
+        assert_eq!(tokens.cache_created, 0);
+    }
+
+    #[test]
+    fn test_extract_streaming_plus_tool_use_pair() {
+        // Real pattern: streaming snapshot (stop_reason=None, low output) followed by
+        // tool_use (higher output). Each has independent usage — must sum both.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = [
+            r#"{"type":"user","message":{"content":"Do something"}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":null,"content":[],"usage":{"input_tokens":3,"output_tokens":23,"cache_read_input_tokens":8693,"cache_creation_input_tokens":16911}}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_01","name":"Read","input":{}}],"usage":{"input_tokens":3,"output_tokens":196,"cache_read_input_tokens":8693,"cache_creation_input_tokens":16911}}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, content).unwrap();
+
+        let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
+        assert_eq!(extract.response, "");
+        let tokens = extract.tokens.unwrap();
+        assert_eq!(tokens.input, 6);
+        assert_eq!(tokens.output, 219);
+        assert_eq!(tokens.cache_read, 8693 + 8693);
+        assert_eq!(tokens.cache_created, 16911 + 16911);
+    }
+
+    #[test]
+    fn test_extract_streaming_plus_end_turn_pair() {
+        // Streaming snapshot followed by end_turn with text.
+        // Should sum tokens, take text from the final entry.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = [
+            r#"{"type":"user","message":{"content":"Explain this"}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":null,"content":[],"usage":{"input_tokens":3,"output_tokens":28,"cache_read_input_tokens":39261,"cache_creation_input_tokens":412}}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"Here is the explanation."}],"usage":{"input_tokens":3,"output_tokens":288,"cache_read_input_tokens":39261,"cache_creation_input_tokens":412}}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, content).unwrap();
+
+        let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
+        assert_eq!(extract.response, "Here is the explanation.");
+        let tokens = extract.tokens.unwrap();
+        assert_eq!(tokens.input, 6);
+        assert_eq!(tokens.output, 316);
+    }
+
+    #[test]
+    fn test_extract_multiple_tool_use_rounds() {
+        // Multiple tool calls in one turn — several assistant entries between user messages.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = [
+            r#"{"type":"user","message":{"content":"Fix everything"}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t2","name":"Edit","input":{}}],"usage":{"input_tokens":200,"output_tokens":80,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{}}],"usage":{"input_tokens":300,"output_tokens":60,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"All fixed."}],"usage":{"input_tokens":400,"output_tokens":120,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, content).unwrap();
+
+        let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
+        assert_eq!(extract.response, "All fixed.");
+        let tokens = extract.tokens.unwrap();
+        assert_eq!(tokens.input, 1000);
+        assert_eq!(tokens.output, 310);
+    }
+
+    #[test]
+    fn test_extract_no_content_placeholder_skipped() {
+        // Claude Code writes "(no content)" as a streaming placeholder.
+        // Should be filtered out — not counted as real text.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = [
+            r#"{"type":"user","message":{"content":"Hello"}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":null,"content":[{"type":"text","text":"(no content)"}],"usage":{"input_tokens":1,"output_tokens":4,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"Hi there!"}],"usage":{"input_tokens":1,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, content).unwrap();
+
+        let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
+        assert_eq!(extract.response, "Hi there!");
+        let tokens = extract.tokens.unwrap();
+        assert_eq!(tokens.input, 2);
+        assert_eq!(tokens.output, 14);
     }
 }

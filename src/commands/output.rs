@@ -3,9 +3,7 @@
 //! Provides a `CommandOutput` struct and `format_command_output()` that both
 //! review.rs and fix.rs use to produce consistent output.
 
-use std::collections::HashMap;
-
-use crate::commands::review::ReviewScope;
+use crate::reviews::{format_locations, parse_locations, ReviewScope};
 use crate::tasks::TaskComment;
 
 /// Structured output data for review/fix commands.
@@ -43,14 +41,46 @@ pub fn format_command_output(output: &CommandOutput) -> String {
 
     if let Some(issues) = output.issues {
         if !issues.is_empty() {
+            // Sort by severity for display
+            let mut sorted: Vec<&TaskComment> = issues.iter().collect();
+            sorted.sort_by_key(|c| {
+                let sev = c
+                    .data
+                    .get("severity")
+                    .map(|s| s.as_str())
+                    .unwrap_or("medium");
+                match sev {
+                    "high" => 0u8,
+                    "medium" => 1,
+                    "low" => 2,
+                    _ => 1,
+                }
+            });
             content.push('\n');
-            for (i, comment) in issues.iter().enumerate() {
+            for (i, comment) in sorted.iter().enumerate() {
+                let severity = comment
+                    .data
+                    .get("severity")
+                    .map(|s| s.as_str())
+                    .unwrap_or("medium");
+                let locations = parse_locations(&comment.data);
+                let loc_suffix = format_locations(&locations);
                 let display_text = if comment.text.len() > 60 {
                     format!("{}...", &comment.text[..57])
                 } else {
                     comment.text.clone()
                 };
-                content.push_str(&format!("{}. {}\n", i + 1, &display_text));
+                if loc_suffix.is_empty() {
+                    content.push_str(&format!("{}. [{}] {}\n", i + 1, severity, &display_text));
+                } else {
+                    content.push_str(&format!(
+                        "{}. [{}] {} {}\n",
+                        i + 1,
+                        severity,
+                        &display_text,
+                        loc_suffix
+                    ));
+                }
             }
         }
     }
@@ -65,7 +95,8 @@ pub fn format_command_output(output: &CommandOutput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::review::{ReviewScope, ReviewScopeKind};
+    use crate::reviews::{ReviewScope, ReviewScopeKind};
+    use std::collections::HashMap;
 
     #[test]
     fn test_format_minimal_output() {
@@ -177,8 +208,9 @@ mod tests {
         };
         let result = format_command_output(&output);
         assert!(result.contains("- **Issues found:** 2"));
-        assert!(result.contains("1. Short issue"));
-        assert!(result.contains("2. A much longer issue description that definitely exceeds t..."));
+        assert!(result.contains("1. [medium] Short issue"));
+        assert!(result
+            .contains("2. [medium] A much longer issue description that definitely exceeds t..."));
     }
 
     #[test]

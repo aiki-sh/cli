@@ -94,6 +94,8 @@ pub struct TaskDefinition {
     pub sources: Vec<String>,
     /// Additional data specific to this subtask
     pub data: HashMap<String, serde_json::Value>,
+    /// needs-context reference: `subtasks.<slug>` — sibling that must run before this in same session
+    pub needs_context: Option<String>,
 }
 
 /// Loop configuration for repeating templates
@@ -101,9 +103,16 @@ pub struct TaskDefinition {
 pub struct LoopConfig {
     /// Rhai expression — loop terminates when this evaluates to true
     pub until: String,
+    /// Maximum iterations (default: 100). Set to 0 to disable.
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: usize,
     /// Additional data to pass to each iteration
     #[serde(default)]
     pub data: HashMap<String, serde_yaml::Value>,
+}
+
+fn default_max_iterations() -> usize {
+    100
 }
 
 /// YAML frontmatter structure for template files
@@ -148,6 +157,9 @@ pub struct SubtaskFrontmatter {
     /// Additional data
     #[serde(default)]
     pub data: HashMap<String, serde_json::Value>,
+    /// needs-context reference: `subtasks.<slug>` — creates a needs-context link to the referenced sibling
+    #[serde(default, rename = "needs-context")]
+    pub needs_context: Option<String>,
 }
 
 #[cfg(test)]
@@ -165,15 +177,15 @@ mod tests {
 
     #[test]
     fn test_template_id_without_version() {
-        let template = TaskTemplate::new("aiki/review");
-        assert_eq!(template.template_id(), "aiki/review");
+        let template = TaskTemplate::new("review");
+        assert_eq!(template.template_id(), "review");
     }
 
     #[test]
     fn test_template_id_with_version() {
-        let mut template = TaskTemplate::new("aiki/review");
+        let mut template = TaskTemplate::new("review");
         template.version = Some("1.2.0".to_string());
-        assert_eq!(template.template_id(), "aiki/review@1.2.0");
+        assert_eq!(template.template_id(), "review@1.2.0");
     }
 
     #[test]
@@ -229,6 +241,7 @@ loop:
             "subtasks.review.approved or data.loop.index1 >= 10"
         );
         assert_eq!(lc.data.len(), 1);
+        assert_eq!(lc.max_iterations, 100); // default
     }
 
     #[test]
@@ -241,6 +254,32 @@ loop:
         let lc = fm.loop_config.unwrap();
         assert_eq!(lc.until, "approved");
         assert!(lc.data.is_empty());
+        assert_eq!(lc.max_iterations, 100); // default when not specified
+    }
+
+    #[test]
+    fn test_loop_config_with_max_iterations() {
+        let yaml = r#"
+loop:
+  until: data.approved
+  max_iterations: 5
+"#;
+        let fm: TemplateFrontmatter = serde_yaml::from_str(yaml).unwrap();
+        let lc = fm.loop_config.unwrap();
+        assert_eq!(lc.until, "data.approved");
+        assert_eq!(lc.max_iterations, 5);
+    }
+
+    #[test]
+    fn test_loop_config_max_iterations_zero_disables() {
+        let yaml = r#"
+loop:
+  until: data.approved
+  max_iterations: 0
+"#;
+        let fm: TemplateFrontmatter = serde_yaml::from_str(yaml).unwrap();
+        let lc = fm.loop_config.unwrap();
+        assert_eq!(lc.max_iterations, 0);
     }
 
     #[test]
@@ -260,10 +299,40 @@ loop:
 spawns:
   - when: "not approved"
     task:
-      template: aiki/fix
+      template: fix
 "#;
         let fm: TemplateFrontmatter = serde_yaml::from_str(yaml).unwrap();
         assert!(fm.loop_config.is_some());
         assert_eq!(fm.spawns.len(), 1);
+    }
+
+    #[test]
+    fn test_subtask_frontmatter_needs_context() {
+        let yaml = r#"
+slug: plan
+needs-context: subtasks.explore
+"#;
+        let fm: SubtaskFrontmatter = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(fm.slug, Some("plan".to_string()));
+        assert_eq!(fm.needs_context, Some("subtasks.explore".to_string()));
+    }
+
+    #[test]
+    fn test_subtask_frontmatter_no_needs_context() {
+        let yaml = r#"
+slug: review
+priority: p1
+"#;
+        let fm: SubtaskFrontmatter = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(fm.slug, Some("review".to_string()));
+        assert!(fm.needs_context.is_none());
+    }
+
+    #[test]
+    fn test_subtask_frontmatter_empty() {
+        let yaml = "";
+        let fm: SubtaskFrontmatter = serde_yaml::from_str(yaml).unwrap_or_default();
+        assert!(fm.needs_context.is_none());
+        assert!(fm.slug.is_none());
     }
 }

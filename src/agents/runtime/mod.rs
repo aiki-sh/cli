@@ -10,22 +10,26 @@ pub use claude_code::ClaudeCodeRuntime;
 pub use codex::CodexRuntime;
 
 use crate::error::Result;
-use std::io::Read;
+use crate::tasks::lanes::ThreadId;
+use crate::tasks::md::DONE_MESSAGE;
 use std::path::Path;
-use std::process::{Child, ChildStderr, ExitStatus};
+use std::process::{Child, ExitStatus};
 
-use super::AgentType;
+pub(crate) use super::AgentType;
 
 /// Handle for a background agent process
 ///
-/// Returned when spawning an agent in background mode. Contains the PID
-/// and task ID for later management (e.g., stopping the process).
+/// Returned when spawning an agent in background mode. Contains the
+/// thread ID for later management (e.g., stopping the process).
 #[derive(Debug, Clone)]
 pub struct BackgroundHandle {
-    /// Process ID of the spawned agent
-    pub pid: u32,
-    /// Task ID being worked on
-    pub task_id: String,
+    /// Thread being worked on
+    pub thread: ThreadId,
+    /// Session UUID, resolved after spawn via event polling
+    #[allow(dead_code)]
+    pub session_id: Option<String>,
+    /// Agent type that was spawned
+    pub agent_type: AgentType,
 }
 
 /// Handle for a monitored child process
@@ -33,29 +37,39 @@ pub struct BackgroundHandle {
 /// Unlike `BackgroundHandle`, this keeps the `Child` handle so we can properly
 /// detect when the process exits (including zombie processes). This is used
 /// for real-time status monitoring where we need accurate exit detection.
+///
+/// Stdout and stderr are drained by background threads to prevent the child
+/// from blocking on a full pipe buffer (agents like codex write their entire
+/// session log to stderr, easily exceeding the ~64KB OS pipe limit).
 pub struct MonitoredChild {
     /// The child process handle
     child: Child,
-    /// Stderr handle for capturing error output
-    stderr: Option<ChildStderr>,
-    /// Process ID of the spawned agent
-    pub pid: u32,
-    /// Task ID being worked on
-    pub task_id: String,
+    /// Drain threads for stdout/stderr (joined on drop)
+    _drain_threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl MonitoredChild {
     /// Create a new monitored child from a Child process
     #[must_use]
-    pub fn new(mut child: Child, task_id: impl Into<String>) -> Self {
-        let pid = child.id();
-        // Take stderr handle from child so we can read it later
-        let stderr = child.stderr.take();
+    pub fn new(mut child: Child) -> Self {
+        let mut drain_threads = Vec::new();
+
+        // Spawn background threads that read-and-discard stdout/stderr so the
+        // child process never blocks on a full pipe buffer.
+        if let Some(mut stdout) = child.stdout.take() {
+            drain_threads.push(std::thread::spawn(move || {
+                let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+            }));
+        }
+        if let Some(mut stderr) = child.stderr.take() {
+            drain_threads.push(std::thread::spawn(move || {
+                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            }));
+        }
+
         Self {
             child,
-            stderr,
-            pid,
-            task_id: task_id.into(),
+            _drain_threads: drain_threads,
         }
     }
 
@@ -72,20 +86,11 @@ impl MonitoredChild {
         self.child.try_wait()
     }
 
-    /// Read any captured stderr output
+    /// Block until the process exits
     ///
-    /// Should be called after the process has exited to get error messages.
-    /// Returns an empty string if stderr wasn't captured or is empty.
-    pub fn read_stderr(&mut self) -> String {
-        if let Some(ref mut stderr) = self.stderr {
-            let mut output = String::new();
-            // Read whatever is available in the stderr buffer
-            // This is non-blocking since the process has already exited
-            if stderr.read_to_string(&mut output).is_ok() {
-                return output;
-            }
-        }
-        String::new()
+    /// Returns the exit status. This reaps the child process.
+    pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.child.wait()
     }
 }
 
@@ -141,61 +146,31 @@ impl AgentSessionResult {
     pub fn detached() -> Self {
         Self::Detached
     }
-
-    /// Check if the session completed successfully
-    #[must_use]
-    #[allow(dead_code)] // Part of AgentSessionResult API
-    pub fn is_completed(&self) -> bool {
-        matches!(self, Self::Completed { .. })
-    }
-
-    /// Check if the session failed
-    #[must_use]
-    #[allow(dead_code)] // Part of AgentSessionResult API
-    pub fn is_failed(&self) -> bool {
-        matches!(self, Self::Failed { .. })
-    }
-
-    /// Check if the user detached (agent continues in background)
-    #[must_use]
-    #[allow(dead_code)] // Part of AgentSessionResult API
-    pub fn is_detached(&self) -> bool {
-        matches!(self, Self::Detached)
-    }
 }
 
 /// Options for spawning an agent session
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields are part of API
 pub struct AgentSpawnOptions {
     /// Working directory for the agent
     pub cwd: std::path::PathBuf,
-    /// Task ID to work on
-    pub task_id: String,
-    /// Override the task's assignee (optional)
-    pub agent_override: Option<AgentType>,
+    /// Thread to work on (single-task or multi-task chain)
+    pub thread: ThreadId,
     /// Parent session UUID for workspace isolation chaining
     pub parent_session_uuid: Option<String>,
+    /// Path to the event FIFO pipe for push-based event streaming
+    pub event_pipe: Option<std::path::PathBuf>,
 }
 
 impl AgentSpawnOptions {
     /// Create new spawn options
     #[must_use]
-    pub fn new(cwd: impl AsRef<Path>, task_id: impl Into<String>) -> Self {
+    pub fn new(cwd: impl AsRef<Path>, thread: ThreadId) -> Self {
         Self {
             cwd: cwd.as_ref().to_path_buf(),
-            task_id: task_id.into(),
-            agent_override: None,
+            thread,
             parent_session_uuid: None,
+            event_pipe: None,
         }
-    }
-
-    /// Set an agent override
-    #[must_use]
-    #[allow(dead_code)] // Part of builder API
-    pub fn with_agent_override(mut self, agent: AgentType) -> Self {
-        self.agent_override = Some(agent);
-        self
     }
 
     /// Set the parent session UUID for workspace isolation chaining
@@ -205,23 +180,27 @@ impl AgentSpawnOptions {
         self
     }
 
+    /// Set the event pipe path for push-based event streaming
+    #[must_use]
+    pub fn with_event_pipe(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.event_pipe = path;
+        self
+    }
+
     /// Build the task prompt with instructions for autonomous work
     #[must_use]
     pub fn task_prompt(&self) -> String {
         format!(
-            r#"You are assigned task `{id}`. Work autonomously until ALL work is complete.
+            r#"You are assigned thread `{thread}`. Work through all tasks in order.
 
-SCOPE: ONLY work on task `{id}` and its subtasks. Do NOT start, pick up, or work on any other tasks from the backlog. Ignore the ready queue entirely — it is not your concern. When your task (and all its subtasks) are closed, you are done.
-
-WORKFLOW:
-1. Run `aiki task start {id}` to begin
-2. Run `aiki task show {id}` to read the task details and instructions
-3. Complete each subtask's work, then close it: `aiki task close <id> --summary "what I did"`
-4. Closing a subtask auto-starts the next one — read the <started> block in the close output for your next task and its instructions
-5. When ALL subtasks are closed, the parent task auto-starts for you to do a final review
-
-CRITICAL: Do NOT stop and ask "what should I do next?" - work through ALL subtasks in sequence. When the parent auto-starts, do a final review and close it. Only stop if you are genuinely blocked on something."#,
-            id = self.task_id
+SCOPE: Only tasks in this thread. Do not pick up other work.
+START: Run `aiki task list` to see your backlog. Start the next task with
+       `aiki task start <task-id>`. The start output includes the task's
+       instructions and context; review that output, then begin working immediately.
+EXIT: When `aiki task list` returns "{done}", you are finished — exit immediately.
+"#,
+            thread = self.thread,
+            done = DONE_MESSAGE,
         )
     }
 }
@@ -230,11 +209,7 @@ CRITICAL: Do NOT stop and ask "what should I do next?" - work through ALL subtas
 ///
 /// Each agent type (ClaudeCode, Codex, etc.) has its own runtime that knows
 /// how to spawn and manage sessions for that agent.
-#[allow(dead_code)] // Trait methods are part of runtime API
 pub trait AgentRuntime {
-    /// Returns the agent type this runtime handles
-    fn agent_type(&self) -> AgentType;
-
     /// Spawns an agent session and waits for completion
     ///
     /// This is a blocking operation that:
@@ -259,7 +234,30 @@ pub trait AgentRuntime {
     /// Similar to `spawn_background`, but keeps the Child handle so we can
     /// properly detect when the process exits (including zombie processes).
     /// This should be used when real-time status monitoring is needed.
+    #[allow(dead_code)]
     fn spawn_monitored(&self, options: &AgentSpawnOptions) -> Result<MonitoredChild>;
+}
+
+/// Build the common environment variables for spawning an agent.
+///
+/// Both `ClaudeCodeRuntime` and `CodexRuntime` call this to ensure consistent
+/// env-var setup (`AIKI_THREAD`, `AIKI_SESSION_MODE`, and optionally
+/// `AIKI_PARENT_SESSION_UUID`).
+pub(crate) fn build_spawn_env(options: &AgentSpawnOptions, mode: &str) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("AIKI_THREAD".to_string(), options.thread.serialize()),
+        ("AIKI_SESSION_MODE".to_string(), mode.to_string()),
+    ];
+    if let Some(ref uuid) = options.parent_session_uuid {
+        env.push(("AIKI_PARENT_SESSION_UUID".to_string(), uuid.clone()));
+    }
+    if let Some(ref pipe) = options.event_pipe {
+        env.push((
+            "AIKI_EVENT_PIPE".to_string(),
+            pipe.to_string_lossy().into_owned(),
+        ));
+    }
+    env
 }
 
 /// Get the appropriate runtime for an agent type
@@ -273,6 +271,42 @@ pub fn get_runtime(agent_type: AgentType) -> Option<Box<dyn AgentRuntime>> {
     }
 }
 
+/// Poll session state until a thread-bound session is registered.
+///
+/// After spawning an agent, `session.started` is recorded in conversation
+/// history with the run thread ID and session UUID. This function polls that log using
+/// exponential backoff (100ms → 500ms, 30s total timeout).
+///
+/// Conversation events live in the global JJ repo (`~/.aiki/`), not the
+/// project repo, so we read from `global_aiki_dir()`.
+pub fn discover_session_id(thread: &ThreadId) -> Result<String> {
+    use crate::history::storage::find_session_started_for_thread;
+    use std::thread as std_thread;
+    use std::time::{Duration, Instant};
+
+    // Session startup can take longer than the original 5s budget.
+    let timeout = Duration::from_secs(30);
+    let start = Instant::now();
+    let mut delay = Duration::from_millis(100);
+    let max_delay = Duration::from_millis(500);
+
+    let serialized = thread.serialize();
+    let global_dir = crate::global::global_aiki_dir();
+
+    loop {
+        if let Some(session_id) = find_session_started_for_thread(&global_dir, &serialized)? {
+            return Ok(session_id);
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(anyhow::anyhow!("Session UUID not discovered within timeout").into());
+        }
+
+        std_thread::sleep(delay);
+        delay = (delay * 2).min(max_delay);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,34 +314,26 @@ mod tests {
     #[test]
     fn test_agent_session_result_constructors() {
         let completed = AgentSessionResult::completed("Task done");
-        assert!(completed.is_completed());
-        assert!(!completed.is_failed());
-        assert!(!completed.is_detached());
+        assert!(matches!(completed, AgentSessionResult::Completed { .. }));
 
         let stopped = AgentSessionResult::stopped("Needs input");
-        assert!(!stopped.is_completed());
-        assert!(!stopped.is_failed());
-        assert!(!stopped.is_detached());
+        assert!(matches!(stopped, AgentSessionResult::Stopped { .. }));
 
         let failed = AgentSessionResult::failed("Crashed");
-        assert!(!failed.is_completed());
-        assert!(failed.is_failed());
-        assert!(!failed.is_detached());
+        assert!(matches!(failed, AgentSessionResult::Failed { .. }));
 
         let detached = AgentSessionResult::detached();
-        assert!(!detached.is_completed());
-        assert!(!detached.is_failed());
-        assert!(detached.is_detached());
+        assert!(matches!(detached, AgentSessionResult::Detached));
     }
 
     #[test]
     fn test_spawn_options() {
-        let options = AgentSpawnOptions::new("/tmp", "task123")
-            .with_agent_override(AgentType::ClaudeCode);
+        let thread = ThreadId::single("task123".to_string());
+        let options = AgentSpawnOptions::new("/tmp", thread);
 
         assert_eq!(options.cwd.to_string_lossy(), "/tmp");
-        assert_eq!(options.task_id, "task123");
-        assert_eq!(options.agent_override, Some(AgentType::ClaudeCode));
+        assert_eq!(options.thread.head, "task123");
+        assert!(options.thread.is_single());
     }
 
     #[test]
@@ -317,5 +343,227 @@ mod tests {
         assert!(get_runtime(AgentType::Cursor).is_none());
         assert!(get_runtime(AgentType::Gemini).is_none());
         assert!(get_runtime(AgentType::Unknown).is_none());
+    }
+
+    /// 6a: task_prompt contains thread display, expected keywords
+    #[test]
+    fn test_task_prompt_contains_thread_id() {
+        let head = "abcdefghijklmnopqrstuvwxyzabcdef".to_string();
+        let tail = "fedcbazyxwvutsrqponmlkjihgfedcba".to_string();
+        let thread = ThreadId {
+            head: head.clone(),
+            tail: tail.clone(),
+        };
+        let options = AgentSpawnOptions::new("/tmp", thread.clone());
+        let prompt = options.task_prompt();
+
+        // Should contain the Display form (short IDs)
+        let display = format!("{}", thread);
+        assert!(
+            prompt.contains(&display),
+            "prompt should contain thread display '{display}': {prompt}"
+        );
+        assert!(prompt.contains("thread"), "prompt should mention 'thread'");
+        assert!(prompt.contains("SCOPE"), "prompt should mention 'SCOPE'");
+        assert!(prompt.contains("START"), "prompt should mention 'START'");
+        assert!(prompt.contains("EXIT"), "prompt should mention 'EXIT'");
+        assert!(
+            prompt.contains("aiki task list"),
+            "prompt should mention 'aiki task list'"
+        );
+        assert!(
+            prompt.contains("aiki task start <task-id>"),
+            "prompt should mention starting the task before working"
+        );
+    }
+
+    /// 6b: single-task thread display shows bare short ID (no colon)
+    #[test]
+    fn test_task_prompt_single_task_thread() {
+        let id = "abcdefghijklmnopqrstuvwxyzabcdef".to_string();
+        let thread = ThreadId::single(id.clone());
+        let options = AgentSpawnOptions::new("/tmp", thread);
+        let prompt = options.task_prompt();
+
+        let short = &id[..7];
+        assert!(
+            prompt.contains(short),
+            "prompt should contain short ID '{short}'"
+        );
+        // Single-task thread display should NOT contain a colon separator
+        assert!(
+            !prompt.contains(&format!("{}:", short)),
+            "single-task thread display should not contain colon"
+        );
+    }
+
+    /// 6c: serialize() returns "head:tail" for multi-task, bare head for single
+    #[test]
+    fn test_spawn_options_thread_serialization() {
+        let head = "abcdefghijklmnopqrstuvwxyzabcdef".to_string();
+        let tail = "fedcbazyxwvutsrqponmlkjihgfedcba".to_string();
+        let thread = ThreadId {
+            head: head.clone(),
+            tail: tail.clone(),
+        };
+        let options = AgentSpawnOptions::new("/tmp", thread);
+        assert_eq!(
+            options.thread.serialize(),
+            format!("{}:{}", head, tail),
+            "multi-task thread should serialize as head:tail"
+        );
+
+        // Single-task thread serializes as just the ID
+        let single = ThreadId::single(head.clone());
+        let options_single = AgentSpawnOptions::new("/tmp", single);
+        assert_eq!(
+            options_single.thread.serialize(),
+            head,
+            "single-task thread should serialize as bare head"
+        );
+    }
+
+    /// 6d: build_spawn_env returns AIKI_THREAD = thread.serialize() (multi-task thread)
+    #[test]
+    fn test_build_spawn_env_sets_aiki_thread() {
+        let head = "abcdefghijklmnopqrstuvwxyzabcdef".to_string();
+        let tail = "fedcbazyxwvutsrqponmlkjihgfedcba".to_string();
+        let thread = ThreadId {
+            head: head.clone(),
+            tail: tail.clone(),
+        };
+        let options = AgentSpawnOptions::new("/tmp", thread.clone());
+        let env = build_spawn_env(&options, "background");
+
+        let thread_val = env
+            .iter()
+            .find(|(k, _)| k == "AIKI_THREAD")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            thread_val,
+            Some(thread.serialize().as_str()),
+            "AIKI_THREAD must equal thread.serialize()"
+        );
+    }
+
+    /// 6e: build_spawn_env returns AIKI_THREAD = thread.serialize() (single-task thread)
+    #[test]
+    fn test_build_spawn_env_sets_aiki_thread_single() {
+        let id = "abcdefghijklmnopqrstuvwxyzabcdef".to_string();
+        let thread = ThreadId::single(id.clone());
+        let options = AgentSpawnOptions::new("/tmp", thread.clone());
+        let env = build_spawn_env(&options, "monitored");
+
+        let thread_val = env
+            .iter()
+            .find(|(k, _)| k == "AIKI_THREAD")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            thread_val,
+            Some(id.as_str()),
+            "single-task AIKI_THREAD must equal bare head ID"
+        );
+
+        let mode_val = env
+            .iter()
+            .find(|(k, _)| k == "AIKI_SESSION_MODE")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(mode_val, Some("monitored"));
+    }
+
+    /// 7a: find_session_started_for_thread matches on thread.serialize() format
+    ///
+    /// Behavioral test: creates a SessionStart event with a known run_thread_id
+    /// matching thread.serialize(), then verifies the matching logic returns the
+    /// correct session.
+    #[test]
+    fn test_find_session_matches_serialized_thread() {
+        use crate::history::types::ConversationEvent;
+        use chrono::Utc;
+
+        let head = "abcdefghijklmnopqrstuvwxyzabcdef".to_string();
+        let tail = "fedcbazyxwvutsrqponmlkjihgfedcba".to_string();
+        let thread = ThreadId {
+            head: head.clone(),
+            tail: tail.clone(),
+        };
+        let serialized = thread.serialize();
+
+        // Build an event with the serialized thread as run_thread_id
+        let events = vec![ConversationEvent::SessionStart {
+            session_id: "found-session".to_string(),
+            agent_type: super::super::AgentType::ClaudeCode,
+            timestamp: Utc::now(),
+            run_thread_id: Some(serialized.clone()),
+            repo_id: None,
+            cwd: None,
+            session_mode: None,
+            transcript_path: None,
+        }];
+
+        // Replicate the matching logic used by find_session_started_for_thread
+        let result = events.iter().rev().find_map(|event| match event {
+            ConversationEvent::SessionStart {
+                session_id,
+                run_thread_id: Some(run_thread_id),
+                ..
+            } if run_thread_id == &serialized => Some(session_id.clone()),
+            _ => None,
+        });
+
+        assert_eq!(
+            result.as_deref(),
+            Some("found-session"),
+            "find_session_started_for_thread must match thread.serialize() format"
+        );
+    }
+
+    /// Structural invariant: every spawn method that sets AIKI_THREAD must also
+    /// set AIKI_SESSION_MODE. The one exception is plan.rs which spawns a truly
+    /// interactive user session (mode defaults to "interactive" intentionally).
+    ///
+    /// Regression guard for: spawn_blocking missing AIKI_SESSION_MODE caused
+    /// task.closed hook to SIGTERM background agents (exit code 143).
+    #[test]
+    fn test_all_spawn_methods_set_session_mode() {
+        let runtime_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agents/runtime");
+
+        for filename in &["claude_code.rs", "codex.rs"] {
+            let path = runtime_dir.join(filename);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("Failed to read {}: {}", filename, e));
+
+            // Split source into methods by finding `fn spawn_` boundaries
+            let method_starts: Vec<usize> = source
+                .match_indices("fn spawn_")
+                .map(|(idx, _)| idx)
+                .collect();
+
+            for (i, &start) in method_starts.iter().enumerate() {
+                let end = method_starts.get(i + 1).copied().unwrap_or(source.len());
+                let method_body = &source[start..end];
+
+                // Extract method name for error messages
+                let method_name: String = method_body
+                    .chars()
+                    .skip("fn ".len())
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+
+                let has_thread = method_body.contains("AIKI_THREAD");
+                let has_mode = method_body.contains("AIKI_SESSION_MODE");
+
+                if has_thread {
+                    assert!(
+                        has_mode,
+                        "{filename}::{method_name} sets AIKI_THREAD but not AIKI_SESSION_MODE. \
+                         Every spawn method that sets AIKI_THREAD must also set \
+                         AIKI_SESSION_MODE to prevent the task.closed hook from \
+                         treating background agents as interactive sessions."
+                    );
+                }
+            }
+        }
     }
 }

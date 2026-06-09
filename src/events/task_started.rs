@@ -35,7 +35,7 @@ pub struct TaskEventPayload {
 
 /// task.started event payload
 ///
-/// Fired when a task is started (via `aiki task start` or `aiki task run`).
+/// Fired when a task is started (via `aiki task start` or `aiki run`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AikiTaskStartedPayload {
     /// Task information

@@ -37,6 +37,7 @@ fn bench_create_task(c: &mut Criterion) {
                 let event = TaskEvent::Created {
                     task_id,
                     name: black_box("Benchmark task".to_string()),
+                    slug: None,
                     task_type: None,
                     priority: TaskPriority::P2,
                     assignee: None,
@@ -69,6 +70,7 @@ fn bench_write_events(c: &mut Criterion) {
                 let event = TaskEvent::Created {
                     task_id: black_box("test123".to_string()),
                     name: black_box("Test task".to_string()),
+                    slug: None,
                     task_type: None,
                     priority: TaskPriority::P2,
                     assignee: None,
@@ -97,6 +99,7 @@ fn bench_write_events(c: &mut Criterion) {
                 let event = TaskEvent::Created {
                     task_id: task_id.clone(),
                     name: "Task to start".to_string(),
+                    slug: None,
                     task_type: None,
                     priority: TaskPriority::P2,
                     assignee: None,
@@ -138,6 +141,7 @@ fn bench_write_events(c: &mut Criterion) {
                 let event = TaskEvent::Created {
                     task_id: task_id.clone(),
                     name: "Task to stop".to_string(),
+                    slug: None,
                     task_type: None,
                     priority: TaskPriority::P2,
                     assignee: None,
@@ -178,6 +182,7 @@ fn bench_write_events(c: &mut Criterion) {
                 let event = TaskEvent::Created {
                     task_id: task_id.clone(),
                     name: "Task to close".to_string(),
+                    slug: None,
                     task_type: None,
                     priority: TaskPriority::P2,
                     assignee: None,
@@ -228,6 +233,7 @@ fn bench_read_events(c: &mut Criterion) {
                     let event = TaskEvent::Created {
                         task_id,
                         name: format!("Task {}", i),
+                        slug: None,
                         task_type: None,
                         priority: TaskPriority::P2,
                         assignee: None,
@@ -269,6 +275,7 @@ fn bench_sequential_tasks(c: &mut Criterion) {
                             let event = TaskEvent::Created {
                                 task_id,
                                 name: black_box(format!("Sequential task {}", i)),
+                                slug: None,
                                 task_type: None,
                                 priority: TaskPriority::P2,
                                 assignee: None,
@@ -304,6 +311,7 @@ fn bench_task_lifecycle(c: &mut Criterion) {
                 let event = TaskEvent::Created {
                     task_id: task_id.clone(),
                     name: black_box("Lifecycle task".to_string()),
+                    slug: None,
                     task_type: None,
                     priority: TaskPriority::P2,
                     assignee: None,

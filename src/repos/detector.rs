@@ -1,5 +1,4 @@
-use anyhow::{anyhow, Context, Result};
-use std::fs;
+use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 
 /// Detects and validates repository state (Git and JJ)
@@ -59,66 +58,53 @@ impl RepoDetector {
         }
     }
 
+    /// Find the aiki project root by walking up from `current_dir` looking for `.aiki/`.
+    ///
+    /// Stops at the filesystem root or home directory.
+    pub fn find_aiki_root(&self) -> Result<PathBuf> {
+        let home_dir = dirs::home_dir();
+        let mut current = self.current_dir.clone();
+
+        loop {
+            if current.join(".aiki").is_dir() {
+                return Ok(current);
+            }
+
+            // Stop at home directory
+            if let Some(ref home) = home_dir {
+                if current == *home {
+                    return Err(anyhow!(
+                        "Not in an aiki project\n\nRun 'aiki init' first to initialize this repository."
+                    ));
+                }
+            }
+
+            if !current.pop() {
+                return Err(anyhow!(
+                    "Not in an aiki project\n\nRun 'aiki init' first to initialize this repository."
+                ));
+            }
+        }
+    }
+
     /// Check if a JJ repository exists at the given path
     pub fn has_jj<P: AsRef<Path>>(path: P) -> bool {
         path.as_ref().join(".jj").exists()
     }
 
-    /// Resolve the Git directory path, handling both regular directories and worktree/submodule files
+    /// Get the repo folder name (last path component of the git root).
     ///
-    /// In normal Git repositories, `.git` is a directory.
-    /// In Git worktrees and submodules, `.git` is a file containing `gitdir: /path/to/real/git/dir`
-    ///
-    /// Returns the path to the actual Git directory, or an error if it cannot be resolved.
-    #[allow(dead_code)] // Part of RepoDetector API
-    pub fn resolve_git_dir<P: AsRef<Path>>(repo_root: P) -> Result<PathBuf> {
-        let git_path = repo_root.as_ref().join(".git");
-
-        if !git_path.exists() {
-            return Err(anyhow!(
-                "No .git file or directory found at repository root"
-            ));
-        }
-
-        // Check if .git is a directory (normal case)
-        if git_path.is_dir() {
-            return Ok(git_path);
-        }
-
-        // .git is a file - parse the gitdir pointer (worktree/submodule case)
-        let content = fs::read_to_string(&git_path)
-            .context("Failed to read .git file - worktree/submodule pointer may be corrupted")?;
-
-        // Parse "gitdir: /path/to/git/dir"
-        let gitdir_line = content
-            .lines()
-            .find(|line| line.starts_with("gitdir: "))
-            .ok_or_else(|| anyhow!("Invalid .git file format - expected 'gitdir:' line"))?;
-
-        let git_dir_str = gitdir_line
-            .strip_prefix("gitdir: ")
-            .ok_or_else(|| anyhow!("Failed to parse gitdir path"))?
-            .trim();
-
-        // Convert to PathBuf and resolve relative paths
-        let git_dir = PathBuf::from(git_dir_str);
-
-        // If the path is relative, resolve it relative to the repo root
-        let resolved = if git_dir.is_absolute() {
-            git_dir
-        } else {
-            repo_root.as_ref().join(git_dir)
-        };
-
-        // Verify the resolved path exists
-        if !resolved.exists() {
-            return Err(anyhow!(
-                "Git directory pointer references non-existent path: {}",
-                resolved.display()
-            ));
-        }
-
-        Ok(resolved)
+    /// Falls back to the `cwd` folder name if `.git` can't be found.
+    #[allow(dead_code)]
+    pub fn repo_folder_name(&self) -> String {
+        let root = self
+            .find_repo_root()
+            .ok()
+            .unwrap_or_else(|| self.current_dir.clone());
+        root.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -189,6 +175,49 @@ mod tests {
     }
 
     #[test]
+    fn find_aiki_root_at_current_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::create_dir(temp_dir.path().join(".aiki")).unwrap();
+
+        let detector = RepoDetector::new(temp_dir.path());
+        let root = detector.find_aiki_root().unwrap();
+
+        assert_eq!(root, temp_dir.path());
+    }
+
+    #[test]
+    fn find_aiki_root_from_subdirectory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::create_dir(temp_dir.path().join(".aiki")).unwrap();
+
+        let subdir = temp_dir.path().join("src").join("components");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let detector = RepoDetector::new(&subdir);
+        let root = detector.find_aiki_root().unwrap();
+
+        assert_eq!(root, temp_dir.path());
+    }
+
+    #[test]
+    fn find_aiki_root_stops_at_home_directory() {
+        // Verify that find_aiki_root stops at home (or filesystem root)
+        // and doesn't walk above it
+        if let Some(home) = dirs::home_dir() {
+            let detector = RepoDetector::new(&home);
+            let result = detector.find_aiki_root();
+
+            if !home.join(".aiki").exists() {
+                assert!(result.is_err());
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Not in an aiki project"));
+            }
+        }
+    }
+
+    #[test]
     fn has_jj_returns_true_when_jj_directory_exists() {
         let temp_dir = tempfile::tempdir().unwrap();
         fs::create_dir(temp_dir.path().join(".jj")).unwrap();
@@ -201,89 +230,5 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
 
         assert!(!RepoDetector::has_jj(temp_dir.path()));
-    }
-
-    #[test]
-    fn resolve_git_dir_handles_normal_repository() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        fs::create_dir(temp_dir.path().join(".git")).unwrap();
-
-        let result = RepoDetector::resolve_git_dir(temp_dir.path()).unwrap();
-        assert_eq!(result, temp_dir.path().join(".git"));
-    }
-
-    #[test]
-    fn resolve_git_dir_handles_worktree_with_absolute_path() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let real_git_dir = tempfile::tempdir().unwrap();
-
-        // Create a .git file with absolute gitdir pointer (worktree case)
-        let gitdir_content = format!("gitdir: {}", real_git_dir.path().display());
-        fs::write(temp_dir.path().join(".git"), gitdir_content).unwrap();
-
-        let result = RepoDetector::resolve_git_dir(temp_dir.path()).unwrap();
-        assert_eq!(result, real_git_dir.path());
-    }
-
-    #[test]
-    fn resolve_git_dir_handles_worktree_with_relative_path() {
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        // Create a real git directory as a subdirectory
-        let git_subdir = temp_dir.path().join("some").join("nested").join("git");
-        fs::create_dir_all(&git_subdir).unwrap();
-
-        // Create a .git file with relative gitdir pointer
-        let gitdir_content = "gitdir: some/nested/git";
-        fs::write(temp_dir.path().join(".git"), gitdir_content).unwrap();
-
-        let result = RepoDetector::resolve_git_dir(temp_dir.path()).unwrap();
-        assert_eq!(result, git_subdir);
-    }
-
-    #[test]
-    fn resolve_git_dir_errors_when_git_missing() {
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        let result = RepoDetector::resolve_git_dir(temp_dir.path());
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No .git file or directory found"));
-    }
-
-    #[test]
-    fn resolve_git_dir_errors_on_invalid_worktree_pointer() {
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        // Create a .git file with invalid content
-        fs::write(temp_dir.path().join(".git"), "invalid content").unwrap();
-
-        let result = RepoDetector::resolve_git_dir(temp_dir.path());
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("expected 'gitdir:' line"));
-    }
-
-    #[test]
-    fn resolve_git_dir_errors_when_target_nonexistent() {
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        // Create a .git file pointing to non-existent directory
-        fs::write(
-            temp_dir.path().join(".git"),
-            "gitdir: /nonexistent/path/to/git",
-        )
-        .unwrap();
-
-        let result = RepoDetector::resolve_git_dir(temp_dir.path());
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("references non-existent path"));
     }
 }

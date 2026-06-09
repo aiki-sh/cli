@@ -26,7 +26,6 @@
 //! ## Utility Functions
 //! - [`get_git_user`] - Get the git user (name + email) from git config
 
-use crate::provenance::authors::{AuthorScope, AuthorsCommand, OutputFormat};
 use crate::cache::debug_log;
 use crate::error::{AikiError, Result};
 use crate::events::{
@@ -34,15 +33,14 @@ use crate::events::{
     ChangeOperation,
 };
 use crate::flows::state::ActionResult;
+use crate::provenance::authors::{AuthorScope, AuthorsCommand, OutputFormat};
 use crate::provenance::record::ProvenanceRecord;
 use crate::tasks::{manager, storage};
 use anyhow::Context;
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use crate::jj::jj_cmd;
-
 // =============================================================================
 // Utility Functions
 // =============================================================================
@@ -339,7 +337,7 @@ pub fn build_move_metadata(
 /// during an AI editing session (AdditiveUserEdits case).
 ///
 /// # Required Event Variables
-/// - `event.session_id` - Session identifier
+/// - `event.session.uuid` - Session UUID
 ///
 /// # Returns
 /// An ActionResult with JSON output: `{"author": "...", "message": "..."}`
@@ -377,7 +375,7 @@ fn build_human_metadata_impl(session: &crate::session::AikiSession) -> Result<Ac
         "[aiki]".to_string(),
         format!("author={}", git_user),
         "author_type=human".to_string(),
-        format!("session={}", session.external_id()),
+        format!("session={}", session.uuid()),
     ];
 
     let message = format!("{}\n[/aiki]", lines.join("\n"));
@@ -885,108 +883,6 @@ fn normalize_path_for_jj(file_path: &str, cwd: &Path) -> String {
     }
 }
 
-/// Run jj split to create AI change and user change
-#[allow(dead_code)] // Reserved for future split-based separation strategy
-fn run_jj_split(cwd: &Path, message: &str, author: &str, files: &[String]) -> Result<String> {
-    // Build jj split command
-    // Note: jj split doesn't support --author, we'll set it separately
-    let mut cmd = jj_cmd();
-    cmd.current_dir(cwd);
-    cmd.arg("split");
-    cmd.arg("--message").arg(message);
-
-    // Add file paths
-    for file in files {
-        cmd.arg(file);
-    }
-
-    debug_log(|| format!("[flows/core] Running: {:?}", cmd));
-
-    let output = cmd
-        .output()
-        .map_err(|e| AikiError::JjCommandFailed(format!("Failed to execute jj split: {}", e)))?;
-
-    if !output.status.success() {
-        return Err(AikiError::JjCommandFailed(format!(
-            "jj split failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-
-    let split_output = String::from_utf8_lossy(&output.stdout).to_string();
-
-    // Step 2: Set author on the first part (AI change) using jj metaedit
-    // After split, the first part is at @- (parent of working copy)
-    let mut metaedit_cmd = jj_cmd();
-    metaedit_cmd.current_dir(cwd);
-    metaedit_cmd.arg("metaedit");
-    metaedit_cmd.arg("-r").arg("@-");
-    metaedit_cmd.arg("--author").arg(author);
-    metaedit_cmd.arg("--no-edit"); // Don't open editor
-
-    debug_log(|| {
-        format!(
-            "[flows/core] Setting author on AI change: {:?}",
-            metaedit_cmd
-        )
-    });
-
-    let metaedit_output = metaedit_cmd
-        .output()
-        .map_err(|e| AikiError::JjCommandFailed(format!("Failed to execute jj metaedit: {}", e)))?;
-
-    if !metaedit_output.status.success() {
-        return Err(AikiError::JjCommandFailed(format!(
-            "jj metaedit failed: {}",
-            String::from_utf8_lossy(&metaedit_output.stderr)
-        )));
-    }
-
-    Ok(split_output)
-}
-
-/// Parse jj split output to extract change IDs
-#[allow(dead_code)] // Reserved for future split-based separation strategy
-fn parse_split_output(output: &str) -> Result<(String, String)> {
-    // jj split output format (example):
-    // "First part: qpvuntsm 12345678 AI changes
-    //  Second part: rlvkpnrz 87654321 (no description set)"
-    //
-    // The format is: "First part: <change_hash_short> <change_hash_long> <description>"
-    // We want the long hash (position 3 in split_whitespace)
-
-    let lines: Vec<&str> = output.lines().collect();
-
-    let ai_change_id = lines
-        .iter()
-        .find(|l| l.contains("First part"))
-        .and_then(|l| {
-            // Extract third word (long change ID hash)
-            // Words: [0]="First", [1]="part:", [2]=short_hash, [3]=long_hash
-            l.split_whitespace().nth(3).map(String::from)
-        })
-        .ok_or_else(|| {
-            AikiError::Other(anyhow::anyhow!(
-                "Failed to parse AI change ID from jj split output"
-            ))
-        })?;
-
-    let user_change_id = lines
-        .iter()
-        .find(|l| l.contains("Second part"))
-        .and_then(|l| {
-            // Extract third word (long change ID hash)
-            l.split_whitespace().nth(3).map(String::from)
-        })
-        .ok_or_else(|| {
-            AikiError::Other(anyhow::anyhow!(
-                "Failed to parse user change ID from jj split output"
-            ))
-        })?;
-
-    Ok((ai_change_id, user_change_id))
-}
-
 // =============================================================================
 // Git Integration Functions
 // =============================================================================
@@ -1021,29 +917,14 @@ pub fn generate_coauthors(event: &AikiCommitMessageStartedPayload) -> Result<Act
 /// Returns the number of open, unblocked tasks visible to the given agent,
 /// filtered by the current scope (same as `aiki task list`).
 /// This is used for context injection in flows.
-pub fn task_list_size_for_agent(cwd: &Path, agent: &crate::agents::AgentType) -> Result<ActionResult> {
+pub fn task_list_size_for_agent(
+    cwd: &Path,
+    agent: &crate::agents::AgentType,
+) -> Result<ActionResult> {
     let events = crate::tasks::storage::read_events(cwd)?;
     let graph = crate::tasks::graph::materialize_graph(&events);
     let scope_set = crate::tasks::manager::get_current_scope_set(&graph);
     let ready = crate::tasks::manager::get_ready_queue_for_agent_scoped(&graph, &scope_set, agent);
-
-    Ok(ActionResult {
-        success: true,
-        exit_code: Some(0),
-        stdout: ready.len().to_string(),
-        stderr: String::new(),
-    })
-}
-
-/// Get the size of the ready task queue (all tasks, no filtering)
-///
-/// Returns the number of open, unblocked tasks in the ready queue.
-/// This is used for context injection in flows to show task count.
-#[allow(dead_code)] // Part of flow function API
-pub fn task_list_size(cwd: &Path) -> Result<ActionResult> {
-    let events = crate::tasks::storage::read_events(cwd)?;
-    let graph = crate::tasks::graph::materialize_graph(&events);
-    let ready = crate::tasks::manager::get_ready_queue(&graph);
 
     Ok(ActionResult {
         success: true,
@@ -1078,19 +959,7 @@ pub fn task_in_progress(cwd: &Path) -> Result<ActionResult> {
 // Workspace Isolation Functions
 // =============================================================================
 
-/// Create an isolated workspace if concurrent sessions are detected.
-///
-/// Called from `turn.started` and `repo.changed` hooks.
-/// Checks how many sessions are active in the current repo:
-/// - count == 1: skip (zero overhead for solo sessions)
-/// - count > 1: create isolated workspace
-///
-/// Creation is idempotent — no-op if workspace already exists.
-///
-/// # Returns
-/// ActionResult with stdout being the absolute workspace path (if created/exists)
-/// or empty string (if skipped or failed)
-pub fn workspace_create_if_concurrent(
+pub fn workspace_ensure_isolated(
     session: &crate::session::AikiSession,
     cwd: &Path,
 ) -> Result<ActionResult> {
@@ -1100,56 +969,11 @@ pub fn workspace_create_if_concurrent(
         Some(root) => root,
         None => {
             debug_log(|| "[workspace] Not in a JJ repo, skipping workspace creation");
-            return Ok(ActionResult {
-                success: true,
-                exit_code: Some(0),
-                stdout: String::new(),
-                stderr: String::new(),
-            });
+            return Ok(ActionResult::success());
         }
     };
 
-    let repo_id = match crate::repos::ensure_repo_id(&repo_root) {
-        Ok(id) => id,
-        Err(_) => {
-            debug_log(|| "[workspace] No repo-id found, skipping workspace creation");
-            return Ok(ActionResult {
-                success: true,
-                exit_code: Some(0),
-                stdout: String::new(),
-                stderr: String::new(),
-            });
-        }
-    };
-
-    let session_uuid = session.uuid();
-
-    // Register session in repo (for O(1) session counting and repo-transition detection)
-    isolation::register_session_in_repo(&repo_id, session_uuid);
-
-    let session_count = isolation::count_sessions_in_repo(&repo_id);
-
-    // Check if a workspace already exists for this session
-    let workspace_path = crate::session::isolation::workspaces_dir()
-        .join(&repo_id)
-        .join(session_uuid);
-
-    if session_count <= 1 && !workspace_path.exists() {
-        debug_log(|| {
-            format!(
-                "[workspace] Only {} session(s) in repo {}, skipping isolation",
-                session_count, repo_id
-            )
-        });
-        return Ok(ActionResult {
-            success: true,
-            exit_code: Some(0),
-            stdout: String::new(),
-            stderr: String::new(),
-        });
-    }
-
-    match isolation::create_isolated_workspace(&repo_root, session_uuid) {
+    match isolation::create_isolated_workspace(&repo_root, session.uuid()) {
         Ok(ws) => {
             debug_log(|| {
                 format!(
@@ -1166,8 +990,10 @@ pub fn workspace_create_if_concurrent(
             })
         }
         Err(e) => {
-            // Workspace creation failure is non-fatal — fall back to main workspace
-            eprintln!("[aiki] Warning: workspace creation failed, continuing in main workspace: {}", e);
+            eprintln!(
+                "[aiki] Warning: workspace creation failed, continuing in main workspace: {}",
+                e
+            );
             Ok(ActionResult {
                 success: true,
                 exit_code: Some(0),
@@ -1186,9 +1012,7 @@ pub fn workspace_create_if_concurrent(
 ///
 /// # Returns
 /// ActionResult with stdout being the count of absorbed workspaces
-pub fn workspace_absorb_all(
-    session: &crate::session::AikiSession,
-) -> Result<ActionResult> {
+pub fn workspace_absorb_all(session: &crate::session::AikiSession) -> Result<ActionResult> {
     use crate::session::isolation;
 
     let session_uuid = session.uuid();
@@ -1206,8 +1030,8 @@ pub fn workspace_absorb_all(
     let parent_session_uuid: Option<String> = std::env::var("AIKI_PARENT_SESSION_UUID").ok();
     let mut absorbed = 0u32;
     let mut has_conflicts = false;
-    let mut last_conflict_id: Option<String> = None;
-    let mut last_conflicted_files: Vec<String> = Vec::new();
+    let mut last_conflicted_files = String::new();
+    let mut seen_repo_roots: Vec<PathBuf> = Vec::new();
 
     // Scan all repo-id directories for workspaces belonging to this session
     let entries = match std::fs::read_dir(&workspaces_dir) {
@@ -1254,44 +1078,100 @@ pub fn workspace_absorb_all(
             }
         };
 
+        if !seen_repo_roots.contains(&repo_root) {
+            seen_repo_roots.push(repo_root.clone());
+        }
+
         let workspace = isolation::IsolatedWorkspace {
             name: workspace_name,
             path: session_ws_dir,
-            repo_root: repo_root.clone(),
-            session_uuid: session_uuid.to_string(),
         };
 
-        match isolation::absorb_workspace(
-            &repo_root,
-            &workspace,
-            parent_session_uuid.as_deref(),
-        ) {
+        match isolation::absorb_workspace(&repo_root, &workspace, parent_session_uuid.as_deref()) {
             Ok(isolation::AbsorbResult::Absorbed) => {
                 absorbed += 1;
-                let _ = isolation::cleanup_workspace(&repo_root, &workspace);
-                // Unregister session from this repo's sidecar
-                if let Some(repo_id) = repo_id_dir.file_name().and_then(|n| n.to_str()) {
-                    isolation::unregister_session_from_repo(repo_id, session_uuid);
+
+                // Post-absorption: check if target's @ is conflicted.
+                // Compute target_dir same as absorb_workspace: parent workspace if
+                // it exists, otherwise repo root.
+                let target_dir = if let Some(ref parent_uuid) = parent_session_uuid {
+                    let repo_id = crate::repos::ensure_repo_id(&repo_root).unwrap_or_default();
+                    let parent_ws_path =
+                        isolation::workspaces_dir().join(&repo_id).join(parent_uuid);
+                    if parent_ws_path.exists() {
+                        parent_ws_path
+                    } else {
+                        repo_root.clone()
+                    }
+                } else {
+                    repo_root.clone()
+                };
+
+                // Uses `conflicts() & @` — if @ is clean, all ancestor conflicts
+                // have been resolved, so no false positives from historical conflicts.
+                let conflict_check = crate::jj::jj_cmd()
+                    .current_dir(&target_dir)
+                    .args([
+                        "log",
+                        "-r",
+                        "conflicts() & @",
+                        "--no-graph",
+                        "-T",
+                        r#"change_id ++ "\n""#,
+                        "--ignore-working-copy",
+                    ])
+                    .output();
+                match conflict_check {
+                    Ok(output) if output.status.success() => {
+                        let conflicted = String::from_utf8_lossy(&output.stdout);
+                        if !conflicted.trim().is_empty() {
+                            has_conflicts = true;
+                            // Get conflicted file list for the autoreply.
+                            // Capture both stdout and stderr — output stream varies
+                            // across JJ versions.
+                            let files_output = crate::jj::jj_cmd()
+                                .current_dir(&target_dir)
+                                .args(["resolve", "--list", "-r", "@"])
+                                .output();
+                            last_conflicted_files = match files_output {
+                                Ok(fo) => {
+                                    let stdout = String::from_utf8_lossy(&fo.stdout);
+                                    let stderr = String::from_utf8_lossy(&fo.stderr);
+                                    let files = if !stdout.trim().is_empty() { stdout } else { stderr };
+                                    let trimmed = files.trim().to_string();
+                                    if trimmed.is_empty() {
+                                        "(conflict detected but file list unavailable — run `jj resolve --list` to inspect)".to_string()
+                                    } else {
+                                        trimmed
+                                    }
+                                }
+                                Err(_) => "(conflict detected but `jj resolve --list` failed — run it manually to inspect)".to_string(),
+                            };
+                        }
+                    }
+                    Ok(output) => {
+                        // jj log exited with non-zero — conflict state unknown, treat as conflicted
+                        // to force the agent to investigate.
+                        eprintln!(
+                            "[aiki] Warning: conflict check `jj log -r 'conflicts() & @'` failed (exit {}): {}",
+                            output.status.code().unwrap_or(-1),
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        );
+                        has_conflicts = true;
+                        last_conflicted_files =
+                            "(conflict check failed — run `jj log -r 'conflicts() & @'` to verify)"
+                                .to_string();
+                    }
+                    Err(e) => {
+                        // jj command failed to spawn — conflict state unknown, treat as conflicted.
+                        eprintln!("[aiki] Warning: conflict check failed to run: {}", e);
+                        has_conflicts = true;
+                        last_conflicted_files = "(conflict check failed to run — run `jj log -r 'conflicts() & @'` to verify)".to_string();
+                    }
                 }
-            }
-            Ok(isolation::AbsorbResult::Conflicts { conflict_id, conflicted_files }) => {
-                // Don't cleanup — workspace stays alive for conflict resolution
-                has_conflicts = true;
-                debug_log(|| {
-                    format!(
-                        "[workspace] Conflicts remain after auto-resolve: conflict_id={}, files={:?}",
-                        conflict_id, conflicted_files
-                    )
-                });
-                last_conflict_id = Some(conflict_id);
-                last_conflicted_files = conflicted_files;
             }
             Ok(isolation::AbsorbResult::Skipped) => {
                 let _ = isolation::cleanup_workspace(&repo_root, &workspace);
-                // Unregister session from this repo's sidecar
-                if let Some(repo_id) = repo_id_dir.file_name().and_then(|n| n.to_str()) {
-                    isolation::unregister_session_from_repo(repo_id, session_uuid);
-                }
             }
             Err(e) => {
                 eprintln!(
@@ -1299,41 +1179,61 @@ pub fn workspace_absorb_all(
                     workspace.name, e
                 );
                 let _ = isolation::cleanup_workspace(&repo_root, &workspace);
-                // Unregister session from this repo's sidecar
-                if let Some(repo_id) = repo_id_dir.file_name().and_then(|n| n.to_str()) {
-                    isolation::unregister_session_from_repo(repo_id, session_uuid);
-                }
             }
         }
     }
 
-    // Unconditionally unregister this session from any repo it's registered in.
-    // This handles solo sessions that registered in by-repo/ but never created
-    // a workspace (the loop above only covers sessions with workspace dirs).
-    if let Some(repo_id) = isolation::find_session_repo(session_uuid) {
-        isolation::unregister_session_from_repo(&repo_id, session_uuid);
-    }
-
-    // Opportunistically clean up orphaned JJ workspaces for the current repo.
+    // Opportunistically clean up orphaned JJ workspaces for repositories that had
+    // absorbed workspaces.
     // This prevents the jj workspace list from growing unbounded with dead sessions.
-    if let Some(repo_root) = isolation::find_jj_root(&std::env::current_dir().unwrap_or_default()) {
-        if let Err(e) = isolation::cleanup_orphaned_workspaces(&repo_root) {
-            debug_log(|| format!("[workspace] Orphaned workspace cleanup failed: {}", e));
+    for repo_root in &seen_repo_roots {
+        if let Err(e) = isolation::cleanup_orphaned_workspaces(repo_root) {
+            debug_log(|| {
+                format!(
+                    "[workspace] Orphaned workspace cleanup failed for {}: {}",
+                    repo_root.display(),
+                    e
+                )
+            });
         }
     }
 
     debug_log(|| format!("[workspace] Absorbed {} workspace(s)", absorbed));
 
+    // Emit Absorbed event for tasks closed by this session.
+    // This signals `run_wait` that the session's work is complete,
+    // even when no file changes were absorbed.
+    let session_uuid_str = session_uuid.to_string();
+    for repo_root in &seen_repo_roots {
+        if let Ok(events) = crate::tasks::storage::read_events(repo_root) {
+            let graph = crate::tasks::materialize_graph(&events);
+            let terminal_task_ids: Vec<String> = graph
+                .tasks
+                .iter()
+                .filter(|(_, task)| {
+                    matches!(
+                        task.status,
+                        crate::tasks::TaskStatus::Closed | crate::tasks::TaskStatus::Stopped
+                    ) && task.last_session_id.as_deref() == Some(&session_uuid_str)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            if !terminal_task_ids.is_empty() {
+                let turn_id = crate::tasks::current_turn_id(Some(&session_uuid_str));
+                let absorbed_event = crate::tasks::TaskEvent::Absorbed {
+                    task_ids: terminal_task_ids,
+                    session_id: session_uuid_str.clone(),
+                    turn_id,
+                    timestamp: chrono::Utc::now(),
+                };
+                let _ = crate::tasks::storage::write_event(repo_root, &absorbed_event);
+            }
+        }
+    }
+
     let stdout = if has_conflicts {
-        // Return JSON so the hook can access fields via {{absorb_result.conflict_id}}
-        let conflict_id = last_conflict_id.unwrap_or_default();
-        let files = last_conflicted_files.join(", ");
-        serde_json::json!({
-            "status": "conflicts",
-            "conflict_id": conflict_id,
-            "conflicted_files": files,
-        })
-        .to_string()
+        last_conflicted_files
     } else if absorbed > 0 {
         "ok".to_string()
     } else {
@@ -1344,125 +1244,6 @@ pub fn workspace_absorb_all(
         success: true,
         exit_code: Some(0),
         stdout,
-        stderr: String::new(),
-    })
-}
-
-/// Detect conflicts in the agent's workspace and return formatted details.
-///
-/// Finds the workspace for the current session, runs `jj resolve --list`
-/// to get conflicted files, reads each file's content showing conflict markers,
-/// and returns a formatted string for the autoreply.
-pub fn detect_workspace_conflicts(
-    session: &crate::session::AikiSession,
-) -> Result<ActionResult> {
-    use crate::session::isolation;
-
-    let session_uuid = session.uuid();
-    let workspaces_dir = isolation::workspaces_dir();
-
-    if !workspaces_dir.exists() {
-        return Ok(ActionResult {
-            success: true,
-            exit_code: Some(0),
-            stdout: String::new(),
-            stderr: String::new(),
-        });
-    }
-
-    // Find workspace path for this session (scan repo-id dirs)
-    let mut workspace_path: Option<std::path::PathBuf> = None;
-    if let Ok(entries) = std::fs::read_dir(&workspaces_dir) {
-        for entry in entries.flatten() {
-            let repo_id_dir = entry.path();
-            if !repo_id_dir.is_dir() {
-                continue;
-            }
-            let session_ws_dir = repo_id_dir.join(session_uuid);
-            if session_ws_dir.exists() {
-                workspace_path = Some(session_ws_dir);
-                break;
-            }
-        }
-    }
-
-    let workspace_path: std::path::PathBuf = match workspace_path {
-        Some(p) => p,
-        None => {
-            return Ok(ActionResult {
-                success: true,
-                exit_code: Some(0),
-                stdout: String::new(),
-                stderr: String::new(),
-            });
-        }
-    };
-
-    // Run jj resolve --list to get conflicted files
-    let conflict_output = crate::jj::jj_cmd()
-        .current_dir(&workspace_path)
-        .args(["resolve", "--list"])
-        .output()
-        .map_err(|e| {
-            crate::error::AikiError::Other(anyhow::anyhow!(
-                "Failed to list conflicts: {}",
-                e
-            ))
-        })?;
-
-    let conflict_list = String::from_utf8_lossy(&conflict_output.stdout);
-    if conflict_list.trim().is_empty() {
-        return Ok(ActionResult {
-            success: true,
-            exit_code: Some(0),
-            stdout: String::new(),
-            stderr: String::new(),
-        });
-    }
-
-    let mut output = String::from("Conflicted files:\n");
-    let max_lines_per_file = 100;
-
-    for line in conflict_list.lines() {
-        // jj resolve --list output format: "filename    <description>"
-        let file_path = line.split_whitespace().next().unwrap_or("").trim();
-        if file_path.is_empty() {
-            continue;
-        }
-
-        output.push_str(&format!("\n--- {} ---\n", file_path));
-
-        // Read file content from workspace
-        let full_path = workspace_path.join(file_path);
-        match std::fs::read_to_string(&full_path) {
-            Ok(content) => {
-                let lines: Vec<&str> = content.lines().collect();
-                if lines.len() > max_lines_per_file {
-                    for line in &lines[..max_lines_per_file] {
-                        output.push_str(line);
-                        output.push('\n');
-                    }
-                    output.push_str(&format!(
-                        "\n... truncated ({} more lines) ...\n",
-                        lines.len() - max_lines_per_file
-                    ));
-                } else {
-                    output.push_str(&content);
-                    if !content.ends_with('\n') {
-                        output.push('\n');
-                    }
-                }
-            }
-            Err(e) => {
-                output.push_str(&format!("(could not read file: {})\n", e));
-            }
-        }
-    }
-
-    Ok(ActionResult {
-        success: true,
-        exit_code: Some(0),
-        stdout: output,
         stderr: String::new(),
     })
 }
@@ -1492,7 +1273,8 @@ mod tests {
             AgentType::ClaudeCode,
             "test".to_string(),
             None::<&str>,
-            crate::provenance::DetectionMethod::Hook, SessionMode::Interactive,
+            crate::provenance::DetectionMethod::Hook,
+            SessionMode::Interactive,
         );
         AikiChangeCompletedPayload {
             session,
@@ -1518,7 +1300,8 @@ mod tests {
             AgentType::ClaudeCode,
             "test-session-123".to_string(),
             None::<&str>,
-            crate::provenance::DetectionMethod::Hook, SessionMode::Interactive,
+            crate::provenance::DetectionMethod::Hook,
+            SessionMode::Interactive,
         );
         let event = AikiChangeCompletedPayload {
             session,
@@ -1570,7 +1353,8 @@ mod tests {
             AgentType::Cursor,
             "cursor-session".to_string(),
             None::<&str>,
-            crate::provenance::DetectionMethod::Hook, SessionMode::Interactive,
+            crate::provenance::DetectionMethod::Hook,
+            SessionMode::Interactive,
         );
         let event = AikiChangeCompletedPayload {
             session,
@@ -1682,19 +1466,5 @@ mod tests {
         let result = classify_edits_change(&event).unwrap();
         // No edit details → assume AI-only
         assert_eq!(result.stdout, "ExactMatch");
-    }
-
-    // =========================================================================
-    // Helper Function Tests
-    // =========================================================================
-
-    #[test]
-    fn test_parse_split_output() {
-        let output = "First part: qpvuntsm 12345678 AI changes\nSecond part: rlvkpnrz 87654321 (no description set)\n";
-
-        let (ai_id, user_id) = parse_split_output(output).unwrap();
-
-        assert_eq!(ai_id, "12345678");
-        assert_eq!(user_id, "87654321");
     }
 }

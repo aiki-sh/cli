@@ -42,10 +42,6 @@ pub fn handle_task_closed(payload: AikiTaskClosedPayload) -> Result<HookResult> 
         &core_hook.handlers.task_closed,
     )?;
 
-    // Execute any pending session terminations (from session.end actions)
-    // This must happen AFTER hooks complete but BEFORE we return
-    state.execute_pending_session_ends();
-
     // Extract failures from state
     let failures = state.take_failures();
 

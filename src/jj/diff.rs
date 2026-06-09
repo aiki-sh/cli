@@ -20,7 +20,8 @@ pub fn get_deleted_paths(shell_cwd: &Path, command_args: &[String]) -> Result<Ve
     // Find workspace root and normalize command args to be workspace-relative
     let workspace = JJWorkspace::find(shell_cwd)?;
     let workspace_root = workspace.workspace_root();
-    let normalized_args = normalize_paths_to_workspace_root(command_args, shell_cwd, workspace_root)?;
+    let normalized_args =
+        normalize_paths_to_workspace_root(command_args, shell_cwd, workspace_root)?;
 
     let output = run_jj_diff_summary(workspace_root)?;
 
@@ -79,10 +80,11 @@ pub fn get_move_operations(
     //   mv bar existing_dir # Dest arg: "existing_dir", JJ dest: "existing_dir/bar"
     //                       # "existing_dir/bar" starts with "existing_dir" - match!
     let dest_arg: String = command_args.last().cloned().unwrap_or_default();
-    let normalized_dest = normalize_paths_to_workspace_root(&[dest_arg], shell_cwd, workspace_root)?
-        .into_iter()
-        .next()
-        .unwrap_or_default();
+    let normalized_dest =
+        normalize_paths_to_workspace_root(&[dest_arg], shell_cwd, workspace_root)?
+            .into_iter()
+            .next()
+            .unwrap_or_default();
 
     // If destination is outside workspace, normalized_dest will be empty.
     // Return empty vec so caller falls back to syntactic detection.
@@ -110,9 +112,8 @@ pub fn get_move_operations(
         .into_iter()
         .filter(|(_source, dest)| {
             let dest_path = std::path::Path::new(dest);
-            let arg_path = std::path::Path::new(
-                normalized_dest.trim_end_matches('/').trim_end_matches('\\'),
-            );
+            let arg_path =
+                std::path::Path::new(normalized_dest.trim_end_matches('/').trim_end_matches('\\'));
             dest_path == arg_path || dest_path.starts_with(arg_path)
         })
         .collect();
@@ -249,9 +250,7 @@ fn filter_paths_by_command(paths: &[String], command_args: &[String]) -> Vec<Str
             // Also add pattern/** for directory matching (e.g., src/* matches src/foo/bar.rs)
             let dir_pattern = format!(
                 "{}/**",
-                normalized_arg
-                    .trim_end_matches('/')
-                    .trim_end_matches('\\')
+                normalized_arg.trim_end_matches('/').trim_end_matches('\\')
             );
             if let Ok(glob) = Glob::new(&dir_pattern) {
                 builder.add(glob);
@@ -615,21 +614,18 @@ mod tests {
 
         // Test 2: Command from subdirectory (relative path)
         let args = vec!["foo.rs".to_string()];
-        let normalized =
-            normalize_paths_to_workspace_root(&args, &subdir, workspace_root).unwrap();
+        let normalized = normalize_paths_to_workspace_root(&args, &subdir, workspace_root).unwrap();
         assert_eq!(normalized, vec!["src/foo.rs"]);
 
         // Test 3: Multiple paths from subdirectory
         let args = vec!["foo.rs".to_string(), "bar.rs".to_string()];
-        let normalized =
-            normalize_paths_to_workspace_root(&args, &subdir, workspace_root).unwrap();
+        let normalized = normalize_paths_to_workspace_root(&args, &subdir, workspace_root).unwrap();
         assert_eq!(normalized, vec!["src/foo.rs", "src/bar.rs"]);
 
         // Test 4: Absolute path
         let absolute_path = workspace_root.join("lib.rs");
         let args = vec![absolute_path.to_string_lossy().to_string()];
-        let normalized =
-            normalize_paths_to_workspace_root(&args, &subdir, workspace_root).unwrap();
+        let normalized = normalize_paths_to_workspace_root(&args, &subdir, workspace_root).unwrap();
         assert_eq!(normalized, vec!["lib.rs"]);
     }
 
@@ -887,6 +883,9 @@ mod tests {
         assert_eq!(normalize_separators("src\\foo.rs"), "src/foo.rs");
         assert_eq!(normalize_separators("src/foo.rs"), "src/foo.rs");
         assert_eq!(normalize_separators("a\\b\\c\\d.txt"), "a/b/c/d.txt");
-        assert_eq!(normalize_separators("no_separators.txt"), "no_separators.txt");
+        assert_eq!(
+            normalize_separators("no_separators.txt"),
+            "no_separators.txt"
+        );
     }
 }

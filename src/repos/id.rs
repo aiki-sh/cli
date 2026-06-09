@@ -141,50 +141,6 @@ pub fn ensure_repo_id(repo_path: &Path) -> Result<String> {
     }
 }
 
-/// Upgrade a local-* repo ID to a root commit hash if possible
-///
-/// Call this after the user adds their first commit to upgrade
-/// from a path-based ID to a stable root commit hash.
-///
-/// Returns:
-/// - `Ok(Some(new_id))` if upgraded
-/// - `Ok(None)` if no upgrade needed or possible
-pub fn try_upgrade_repo_id(repo_path: &Path) -> Result<Option<String>> {
-    let existing = read_repo_id(repo_path)?;
-
-    match &existing {
-        // Truncate legacy 40-char hex IDs to 8 chars
-        Some(id) if is_long_hex_id(id) => {
-            let short = id[..8].to_string();
-            let path = repo_id_path(repo_path);
-            fs::write(&path, format!("{}\n", short)).map_err(|e| {
-                AikiError::Other(anyhow::anyhow!("Failed to upgrade repo-id file: {}", e))
-            })?;
-            crate::cache::debug_log(|| {
-                format!("Truncated repo-id from {} to {}", id, short)
-            });
-            Ok(Some(short))
-        }
-        // Upgrade local-* to root commit hash (truncated)
-        Some(id) if id.starts_with("local-") => {
-            let root_hash = match get_git_root_commit(repo_path)? {
-                Some(h) => h,
-                None => return Ok(None),
-            };
-            let short = root_hash[..8].to_string();
-            let path = repo_id_path(repo_path);
-            fs::write(&path, format!("{}\n", short)).map_err(|e| {
-                AikiError::Other(anyhow::anyhow!("Failed to upgrade repo-id file: {}", e))
-            })?;
-            crate::cache::debug_log(|| {
-                format!("Upgraded repo-id from {} to {}", id, short)
-            });
-            Ok(Some(short))
-        }
-        _ => Ok(None),
-    }
-}
-
 /// Check if a repo ID is a legacy long hex string (e.g., 40-char SHA-1).
 fn is_long_hex_id(id: &str) -> bool {
     id.len() > 8 && !id.starts_with("local-") && id.chars().all(|c| c.is_ascii_hexdigit())
@@ -270,7 +226,11 @@ mod tests {
         let temp_dir = setup_test_repo();
         // No git repo - should get local-* ID
         let id = compute_repo_id(temp_dir.path()).unwrap();
-        assert!(id.starts_with("local-"), "Should be local-* without git: {}", id);
+        assert!(
+            id.starts_with("local-"),
+            "Should be local-* without git: {}",
+            id
+        );
     }
 
     #[test]
@@ -279,7 +239,11 @@ mod tests {
         init_git_repo(temp_dir.path());
         // Git repo with no commits - should get local-* ID
         let id = compute_repo_id(temp_dir.path()).unwrap();
-        assert!(id.starts_with("local-"), "Should be local-* without commits: {}", id);
+        assert!(
+            id.starts_with("local-"),
+            "Should be local-* without commits: {}",
+            id
+        );
     }
 
     #[test]
@@ -289,7 +253,11 @@ mod tests {
         create_commit(temp_dir.path(), "Initial commit");
 
         let id = compute_repo_id(temp_dir.path()).unwrap();
-        assert!(!id.starts_with("local-"), "Should be root hash with commits: {}", id);
+        assert!(
+            !id.starts_with("local-"),
+            "Should be root hash with commits: {}",
+            id
+        );
         assert_eq!(id.len(), 8, "Truncated hash should be 8 chars: {}", id);
     }
 
@@ -339,63 +307,6 @@ mod tests {
         let id = ensure_repo_id(temp_dir.path()).unwrap();
         assert!(!id.is_empty());
         assert!(!id.starts_with("local-"));
-    }
-
-    #[test]
-    fn test_try_upgrade_no_existing() {
-        let temp_dir = setup_test_repo();
-        let result = try_upgrade_repo_id(temp_dir.path()).unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_try_upgrade_non_local_short_id() {
-        let temp_dir = setup_test_repo();
-        // 8-char hex ID is already short — no upgrade needed
-        fs::write(repo_id_path(temp_dir.path()), "abc12345\n").unwrap();
-
-        let result = try_upgrade_repo_id(temp_dir.path()).unwrap();
-        assert!(result.is_none(), "Should not upgrade already-short IDs");
-    }
-
-    #[test]
-    fn test_try_upgrade_truncates_long_hex_id() {
-        let temp_dir = setup_test_repo();
-        fs::write(
-            repo_id_path(temp_dir.path()),
-            "7f50e06340e462ecc2f0b28447d532bfe719267c\n",
-        )
-        .unwrap();
-
-        let result = try_upgrade_repo_id(temp_dir.path()).unwrap();
-        assert_eq!(result, Some("7f50e063".to_string()));
-
-        let content = fs::read_to_string(repo_id_path(temp_dir.path())).unwrap();
-        assert_eq!(content.trim(), "7f50e063");
-    }
-
-    #[test]
-    fn test_try_upgrade_local_to_root_hash() {
-        let temp_dir = setup_test_repo();
-        init_git_repo(temp_dir.path());
-
-        // Start with local-* ID
-        fs::write(repo_id_path(temp_dir.path()), "local-abc123\n").unwrap();
-
-        // Create first commit
-        create_commit(temp_dir.path(), "Initial commit");
-
-        // Now upgrade should work
-        let result = try_upgrade_repo_id(temp_dir.path()).unwrap();
-        assert!(result.is_some(), "Should upgrade local ID");
-
-        let new_id = result.unwrap();
-        assert!(!new_id.starts_with("local-"));
-        assert_eq!(new_id.len(), 8, "Upgraded ID should be 8 chars: {}", new_id);
-
-        // Verify file was updated
-        let content = fs::read_to_string(repo_id_path(temp_dir.path())).unwrap();
-        assert_eq!(content.trim(), new_id);
     }
 
     #[test]

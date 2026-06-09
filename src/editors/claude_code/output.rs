@@ -14,6 +14,7 @@ pub fn build_command_output(response: HookResult, event_type: &str) -> HookComma
         "PreToolUse" => build_pre_tool_use_output(&response),
         "PostToolUse" | "PostFileChange" => build_post_tool_use_output(&response),
         "Stop" => build_stop_output(&response),
+        "SessionEnd" => HookCommandOutput::new(None, 0),
         _ => {
             eprintln!("Warning: Unknown Claude Code event type: {}", event_type);
             HookCommandOutput::new(None, 0)

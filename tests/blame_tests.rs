@@ -231,13 +231,10 @@ fn test_blame_shows_recorded_change() {
     // Session ID is now a UUID (deterministic hash of agent_type + external_id)
     // Verify it appears in UUID format (8 hex chars followed by hyphen)
     // The format is truncated in blame output to first 9 chars like "abc12345-..."
-    let has_uuid_prefix = blame_output
-        .lines()
-        .any(|line| {
-            // Look for a UUID-like pattern: 8 hex chars followed by hyphen
-            line.contains(char::is_alphanumeric)
-                && line.chars().filter(|c| *c == '-').count() >= 1
-        });
+    let has_uuid_prefix = blame_output.lines().any(|line| {
+        // Look for a UUID-like pattern: 8 hex chars followed by hyphen
+        line.contains(char::is_alphanumeric) && line.chars().filter(|c| *c == '-').count() >= 1
+    });
     assert!(
         has_uuid_prefix || blame_output.contains("..."),
         "Blame should show truncated session UUID. Output:\n{}",
@@ -263,110 +260,4 @@ fn get_aiki_binary_path() -> PathBuf {
     path.push("debug");
     path.push("aiki");
     path
-}
-
-/// Test that blame --verify shows signature indicators
-#[test]
-fn test_blame_verify_shows_signature_status() {
-    // Create a temporary directory
-    let temp_dir = TempDir::new().unwrap();
-    let repo_path = temp_dir.path();
-
-    // Initialize JJ (non-colocated, creates internal Git storage)
-    Command::new("jj")
-        .args(["git", "init", "--no-colocate"])
-        .current_dir(repo_path)
-        .output()
-        .expect("Failed to initialize JJ repo");
-
-    Command::new("jj")
-        .args(["config", "set", "--repo", "user.name", "Test User"])
-        .current_dir(repo_path)
-        .output()
-        .unwrap();
-
-    Command::new("jj")
-        .args(["config", "set", "--repo", "user.email", "test@example.com"])
-        .current_dir(repo_path)
-        .output()
-        .unwrap();
-
-    // Create a test file with provenance
-    let test_file = repo_path.join("test.txt");
-    fs::write(&test_file, "line 1\nline 2\nline 3\n").unwrap();
-
-    let description = r#"Test change
-
-[aiki]
-author=claude
-author_type=agent
-session=test-session-123
-tool=Edit
-confidence=High
-method=Hook
-[/aiki]"#;
-
-    Command::new("jj")
-        .args(["describe", "-m", description])
-        .current_dir(repo_path)
-        .output()
-        .expect("Failed to describe change");
-
-    // Create a new change to snapshot the working copy
-    Command::new("jj")
-        .args(["new"])
-        .current_dir(repo_path)
-        .output()
-        .expect("Failed to create new change");
-
-    // Run blame without --verify (should not show signature indicators)
-    let aiki_bin = get_aiki_binary_path();
-    let output = Command::new(&aiki_bin)
-        .args(["blame", "test.txt"])
-        .current_dir(repo_path)
-        .output()
-        .expect("Failed to run aiki blame");
-
-    let blame_output = String::from_utf8_lossy(&output.stdout);
-    println!("Blame output (without --verify):\n{}", blame_output);
-
-    // Should NOT contain signature indicators
-    assert!(
-        !blame_output.contains("✓ "),
-        "Blame without --verify should not show ✓"
-    );
-    assert!(
-        !blame_output.contains("✗ "),
-        "Blame without --verify should not show ✗"
-    );
-    assert!(
-        !blame_output.contains("⚠ "),
-        "Blame without --verify should not show ⚠"
-    );
-
-    // Run blame with --verify (should show signature indicators)
-    let output = Command::new(&aiki_bin)
-        .args(["blame", "test.txt", "--verify"])
-        .current_dir(repo_path)
-        .output()
-        .expect("Failed to run aiki blame --verify");
-
-    let blame_verify_output = String::from_utf8_lossy(&output.stdout);
-    println!("Blame output (with --verify):\n{}", blame_verify_output);
-
-    // Should contain signature indicators (unsigned changes show ⚠)
-    assert!(
-        blame_verify_output.contains("⚠ "),
-        "Blame with --verify should show ⚠ for unsigned changes"
-    );
-
-    // Should still show the content
-    assert!(
-        blame_verify_output.contains("line 1"),
-        "Should show file content"
-    );
-    assert!(
-        blame_verify_output.contains("claude-code"),
-        "Should show agent (claude-code)"
-    );
 }

@@ -1,4 +1,6 @@
+use std::cell::OnceCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Result of executing an action
 #[derive(Debug, Clone)]
@@ -7,6 +9,17 @@ pub struct ActionResult {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+}
+
+impl ActionResult {
+    pub fn success() -> Self {
+        Self {
+            success: true,
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
 }
 
 /// Aiki execution state for hook processing
@@ -44,9 +57,18 @@ pub struct AikiState {
     /// Used by session.end action to defer termination until hooks are done
     pending_session_ends: Vec<u32>,
 
+    /// Set by the `end_session` action to signal that the session should end.
+    /// The turn.completed handler reads this to set Decision::Block, which
+    /// the Codex stop output builder translates to `{ "continue": false }`.
+    pub end_session: bool,
+
     /// Cached expression evaluator for compile-once/eval-many condition evaluation.
     /// Persists compiled ASTs across multiple condition evaluations within a session.
     expression_evaluator: crate::expressions::ExpressionEvaluator,
+
+    /// Lazily cached thread-session match for task.closed events.
+    /// Stores `Some(None)` after a miss so failed lookups are also memoized.
+    task_closed_thread_session: Rc<OnceCell<Option<crate::session::ThreadSessionInfo>>>,
 }
 
 impl AikiState {
@@ -85,7 +107,9 @@ impl AikiState {
             context_assembler,
             failures: Vec::new(),
             pending_session_ends: Vec::new(),
+            end_session: false,
             expression_evaluator: crate::expressions::ExpressionEvaluator::new(),
+            task_closed_thread_session: Rc::new(OnceCell::new()),
         }
     }
 
@@ -100,11 +124,25 @@ impl AikiState {
         &mut self.expression_evaluator
     }
 
-    /// Helper to get the agent type
+    /// Resolve the task-thread session once for a task.closed event and cache the result.
     #[must_use]
-    #[allow(dead_code)] // Part of AikiState API
-    pub fn agent_type(&self) -> crate::provenance::AgentType {
-        self.event.agent_type()
+    pub fn resolve_task_closed_thread_session(&self) -> Option<crate::session::ThreadSessionInfo> {
+        self.task_closed_thread_session
+            .get_or_init(|| match &self.event {
+                crate::events::AikiEvent::TaskClosed(e) => {
+                    crate::session::find_thread_session(&e.task.id)
+                }
+                _ => None,
+            })
+            .clone()
+    }
+
+    /// Get the shared per-event cache used by task.closed lazy session variables.
+    #[must_use]
+    pub fn task_closed_thread_session_cache(
+        &self,
+    ) -> Rc<OnceCell<Option<crate::session::ThreadSessionInfo>>> {
+        Rc::clone(&self.task_closed_thread_session)
     }
 
     /// Get a variable value by name
@@ -152,8 +190,18 @@ impl AikiState {
         })
     }
 
-    /// Build the final context from accumulated chunks
-    /// Works for session.started, turn.started (builds prompt), and turn.completed (builds autoreply)
+    /// Returns true if an autoreply (or context) has been queued in this hook run.
+    #[must_use]
+    pub fn has_pending_autoreply(&self) -> bool {
+        self.context_assembler
+            .as_ref()
+            .is_some_and(|a| !a.is_empty())
+    }
+
+    /// Build the final context from accumulated chunks without the original prompt/body.
+    ///
+    /// This is the right default for hook adapters that already receive the
+    /// original user prompt separately and only need injected context.
     /// Returns None if:
     /// - This event doesn't have a context assembler, OR
     /// - The assembler is empty (no Context actions were executed)
@@ -163,7 +211,22 @@ impl AikiState {
             if assembler.is_empty() {
                 None
             } else {
-                Some(assembler.build())
+                Some(assembler.build_without_original())
+            }
+        })
+    }
+
+    /// Build the final context from accumulated chunks including original prompt/body.
+    ///
+    /// This preserves the legacy prompt-rewrite behavior for callers that need it.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn build_context_with_original_prompt(&self) -> Option<String> {
+        self.context_assembler.as_ref().and_then(|assembler| {
+            if assembler.is_empty() {
+                None
+            } else {
+                Some(assembler.build_with_original())
             }
         })
     }
@@ -182,13 +245,6 @@ impl AikiState {
     #[must_use]
     pub fn failures(&self) -> &[crate::events::result::Failure] {
         &self.failures
-    }
-
-    /// Get the number of failures
-    #[must_use]
-    #[allow(dead_code)] // Part of AikiState API
-    pub fn failures_count(&self) -> usize {
-        self.failures.len()
     }
 
     /// Clear all let-bound variables and their metadata.
@@ -254,17 +310,65 @@ impl AikiState {
             self.pending_session_ends.clear();
         }
     }
-
-    /// Check if there are pending session terminations
-    #[must_use]
-    pub fn has_pending_session_ends(&self) -> bool {
-        !self.pending_session_ends.is_empty()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{AikiTaskClosedPayload, TaskEventPayload};
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    // Use the process-wide mutex from global.rs to avoid races with other modules
+    fn aiki_home_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::global::AIKI_HOME_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct EnvGuard {
+        original: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => env::set_var(crate::global::AIKI_HOME_ENV, value),
+                None => env::remove_var(crate::global::AIKI_HOME_ENV),
+            }
+        }
+    }
+
+    fn setup_global_aiki_home() -> (TempDir, EnvGuard) {
+        let aiki_home = TempDir::new().unwrap();
+        fs::create_dir_all(aiki_home.path().join("sessions")).unwrap();
+
+        let original = env::var(crate::global::AIKI_HOME_ENV).ok();
+        env::set_var(crate::global::AIKI_HOME_ENV, aiki_home.path());
+
+        (aiki_home, EnvGuard { original })
+    }
+
+    fn create_task_closed_event(task_id: &str) -> crate::events::AikiEvent {
+        AikiTaskClosedPayload {
+            task: TaskEventPayload {
+                id: task_id.to_string(),
+                name: "Execution Test".to_string(),
+                task_type: "review".to_string(),
+                status: "closed".to_string(),
+                assignee: None,
+                outcome: Some("done".to_string()),
+                source: None,
+                files: Some(vec!["src/test.rs".to_string()]),
+                changes: Some(vec!["abc123".to_string()]),
+            },
+            cwd: PathBuf::from("/tmp/test"),
+            timestamp: chrono::Utc::now(),
+        }
+        .into()
+    }
 
     #[test]
     fn test_action_result_success() {
@@ -303,7 +407,8 @@ mod tests {
             AgentType::ClaudeCode,
             "test-session".to_string(),
             None::<&str>,
-            crate::provenance::DetectionMethod::Hook, SessionMode::Interactive,
+            crate::provenance::DetectionMethod::Hook,
+            SessionMode::Interactive,
         );
         let event = AikiEvent::ChangeCompleted(AikiChangeCompletedPayload {
             session,
@@ -322,10 +427,51 @@ mod tests {
         // Verify we can access event fields through the enum
         match &ctx.event {
             AikiEvent::ChangeCompleted(e) => {
-                assert_eq!(e.operation.file_paths(), vec!["/test/file.rs".to_string()]);
+                if let ChangeOperation::Write(ref w) = e.operation {
+                    assert_eq!(w.file_paths, vec!["/test/file.rs".to_string()]);
+                } else {
+                    panic!("Expected Write operation");
+                }
             }
             _ => panic!("Expected ChangeCompleted event"),
         }
         assert_eq!(ctx.cwd(), std::path::Path::new("/test"));
+    }
+
+    #[test]
+    fn test_task_closed_thread_session_lookup_is_cached() {
+        let _lock = aiki_home_lock();
+        let (_aiki_home, _guard) = setup_global_aiki_home();
+
+        let task_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let thread_head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let session_path = crate::global::global_sessions_dir().join("sessioncachetest");
+        fs::write(
+            &session_path,
+            format!(
+                "thread={}:{}\nparent_pid=4242\nsession_id=sessioncachetest\nmode=background\n",
+                thread_head, task_id
+            ),
+        )
+        .unwrap();
+
+        let state = AikiState::new(create_task_closed_event(task_id));
+
+        let first = state
+            .resolve_task_closed_thread_session()
+            .expect("expected initial session lookup to succeed");
+        assert_eq!(first.pid, 4242);
+        assert_eq!(first.thread.head, thread_head);
+        assert_eq!(first.thread.tail, task_id);
+        assert_eq!(first.mode, crate::session::SessionMode::Background);
+
+        fs::remove_file(&session_path).unwrap();
+
+        let second = state
+            .resolve_task_closed_thread_session()
+            .expect("expected cached session lookup to survive file removal");
+        assert_eq!(second.pid, first.pid);
+        assert_eq!(second.thread.serialize(), first.thread.serialize());
+        assert_eq!(second.mode, first.mode);
     }
 }

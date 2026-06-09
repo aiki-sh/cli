@@ -25,11 +25,15 @@ pub static DEBUG_ENABLED: LazyLock<bool> = LazyLock::new(|| std::env::var("AIKI_
 
 /// Aiki binary path - resolved once per process.
 ///
-/// Uses `which aiki` to find the binary, falling back to `std::env::current_exe()`.
+/// Resolution order:
+/// 1. `AIKI_BIN` env var (explicit override, useful for tests)
+/// 2. `which aiki` (PATH lookup — preferred because current_exe() can return
+///    stale workspace paths like `/private/tmp/aiki/.../target/debug/aiki`)
+/// 3. `std::env::current_exe()` (fallback when not on PATH)
 ///
 /// # Panics
 ///
-/// Panics if both `which aiki` and `current_exe()` fail. This should never happen
+/// Panics if all resolution methods fail. This should never happen
 /// in practice since we're running from this binary, but could theoretically occur
 /// if the path contains invalid UTF-8 or there are OS-level issues.
 pub static AIKI_BINARY_PATH: LazyLock<String> = LazyLock::new(|| {
@@ -88,9 +92,21 @@ pub fn get_core_hook() -> &'static Hook {
 
 /// Resolve the path to the aiki binary.
 ///
-/// Tries `which aiki` first, then falls back to `std::env::current_exe()`.
+/// Resolution order:
+/// 1. `AIKI_BIN` env var — explicit override (tests, custom deployments)
+/// 2. `which aiki` — PATH lookup (preferred; current_exe can return stale workspace paths)
+/// 3. `std::env::current_exe()` — fallback when not on PATH
 fn resolve_aiki_binary_path() -> Result<String, String> {
-    // Try `which aiki` first
+    // 1. Explicit override via environment variable
+    if let Ok(path) = std::env::var("AIKI_BIN") {
+        if !path.is_empty() {
+            return Ok(path);
+        }
+    }
+
+    // 2. PATH lookup — preferred because current_exe() can return stale
+    //    workspace paths (e.g. /private/tmp/aiki/.../target/debug/aiki)
+    //    that no longer exist after workspace cleanup.
     if let Ok(output) = std::process::Command::new("which").arg("aiki").output() {
         if output.status.success() {
             if let Ok(path) = String::from_utf8(output.stdout) {
@@ -102,7 +118,7 @@ fn resolve_aiki_binary_path() -> Result<String, String> {
         }
     }
 
-    // Fallback: current executable path
+    // 3. Fallback: current executable path
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(path_str) = current_exe.to_str() {
             return Ok(path_str.to_string());

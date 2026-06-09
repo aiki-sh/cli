@@ -16,21 +16,6 @@ impl RepoRef {
     pub fn new(root: String, path: PathBuf, id: String) -> Self {
         Self { root, path, id }
     }
-
-    /// Create a RepoRef by reading repo-id from disk.
-    /// Use `new()` when you already have the repo_id to avoid the file read.
-    pub fn from_path(repo_root: &std::path::Path) -> Self {
-        let root = repo_root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let id = std::fs::read_to_string(repo_root.join(".aiki/repo-id"))
-            .unwrap_or_else(|_| format!("local-{}", root))
-            .trim()
-            .to_string();
-        Self::new(root, repo_root.to_path_buf(), id)
-    }
 }
 
 /// repo.changed event payload

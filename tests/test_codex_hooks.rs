@@ -1,8 +1,8 @@
-//! Integration tests for Codex hooks (OTel + notify)
+//! Integration tests for Codex hooks (OTel + native stdin hooks)
 //!
 //! Tests the end-to-end flow of:
 //! - OTel protobuf parsing → session state updates
-//! - Notify payload parsing → turn completion handling
+//! - Native hook config generation
 //! - Hook installation (config.toml generation)
 
 use aiki::editors::codex::otel::{self, CodexOtelEvent};
@@ -141,21 +141,8 @@ fn test_otel_full_session_flow() {
         assert_eq!(prompt.as_deref(), Some("Fix the bug in login.rs"));
     }
 
-    // Verify tool_result has extractable file path
-    if let CodexOtelEvent::ToolResult {
-        tool_name,
-        arguments,
-        ..
-    } = &events[2].0
-    {
-        assert_eq!(tool_name.as_deref(), Some("write_file"));
-        let files = otel::extract_modified_files(
-            tool_name.as_deref(),
-            arguments.as_deref(),
-            None,
-        );
-        assert_eq!(files, vec!["src/login.rs"]);
-    }
+    // Verify tool_result is parsed
+    assert!(matches!(&events[2].0, CodexOtelEvent::ToolResult { .. }));
 }
 
 #[test]
@@ -176,138 +163,18 @@ fn test_otel_deferred_events_not_mapped() {
     assert_eq!(events.len(), 3);
 
     // All should be Unknown (acknowledged but not mapped)
-    for (event, _) in &events {
-        assert!(matches!(event, CodexOtelEvent::Unknown { .. }));
-    }
-}
-
-
-
-#[test]
-fn test_notify_payload_parsing() {
-    use aiki::editors::codex::NotifyPayload;
-
-    let json = r#"{
-        "type": "agent-turn-complete",
-        "thread-id": "conv_notify_1",
-        "turn-id": "turn_abc",
-        "cwd": "/home/user/project",
-        "last-assistant-message": "I fixed the bug in login.rs by updating the auth check.",
-        "input-messages": [{"role": "user", "content": "Fix the login bug"}]
-    }"#;
-
-    let payload: NotifyPayload = serde_json::from_str(json).unwrap();
-    assert_eq!(payload.event_type, "agent-turn-complete");
-    assert_eq!(payload.thread_id, "conv_notify_1");
-    assert_eq!(payload.cwd, "/home/user/project");
-    assert_eq!(
-        payload.last_assistant_message.as_deref(),
-        Some("I fixed the bug in login.rs by updating the auth check.")
-    );
+    assert!(matches!(&events[0].0, CodexOtelEvent::Unknown { .. }));
+    assert!(matches!(&events[1].0, CodexOtelEvent::Unknown { .. }));
+    assert!(matches!(&events[2].0, CodexOtelEvent::ToolDecision { .. }));
 }
 
 #[test]
-fn test_notify_payload_minimal() {
-    use aiki::editors::codex::NotifyPayload;
-
-    // Minimal payload with only required fields
-    let json = r#"{
-        "type": "agent-turn-complete",
-        "thread-id": "conv_minimal",
-        "cwd": "/tmp"
-    }"#;
-
-    let payload: NotifyPayload = serde_json::from_str(json).unwrap();
-    assert_eq!(payload.thread_id, "conv_minimal");
-    assert_eq!(payload.cwd, "/tmp");
-    assert!(payload.last_assistant_message.is_none());
-}
-
-#[test]
-fn test_extract_modified_files_various_tools() {
-    // write_file tool
-    let files = otel::extract_modified_files(
-        Some("write_file"),
-        Some(r#"{"file_path": "src/main.rs"}"#),
-        None,
-    );
-    assert_eq!(files, vec!["src/main.rs"]);
-
-    // edit tool
-    let files = otel::extract_modified_files(
-        Some("edit"),
-        Some(r#"{"path": "lib/utils.py"}"#),
-        None,
-    );
-    assert_eq!(files, vec!["lib/utils.py"]);
-
-    // Non-file tool (web search) - should return empty
-    let files = otel::extract_modified_files(
-        Some("web_search"),
-        Some(r#"{"query": "rust async"}"#),
-        None,
-    );
-    assert!(files.is_empty());
-
-    // Unknown tool with file path - should try to extract
-    let files = otel::extract_modified_files(
-        None,
-        Some(r#"{"file_path": "unknown_tool_file.txt"}"#),
-        None,
-    );
-    assert_eq!(files, vec!["unknown_tool_file.txt"]);
-}
-
-#[test]
-fn test_extract_modified_files_path_resolution() {
-    let cwd = std::path::Path::new("/home/user/project");
-
-    // Relative path resolved against cwd
-    let files = otel::extract_modified_files(
-        Some("write"),
-        Some(r#"{"file_path": "src/foo.rs"}"#),
-        Some(cwd),
-    );
-    assert_eq!(files, vec!["/home/user/project/src/foo.rs"]);
-
-    // Absolute path unchanged
-    let files = otel::extract_modified_files(
-        Some("write"),
-        Some(r#"{"file_path": "/etc/config.toml"}"#),
-        Some(cwd),
-    );
-    assert_eq!(files, vec!["/etc/config.toml"]);
-}
-
-#[test]
-fn test_extract_modified_files_edge_cases() {
-    // Empty arguments
-    let files = otel::extract_modified_files(Some("write"), Some(""), None);
-    assert!(files.is_empty());
-
-    // No arguments
-    let files = otel::extract_modified_files(Some("write"), None, None);
-    assert!(files.is_empty());
-
-    // Invalid JSON - try as plain path
-    let files = otel::extract_modified_files(Some("write"), Some("simple_file.txt"), None);
-    assert_eq!(files, vec!["simple_file.txt"]);
-
-    // JSON without file path keys
-    let files = otel::extract_modified_files(
-        Some("write"),
-        Some(r#"{"content": "hello world"}"#),
-        None,
-    );
-    assert!(files.is_empty());
-}
-
-#[test]
-fn test_codex_config_toml_generation() {
+fn test_codex_config_generation() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config_path = tmp.path().join("config.toml");
+    let hooks_path = tmp.path().join("hooks.json");
 
-    // Simulate what install_codex_hooks_global does
+    // Simulate what install_codex_hooks_global does.
     // exporter is a tagged enum struct variant: { "otlp-http": { endpoint, protocol } }
     let mut config = toml::map::Map::new();
 
@@ -328,26 +195,31 @@ fn test_codex_config_toml_generation() {
     otel_table.insert("exporter".to_string(), toml::Value::Table(exporter));
     otel_table.insert("log_user_prompt".to_string(), toml::Value::Boolean(true));
     config.insert("otel".to_string(), toml::Value::Table(otel_table));
-
-    let notify_cmd = vec![
-        toml::Value::String("/usr/local/bin/aiki".to_string()),
-        toml::Value::String("hooks".to_string()),
-        toml::Value::String("handle".to_string()),
-        toml::Value::String("--agent".to_string()),
-        toml::Value::String("codex".to_string()),
-        toml::Value::String("--event".to_string()),
-        toml::Value::String("agent-turn-complete".to_string()),
-    ];
-    config.insert("notify".to_string(), toml::Value::Array(notify_cmd));
+    let mut features = toml::map::Map::new();
+    features.insert("codex_hooks".to_string(), toml::Value::Boolean(true));
+    config.insert("features".to_string(), toml::Value::Table(features));
 
     let content = toml::to_string_pretty(&toml::Value::Table(config)).unwrap();
     fs::write(&config_path, &content).unwrap();
 
-    // Parse back and verify
+    let hooks_json = serde_json::json!({
+        "hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": "/usr/local/bin/aiki hooks stdin --agent codex --event sessionStart"}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/usr/local/bin/aiki hooks stdin --agent codex --event userPromptSubmit"}]}],
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "/usr/local/bin/aiki hooks stdin --agent codex --event preToolUse"}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": "/usr/local/bin/aiki hooks stdin --agent codex --event stop"}]}]
+        }
+    });
+    fs::write(&hooks_path, serde_json::to_string_pretty(&hooks_json).unwrap()).unwrap();
+
+    // Parse back and verify config.toml.
     let parsed: toml::Value = toml::from_str(&content).unwrap();
 
     let otel = parsed.get("otel").unwrap().as_table().unwrap();
-    assert_eq!(otel.get("log_user_prompt").unwrap().as_bool().unwrap(), true);
+    assert_eq!(
+        otel.get("log_user_prompt").unwrap().as_bool().unwrap(),
+        true
+    );
 
     // Verify exporter is a struct variant (table with otlp-http key)
     let exporter = otel.get("exporter").unwrap().as_table().unwrap();
@@ -361,13 +233,28 @@ fn test_codex_config_toml_generation() {
         "binary"
     );
 
-    let notify = parsed.get("notify").unwrap().as_array().unwrap();
-    assert!(notify
-        .iter()
-        .any(|v| v.as_str().is_some_and(|s| s.contains("aiki"))));
-    assert!(notify
-        .iter()
-        .any(|v| v.as_str() == Some("agent-turn-complete")));
+    assert!(parsed.get("notify").is_none());
+    assert_eq!(
+        parsed["features"]["codex_hooks"].as_bool(),
+        Some(true)
+    );
+
+    // Parse back and verify hooks.json.
+    let hooks_value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+    let hooks = hooks_value["hooks"].as_object().unwrap();
+    for (event_name, event_arg) in [
+        ("SessionStart", "sessionStart"),
+        ("UserPromptSubmit", "userPromptSubmit"),
+        ("PreToolUse", "preToolUse"),
+        ("Stop", "stop"),
+    ] {
+        let groups = hooks[event_name].as_array().unwrap();
+        let command = groups[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.contains("aiki"));
+        assert!(command.contains("stdin"));
+        assert!(command.contains(event_arg));
+    }
 }
 
 #[test]
@@ -406,10 +293,6 @@ fn test_gzip_decompression_roundtrip() {
     ));
 }
 
-
-
-
-
 #[test]
 fn test_content_type_detection_logs_endpoint() {
     // Verify that /v1/traces is detected as unsupported
@@ -420,5 +303,3 @@ fn test_content_type_detection_logs_endpoint() {
     let path = "/v1/logs";
     assert!(!path.contains("/v1/traces"));
 }
-
-

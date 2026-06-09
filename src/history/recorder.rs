@@ -51,14 +51,17 @@ pub fn record_session_start(
     timestamp: DateTime<Utc>,
     repo_id: Option<&str>,
     event_cwd: Option<&str>,
+    transcript_path: Option<&str>,
 ) -> Result<()> {
     let event = ConversationEvent::SessionStart {
         session_id: session.uuid().to_string(),
         agent_type: session.agent_type(),
         timestamp,
+        run_thread_id: session.thread().map(|t| t.serialize()),
         repo_id: repo_id.map(String::from),
         cwd: event_cwd.map(String::from),
         session_mode: Some(session.mode()),
+        transcript_path: transcript_path.map(String::from),
     };
 
     write_event(jj_cwd, &event)?;
@@ -123,6 +126,8 @@ pub fn record_response(
     timestamp: DateTime<Utc>,
     repo_id: Option<&str>,
     event_cwd: Option<&str>,
+    tokens: Option<crate::events::TokenUsage>,
+    model: Option<String>,
 ) -> Result<()> {
     // Store full response content (truncated to same limit as prompts)
     let content = if response_text.trim().is_empty() {
@@ -137,6 +142,8 @@ pub fn record_response(
         turn,
         files_written: truncate_file_list(files_written),
         content,
+        tokens,
+        model,
         timestamp,
         repo_id: repo_id.map(String::from),
         cwd: event_cwd.map(String::from),
@@ -144,6 +151,28 @@ pub fn record_response(
 
     write_event(jj_cwd, &event)?;
     Ok(())
+}
+
+/// Record a model-changed event
+pub fn record_model_changed(
+    jj_cwd: &Path,
+    session: &AikiSession,
+    previous_model: Option<&str>,
+    new_model: &str,
+    timestamp: DateTime<Utc>,
+    repo_id: Option<&str>,
+    event_cwd: Option<&str>,
+) -> Result<()> {
+    let event = ConversationEvent::ModelChanged {
+        session_id: session.uuid().to_string(),
+        previous_model: previous_model.map(String::from),
+        new_model: new_model.to_string(),
+        timestamp,
+        repo_id: repo_id.map(String::from),
+        cwd: event_cwd.map(String::from),
+    };
+
+    write_event(jj_cwd, &event)
 }
 
 /// Record an autoreply event (pending injection into next turn)

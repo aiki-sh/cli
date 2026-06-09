@@ -1,11 +1,11 @@
-use crate::provenance::blame;
 use crate::error::{AikiError, Result};
 use crate::provenance;
+use crate::provenance::blame;
 use anyhow::Context;
 use std::env;
 use std::path::PathBuf;
 
-pub fn run(file: PathBuf, agent: Option<String>, verify: bool) -> Result<()> {
+pub fn run(file: PathBuf, agent: Option<String>) -> Result<()> {
     // Get current directory
     let current_dir = env::current_dir().context("Failed to get current directory")?;
 
@@ -44,7 +44,7 @@ pub fn run(file: PathBuf, agent: Option<String>, verify: bool) -> Result<()> {
         .context("Failed to generate blame information")?;
 
     // Format and print output
-    let output = blame_cmd.format_blame(&attributions, agent_filter, verify);
+    let output = blame_cmd.format_blame(&attributions, agent_filter);
     print!("{}", output);
 
     Ok(())

@@ -11,10 +11,7 @@
 ///
 /// Note: Sugar pattern expansion tests (e.g., review.completed -> task.closed)
 /// are covered in the parser module's internal tests (cli/src/flows/parser.rs).
-
-use aiki::events::{
-    AikiEvent, AikiTaskClosedPayload, AikiTaskStartedPayload, TaskEventPayload,
-};
+use aiki::events::{AikiEvent, AikiTaskClosedPayload, AikiTaskStartedPayload, TaskEventPayload};
 use aiki::flows::composer::EventType;
 use aiki::flows::types::{Action, Hook, HookStatement, IfStatement, LogAction};
 use aiki::flows::{AikiState, HookEngine, HookOutcome};
@@ -466,7 +463,10 @@ task.closed:
     let hook: Hook = serde_yaml::from_str(yaml).unwrap();
 
     assert_eq!(hook.name, "Task Handler Flow");
-    assert_eq!(hook.description, Some("Handles task lifecycle events".to_string()));
+    assert_eq!(
+        hook.description,
+        Some("Handles task lifecycle events".to_string())
+    );
     assert_eq!(hook.handlers.task_started.len(), 1);
     assert_eq!(hook.handlers.task_closed.len(), 1);
 }
@@ -594,7 +594,7 @@ fn test_empty_files_array() {
             assignee: None,
             outcome: Some("done".to_string()),
             source: None,
-            files: Some(vec![]), // Empty but present
+            files: Some(vec![]),   // Empty but present
             changes: Some(vec![]), // Empty but present
         },
         cwd: PathBuf::from("/tmp"),
@@ -609,7 +609,15 @@ fn test_empty_files_array() {
 #[test]
 fn test_task_types_variety() {
     // Test various task types serialize correctly
-    let task_types = vec!["feature", "bugfix", "review", "refactor", "docs", "test", "custom_type"];
+    let task_types = vec![
+        "feature",
+        "bugfix",
+        "review",
+        "refactor",
+        "docs",
+        "test",
+        "custom_type",
+    ];
 
     for task_type in task_types {
         let payload = AikiTaskStartedPayload {
@@ -653,10 +661,7 @@ fn test_task_event_in_hook_composer_context() {
 
     // Verify we can set variables (used by hook execution)
     state.set_variable("task_id".to_string(), "abc123".to_string());
-    assert_eq!(
-        state.get_variable("task_id"),
-        Some(&"abc123".to_string())
-    );
+    assert_eq!(state.get_variable("task_id"), Some(&"abc123".to_string()));
 
     // Verify we can clear variables (used by composer for isolation)
     state.clear_variables();

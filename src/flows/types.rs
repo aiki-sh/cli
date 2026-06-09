@@ -108,71 +108,171 @@ where
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EventHandlers {
     // Session Lifecycle Events
-    #[serde(rename = "session.started", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "session.started",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub session_started: Vec<HookStatement>,
-    #[serde(rename = "session.resumed", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "session.resumed",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub session_resumed: Vec<HookStatement>,
-    #[serde(rename = "session.will_compact", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "session.will_compact",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub session_will_compact: Vec<HookStatement>,
-    #[serde(rename = "session.compacted", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "session.compacted",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub session_compacted: Vec<HookStatement>,
-    #[serde(rename = "session.cleared", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "session.cleared",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub session_cleared: Vec<HookStatement>,
-    #[serde(rename = "session.ended", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "session.ended",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub session_ended: Vec<HookStatement>,
 
     // Turn Lifecycle Events
-    #[serde(rename = "turn.started", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "turn.started",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub turn_started: Vec<HookStatement>,
-    #[serde(rename = "turn.completed", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "turn.completed",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub turn_completed: Vec<HookStatement>,
 
     // Read Operation Events
-    #[serde(rename = "read.permission_asked", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "read.permission_asked",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub read_permission_asked: Vec<HookStatement>,
-    #[serde(rename = "read.completed", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "read.completed",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub read_completed: Vec<HookStatement>,
 
     // Change Operation Events
-    #[serde(rename = "change.permission_asked", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "change.permission_asked",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub change_permission_asked: Vec<HookStatement>,
-    #[serde(rename = "change.completed", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "change.completed",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub change_completed: Vec<HookStatement>,
 
     // Shell Command Events
-    #[serde(rename = "shell.permission_asked", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "shell.permission_asked",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub shell_permission_asked: Vec<HookStatement>,
-    #[serde(rename = "shell.completed", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "shell.completed",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub shell_completed: Vec<HookStatement>,
 
     // Web Access Events
-    #[serde(rename = "web.permission_asked", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "web.permission_asked",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub web_permission_asked: Vec<HookStatement>,
-    #[serde(rename = "web.completed", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "web.completed",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub web_completed: Vec<HookStatement>,
 
     // MCP Tool Events
-    #[serde(rename = "mcp.permission_asked", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "mcp.permission_asked",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub mcp_permission_asked: Vec<HookStatement>,
-    #[serde(rename = "mcp.completed", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "mcp.completed",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub mcp_completed: Vec<HookStatement>,
 
     // Commit Integration Events
-    #[serde(rename = "commit.message_started", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "commit.message_started",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub commit_message_started: Vec<HookStatement>,
 
+    // Model Transition Events
+    #[serde(
+        rename = "model.changed",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
+    pub model_changed: Vec<HookStatement>,
+
     // Repo Transition Events
-    #[serde(rename = "repo.changed", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "repo.changed",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub repo_changed: Vec<HookStatement>,
 
     // Task Lifecycle Events
-    #[serde(rename = "task.started", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "task.started",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub task_started: Vec<HookStatement>,
-    #[serde(rename = "task.closed", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "task.closed",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub task_closed: Vec<HookStatement>,
 
     // Legacy
-    #[serde(rename = "Stop", default, deserialize_with = "deserialize_null_as_empty_vec")]
+    #[serde(
+        rename = "Stop",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
     pub stop: Vec<HookStatement>,
 }
 
@@ -351,16 +451,47 @@ pub struct BlockAction {
     pub failure: String,
 }
 
-/// Session end action - terminates the current session gracefully
+/// Session end action - terminates the current session via SIGTERM
 ///
 /// Used for task-driven sessions that should auto-end when their driving task closes.
 /// Sends SIGTERM to the parent process (the agent) after a short delay to allow
-/// the hook to complete.
+/// the hook to complete. Prefer `end_session` for cooperative termination.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEndAction {
     /// Reason for ending (logged)
-    #[serde(rename = "session.end")]
+    #[serde(rename = "sigterm_to_end_session", alias = "session.end")]
     pub reason: String,
+
+    #[serde(default)]
+    pub on_failure: OnFailure,
+}
+
+/// Cooperative session end action — signals the agent to stop via its native
+/// stop hook rather than sending SIGTERM.
+///
+/// Sets a flag that turn.completed translates to Decision::Block. The editor
+/// output builder then emits the agent-specific "stop" response:
+/// - Codex: `{ "continue": false }`
+/// - Claude Code / Cursor: `{}` (already exits cleanly)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoreplyToEndSessionAction {
+    /// Reason for ending (logged)
+    #[serde(rename = "autoreply_to_end_session")]
+    pub reason: String,
+
+    #[serde(default)]
+    pub on_failure: OnFailure,
+}
+
+/// Autoreply with conflict resolution instructions after workspace absorption.
+///
+/// Takes the list of conflicted files and wraps them in a standard conflict
+/// resolution message with JJ conflict marker documentation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoreplyToFixConflictsAction {
+    /// Conflicted file list (from workspace_absorb_all)
+    #[serde(rename = "autoreply_to_fix_conflicts")]
+    pub conflicted_files: String,
 
     #[serde(default)]
     pub on_failure: OnFailure,
@@ -396,8 +527,12 @@ pub enum Action {
     Stop(StopAction),
     /// Block editor operation (emits error and blocks with exit 2)
     Block(BlockAction),
-    /// End the current session gracefully (for task-driven sessions)
+    /// End the current session via SIGTERM (forceful)
     SessionEnd(SessionEndAction),
+    /// End the current session cooperatively via the agent's stop hook
+    AutoreplyToEndSession(AutoreplyToEndSessionAction),
+    /// Autoreply with conflict resolution instructions
+    AutoreplyToFixConflicts(AutoreplyToFixConflictsAction),
 }
 
 /// Shell command action
@@ -616,7 +751,7 @@ pub struct ReviewConfig {
     #[serde(default)]
     pub agent: Option<String>,
 
-    /// Optional template override (default: aiki/review)
+    /// Optional template override (default: review)
     #[serde(default)]
     pub template: Option<String>,
 }

@@ -28,10 +28,12 @@ pub fn get_version(
 
     // Log failures in debug mode
     if result.is_none() {
-        debug_log(|| format!(
-            "Could not detect version for package '{}' - falling back to None",
-            package_name
-        ));
+        debug_log(|| {
+            format!(
+                "Could not detect version for package '{}' - falling back to None",
+                package_name
+            )
+        });
     }
 
     result
@@ -310,10 +312,7 @@ fn read_version_from_package_json(path: &PathBuf) -> Option<String> {
 }
 
 fn resolve_via_which(binary_name: &str) -> Option<String> {
-    debug_log(|| format!(
-        "Falling back to binary resolution for '{}'",
-        binary_name
-    ));
+    debug_log(|| format!("Falling back to binary resolution for '{}'", binary_name));
 
     // Use the `which` crate (already in dependencies) for cross-platform resolution
     // Handles PATH search, PATHEXT on Windows, symlinks, and permissions

@@ -12,6 +12,9 @@ pub struct AikiSessionEndedPayload {
     /// Reason for session termination (e.g., "clear", "logout", "user_close", "ttl_expired")
     #[serde(default)]
     pub reason: String,
+    /// Cumulative token usage for the entire session
+    #[serde(default)]
+    pub tokens: Option<super::TokenUsage>,
 }
 
 /// Handle session.ended event
@@ -22,6 +25,12 @@ pub fn handle_session_ended(payload: AikiSessionEndedPayload) -> Result<HookResu
     use super::prelude::execute_hook;
 
     debug_log(|| format!("Session ended by {:?}", payload.session.agent_type()));
+
+    // Aggregate token usage from all turns in this session
+    let mut payload = payload;
+    if payload.tokens.is_none() {
+        payload.tokens = aggregate_session_tokens(&payload);
+    }
 
     // Record session end to conversation history (non-blocking on failure)
     // Uses global JJ repo at ~/.aiki/.jj/ for cross-repo conversation history
@@ -73,5 +82,39 @@ pub fn handle_session_ended(payload: AikiSessionEndedPayload) -> Result<HookResu
             decision: Decision::Block,
             failures,
         }),
+    }
+}
+
+/// Aggregate token usage from all Response events for a session.
+///
+/// Returns `None` if no turns had token data (rather than returning zeros),
+/// per the acceptance criteria.
+fn aggregate_session_tokens(payload: &AikiSessionEndedPayload) -> Option<super::TokenUsage> {
+    let session_id = payload.session.uuid();
+    let events = match history::storage::read_events(&global::global_aiki_dir()) {
+        Ok(events) => events,
+        Err(e) => {
+            debug_log(|| format!("Failed to read events for token aggregation: {}", e));
+            return None;
+        }
+    };
+
+    let turn_tokens: Vec<super::TokenUsage> = events
+        .into_iter()
+        .filter_map(|event| match event {
+            history::types::ConversationEvent::Response {
+                session_id: sid,
+                tokens: Some(t),
+                ..
+            } if sid == session_id => Some(t),
+            _ => None,
+        })
+        .collect();
+
+    if turn_tokens.is_empty() {
+        None
+    } else {
+        let total: super::TokenUsage = turn_tokens.into_iter().sum();
+        Some(total)
     }
 }

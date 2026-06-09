@@ -70,7 +70,10 @@ pub fn is_sugar_pattern(trigger: &str) -> bool {
 /// Returns None if not a sugar pattern.
 /// Returns Some((base_event, wrapped_value)) where wrapped_value is the statements
 /// wrapped in an if condition.
-pub fn expand_sugar_value(trigger: &str, statements: Value) -> Result<Option<(&'static str, Value)>> {
+pub fn expand_sugar_value(
+    trigger: &str,
+    statements: Value,
+) -> Result<Option<(&'static str, Value)>> {
     // Check for {type}.started pattern
     if let Some(task_type) = trigger.strip_suffix(".started") {
         if is_sugar_pattern(trigger) {
@@ -137,9 +140,7 @@ pub fn expand_sugar_patterns(map: &mut Mapping) -> Result<()> {
             let base_key = Value::String(base_event.to_string());
 
             // Get or create the base event's statement list
-            let existing = map
-                .entry(base_key)
-                .or_insert(Value::Sequence(vec![]));
+            let existing = map.entry(base_key).or_insert(Value::Sequence(vec![]));
 
             if let (Value::Sequence(ref mut seq), Value::Sequence(wrapped_seq)) =
                 (existing, wrapped)
@@ -302,9 +303,7 @@ task.started:
             assert!(!map.contains_key(&Value::String("review.completed".to_string())));
 
             // task.started should have both existing and expanded statements
-            let task_started = map
-                .get(&Value::String("task.started".to_string()))
-                .unwrap();
+            let task_started = map.get(&Value::String("task.started".to_string())).unwrap();
             if let Value::Sequence(seq) = task_started {
                 // Original + expanded
                 assert_eq!(seq.len(), 2);

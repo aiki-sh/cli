@@ -71,7 +71,7 @@
 //!
 //! ```bash
 //! # Create task from template
-//! aiki task create --template aiki/review --data scope="@"
+//! aiki task create --template review --data scope="@"
 //!
 //! # Create and start in one command
 //! aiki task start --template myorg/refactor --data scope="src/auth.rs"
@@ -80,27 +80,46 @@
 //! aiki task template list
 //! ```
 
+pub mod builtin;
 pub mod conditionals;
+pub mod manifest;
 pub mod parser;
 pub mod resolver;
 pub mod spawn_config;
+pub mod sync;
 pub mod types;
 pub mod variables;
 
-pub use conditionals::{
-    process_conditionals, tokenize as tokenize_conditionals, ConditionalError, EvalContext,
-    LoopItem, TemplateNode, Token,
-};
-pub use parser::{extract_yaml_frontmatter, parse_template, FrontmatterError};
+/// Directory name under `.aiki/` for user-defined task templates (runtime discovery).
+///
+/// Used to construct paths like `{repo_root}/.aiki/{TASKS_DIR_NAME}/`.
+pub const TASKS_DIR_NAME: &str = "tasks";
+
+/// Relative path from repo root to the built-in template source directory.
+///
+/// The `include_dir!` macro in `builtin.rs` must use a matching string literal
+/// (macros cannot reference constants).
+#[allow(dead_code)]
+pub const BUILTIN_TEMPLATES_SOURCE: &str = "cli/src/tasks/templates/core";
+
+#[allow(unused_imports)]
+pub use builtin::default_plugin_templates;
+#[allow(unused_imports)]
 pub use resolver::{
-    convert_data, create_review_task_from_template, create_subtask_entries,
-    create_subtask_entries_from_template, create_subtasks_from_inline_loops,
-    create_tasks_from_template, expand_loops, find_templates_dir, get_working_copy_change_id,
-    has_inline_loops, has_subtask_refs, list_templates, load_template, load_template_file,
-    parse_priority, substitute_parent_id, SubtaskEntry, TemplateInfo, PARENT_ID_PLACEHOLDER,
+    convert_data, create_review_task_from_template, create_subtask_entries_from_template,
+    create_tasks_from_template, find_templates_dir, has_inline_loops, has_subtask_refs,
+    list_templates, load_template, load_template_quiet, normalize_template_ref, parse_priority,
+    substitute_parent_id, SubtaskEntry, PARENT_ID_PLACEHOLDER,
 };
-pub use types::{TaskDefaults, TaskDefinition, TaskTemplate, TemplateFrontmatter};
+pub use types::TaskTemplate;
 pub use variables::{
-    coerce_to_string, coerce_value, find_variables, substitute, substitute_with_template_name,
-    VariableContext,
+    coerce_to_string, find_variables, substitute_with_template_name, VariableContext,
 };
+
+/// Helper: construct the user tasks directory path relative to a repo root.
+///
+/// Returns `{repo_root}/.aiki/{TASKS_DIR_NAME}`.
+#[allow(dead_code)]
+pub fn user_tasks_dir(repo_root: &std::path::Path) -> std::path::PathBuf {
+    repo_root.join(".aiki").join(TASKS_DIR_NAME)
+}

@@ -50,6 +50,60 @@ impl Turn {
 }
 
 // ============================================================================
+// Token Usage
+// ============================================================================
+
+/// Token usage counters for a turn or session
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_created: u64,
+}
+
+#[allow(dead_code)]
+impl TokenUsage {
+    pub fn total(&self) -> u64 {
+        self.input + self.output
+    }
+
+    /// Returns true if all fields are zero
+    pub fn is_zero(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_created == 0
+    }
+}
+
+impl std::ops::Add for TokenUsage {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            input: self.input + rhs.input,
+            output: self.output + rhs.output,
+            cache_read: self.cache_read + rhs.cache_read,
+            cache_created: self.cache_created + rhs.cache_created,
+        }
+    }
+}
+
+impl std::ops::AddAssign for TokenUsage {
+    fn add_assign(&mut self, rhs: Self) {
+        self.input += rhs.input;
+        self.output += rhs.output;
+        self.cache_read += rhs.cache_read;
+        self.cache_created += rhs.cache_created;
+    }
+}
+
+impl std::iter::Sum for TokenUsage {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |a, b| a + b)
+    }
+}
+
+// ============================================================================
 // Main Event Enum
 // ============================================================================
 
@@ -157,6 +211,13 @@ pub enum AikiEvent {
     CommitMessageStarted(AikiCommitMessageStartedPayload),
 
     // ========================================================================
+    // Model Transition Events
+    // ========================================================================
+    /// Model changed mid-session (e.g., /model command)
+    #[serde(rename = "model.changed")]
+    ModelChanged(AikiModelChangedPayload),
+
+    // ========================================================================
     // Repo Transition Events
     // ========================================================================
     /// Session moved to a different JJ repo
@@ -213,6 +274,8 @@ impl AikiEvent {
             Self::McpCompleted(e) => &e.cwd,
             // Commit integration
             Self::CommitMessageStarted(e) => &e.cwd,
+            // Model transitions
+            Self::ModelChanged(e) => &e.cwd,
             // Repo transitions
             Self::RepoChanged(e) => &e.cwd,
             // Task lifecycle
@@ -254,6 +317,8 @@ impl AikiEvent {
             Self::McpCompleted(e) => e.session.agent_type(),
             // Commit integration
             Self::CommitMessageStarted(e) => e.agent_type,
+            // Model transitions
+            Self::ModelChanged(e) => e.session.agent_type(),
             // Repo transitions
             Self::RepoChanged(e) => e.session.agent_type(),
             // Task lifecycle (tasks don't have a session, so use Unknown)
@@ -289,6 +354,9 @@ mod read_permission_asked;
 mod change_completed;
 mod change_permission_asked;
 mod prelude;
+
+// Model transitions
+mod model_changed;
 
 // Repo transitions
 mod repo_changed;
@@ -335,6 +403,9 @@ pub use read_permission_asked::*;
 // Change operations (unified mutations: write, delete, move)
 pub use change_completed::*;
 pub use change_permission_asked::*;
+
+// Model transitions
+pub use model_changed::*;
 
 // Repo transitions
 pub use repo_changed::*;
@@ -484,6 +555,12 @@ impl From<AikiMcpCompletedPayload> for AikiEvent {
     }
 }
 
+impl From<AikiModelChangedPayload> for AikiEvent {
+    fn from(payload: AikiModelChangedPayload) -> Self {
+        AikiEvent::ModelChanged(payload)
+    }
+}
+
 impl From<AikiRepoChangedPayload> for AikiEvent {
     fn from(payload: AikiRepoChangedPayload) -> Self {
         AikiEvent::RepoChanged(payload)
@@ -499,5 +576,114 @@ impl From<AikiTaskStartedPayload> for AikiEvent {
 impl From<AikiTaskClosedPayload> for AikiEvent {
     fn from(payload: AikiTaskClosedPayload) -> Self {
         AikiEvent::TaskClosed(payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenUsage;
+
+    #[test]
+    fn test_token_usage_add() {
+        let a = TokenUsage {
+            input: 100,
+            output: 50,
+            cache_read: 200,
+            cache_created: 10,
+        };
+        let b = TokenUsage {
+            input: 150,
+            output: 75,
+            cache_read: 300,
+            cache_created: 20,
+        };
+        let result = a + b;
+        assert_eq!(result.input, 250);
+        assert_eq!(result.output, 125);
+        assert_eq!(result.cache_read, 500);
+        assert_eq!(result.cache_created, 30);
+    }
+
+    #[test]
+    fn test_token_usage_add_assign() {
+        let mut a = TokenUsage {
+            input: 100,
+            output: 50,
+            cache_read: 200,
+            cache_created: 10,
+        };
+        let b = TokenUsage {
+            input: 150,
+            output: 75,
+            cache_read: 300,
+            cache_created: 20,
+        };
+        a += b;
+        assert_eq!(a.input, 250);
+        assert_eq!(a.output, 125);
+        assert_eq!(a.cache_read, 500);
+        assert_eq!(a.cache_created, 30);
+    }
+
+    #[test]
+    fn test_token_usage_sum() {
+        let usages = vec![
+            TokenUsage {
+                input: 100,
+                output: 50,
+                cache_read: 0,
+                cache_created: 0,
+            },
+            TokenUsage {
+                input: 200,
+                output: 100,
+                cache_read: 50,
+                cache_created: 10,
+            },
+            TokenUsage {
+                input: 300,
+                output: 150,
+                cache_read: 100,
+                cache_created: 20,
+            },
+        ];
+        let total: TokenUsage = usages.into_iter().sum();
+        assert_eq!(total.input, 600);
+        assert_eq!(total.output, 300);
+        assert_eq!(total.cache_read, 150);
+        assert_eq!(total.cache_created, 30);
+    }
+
+    #[test]
+    fn test_token_usage_sum_empty() {
+        let usages: Vec<TokenUsage> = vec![];
+        let total: TokenUsage = usages.into_iter().sum();
+        assert_eq!(total.input, 0);
+        assert_eq!(total.output, 0);
+        assert_eq!(total.cache_read, 0);
+        assert_eq!(total.cache_created, 0);
+    }
+
+    #[test]
+    fn test_token_usage_is_zero() {
+        assert!(TokenUsage::default().is_zero());
+        assert!(!TokenUsage {
+            input: 1,
+            output: 0,
+            cache_read: 0,
+            cache_created: 0,
+        }
+        .is_zero());
+    }
+
+    #[test]
+    fn test_token_usage_total() {
+        let usage = TokenUsage {
+            input: 100,
+            output: 50,
+            cache_read: 200,
+            cache_created: 10,
+        };
+        assert_eq!(usage.total(), 150); // Only input + output
     }
 }

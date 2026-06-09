@@ -8,6 +8,14 @@
 
 use std::path::PathBuf;
 
+/// Process-wide mutex for tests that modify the `AIKI_HOME` env var.
+///
+/// Every test module that touches `AIKI_HOME` **must** lock this mutex
+/// to avoid races with tests in other modules (Rust runs tests in the
+/// same process in parallel by default).
+#[cfg(test)]
+pub static AIKI_HOME_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Environment variable to override the global aiki directory
 pub const AIKI_HOME_ENV: &str = "AIKI_HOME";
 
@@ -54,10 +62,6 @@ pub fn global_jj_dir() -> PathBuf {
 mod tests {
     use super::*;
     use std::env;
-    use std::sync::Mutex;
-
-    // Mutex to serialize tests that modify AIKI_HOME env var
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// Helper to run tests with a temporary AIKI_HOME value
     /// Serializes access to prevent parallel test interference
@@ -66,7 +70,9 @@ mod tests {
         F: FnOnce() -> R,
     {
         // Handle potentially poisoned mutex (from panic tests)
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = super::AIKI_HOME_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Save original value
         let original = env::var(AIKI_HOME_ENV).ok();

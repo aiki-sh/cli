@@ -13,13 +13,6 @@ pub enum Decision {
 }
 
 impl Decision {
-    /// Check if this decision allows the operation to continue
-    #[must_use]
-    #[allow(dead_code)] // Part of Decision API
-    pub fn is_continue(&self) -> bool {
-        matches!(self, Decision::Allow)
-    }
-
     /// Check if this decision is to block the operation
     #[must_use]
     pub fn is_block(&self) -> bool {
@@ -51,16 +44,6 @@ impl HookResult {
     }
 
     #[must_use]
-    #[allow(dead_code)] // Part of HookResult API
-    pub fn success_with_context(context: impl Into<String>) -> Self {
-        Self {
-            context: Some(context.into()),
-            decision: Decision::Allow,
-            failures: Vec::new(),
-        }
-    }
-
-    #[must_use]
     pub fn failure(user_msg: impl Into<String>) -> Self {
         Self {
             context: None,
@@ -69,41 +52,10 @@ impl HookResult {
         }
     }
 
-    #[must_use]
-    #[allow(dead_code)] // Part of HookResult API
-    pub fn blocking_failure(user_msg: impl Into<String>) -> Self {
-        Self {
-            context: None,
-            decision: Decision::Block,
-            failures: vec![Failure(user_msg.into())],
-        }
-    }
-
-    #[must_use]
-    #[allow(dead_code)] // Part of HookResult API
-    pub fn with_context(mut self, context: impl Into<String>) -> Self {
-        self.context = Some(context.into());
-        self
-    }
-
-    #[must_use]
-    #[allow(dead_code)] // Part of HookResult API
-    pub fn with_failure(mut self, msg: impl Into<String>) -> Self {
-        self.failures.push(Failure(msg.into()));
-        self
-    }
-
     /// Check if this response should block the operation
     #[must_use]
     pub fn is_blocking(&self) -> bool {
         self.decision.is_block()
-    }
-
-    /// Check if this response is successful (no blocking and no failures)
-    #[must_use]
-    #[allow(dead_code)] // Part of HookResult API
-    pub fn is_success(&self) -> bool {
-        self.decision.is_continue() && self.failures.is_empty()
     }
 
     /// Format failure messages with emoji prefixes
@@ -151,10 +103,10 @@ impl HookResult {
     /// # Examples
     /// ```
     /// # use aiki::events::result::HookResult;
-    /// let resp1 = HookResult::success_with_context("autoreply text");
+    /// let resp1 = HookResult { context: Some("autoreply text".into()), ..HookResult::success() };
     /// assert!(resp1.has_context());
     ///
-    /// let resp2 = HookResult::success_with_context("");
+    /// let resp2 = HookResult { context: Some("".into()), ..HookResult::success() };
     /// assert!(!resp2.has_context());
     ///
     /// let resp3 = HookResult::success();

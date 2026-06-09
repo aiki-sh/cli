@@ -3,8 +3,8 @@ use crate::error::Result;
 
 use crate::events::result::HookResult;
 use crate::events::{
-    self, AikiChangeCompletedPayload, AikiChangePermissionAskedPayload, AikiEvent,
-    ChangeOperation, DeleteOperation, MoveOperation,
+    self, AikiChangeCompletedPayload, AikiChangePermissionAskedPayload, AikiEvent, ChangeOperation,
+    DeleteOperation, MoveOperation,
 };
 use crate::tools::{parse_file_operation_from_shell_command, FileOperation};
 
@@ -49,6 +49,8 @@ pub fn dispatch(event: AikiEvent) -> Result<HookResult> {
             AikiEvent::McpCompleted(_) => "mcp.completed",
             // Git integration
             AikiEvent::CommitMessageStarted(_) => "commit.message_started",
+            // Model transitions
+            AikiEvent::ModelChanged(_) => "model.changed",
             // Repo transitions
             AikiEvent::RepoChanged(_) => "repo.changed",
             // Task lifecycle
@@ -133,6 +135,9 @@ pub fn dispatch(event: AikiEvent) -> Result<HookResult> {
         // Git integration
         AikiEvent::CommitMessageStarted(e) => events::handle_commit_message_started(e),
 
+        // Model transitions
+        AikiEvent::ModelChanged(e) => events::handle_model_changed(e),
+
         // Repo transitions
         AikiEvent::RepoChanged(e) => events::handle_repo_changed(e),
 
@@ -187,30 +192,22 @@ fn transform_shell_delete_to_change_completed(
     command_args: Vec<String>,
 ) -> AikiChangeCompletedPayload {
     // Try to get actual deleted paths from JJ, filtered by command arguments
-    let deleted_paths =
-        match crate::jj::diff::get_deleted_paths(&shell_event.cwd, &command_args) {
-            Ok(paths) if !paths.is_empty() => {
-                debug_log(|| format!("Using JJ-detected deleted paths: {:?}", paths));
-                paths
-            }
-            Ok(_) => {
-                // No deletions detected by JJ (or filtered out) - fall back to syntactic
-                debug_log(|| {
-                    "JJ detected no matching deletions, falling back to syntactic detection"
-                });
-                command_args
-            }
-            Err(e) => {
-                // JJ not available or error - fall back to syntactic detection
-                debug_log(|| {
-                    format!(
-                        "JJ error ({}), falling back to syntactic detection",
-                        e
-                    )
-                });
-                command_args
-            }
-        };
+    let deleted_paths = match crate::jj::diff::get_deleted_paths(&shell_event.cwd, &command_args) {
+        Ok(paths) if !paths.is_empty() => {
+            debug_log(|| format!("Using JJ-detected deleted paths: {:?}", paths));
+            paths
+        }
+        Ok(_) => {
+            // No deletions detected by JJ (or filtered out) - fall back to syntactic
+            debug_log(|| "JJ detected no matching deletions, falling back to syntactic detection");
+            command_args
+        }
+        Err(e) => {
+            // JJ not available or error - fall back to syntactic detection
+            debug_log(|| format!("JJ error ({}), falling back to syntactic detection", e));
+            command_args
+        }
+    };
 
     debug_log(|| {
         format!(
