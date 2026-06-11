@@ -11,6 +11,7 @@ mod events;
 mod expressions;
 mod flows;
 mod global;
+mod harnesses;
 mod history;
 mod instructions;
 mod jj;

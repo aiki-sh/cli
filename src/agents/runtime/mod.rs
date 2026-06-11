@@ -4,9 +4,11 @@
 //! agent sessions and the result types for tracking session outcomes.
 
 mod claude_code;
+mod cli;
 mod codex;
 
 pub use claude_code::ClaudeCodeRuntime;
+pub use cli::CliAgentRuntime;
 pub use codex::CodexRuntime;
 
 use crate::error::Result;

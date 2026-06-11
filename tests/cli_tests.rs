@@ -233,3 +233,16 @@ fn test_init_with_existing_jj() {
     let hooks_path = String::from_utf8_lossy(&output.stdout);
     assert!(hooks_path.contains(".aiki/githooks"));
 }
+
+#[test]
+fn harness_registry_links_in_integration_context() {
+    // Smoke check for the inventory link-section: the registry must be
+    // populated when the lib is linked as an external crate, not just in
+    // unit-test binaries.
+    let all = aiki::harnesses::all_sorted();
+    assert!(
+        all.len() >= 4,
+        "expected at least 4 built-in harnesses, got {}",
+        all.len()
+    );
+}

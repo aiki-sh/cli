@@ -39,6 +39,7 @@ atty = "0.2"
 shell-words = "1.1"
 agent-client-protocol = "0.7"
 which = "6.0"
+inventory = "0.3"
 uuid = { version = "1.0", features = ["v5"] }
 sha2 = "0.10"
 hex = "0.4"

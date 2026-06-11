@@ -12,6 +12,7 @@ pub mod events;
 pub mod expressions;
 pub mod flows;
 pub mod global;
+pub mod harnesses;
 pub mod history;
 pub mod instructions;
 pub mod jj;
