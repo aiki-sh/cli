@@ -43,7 +43,7 @@ fn test_record_session_start_includes_thread() {
     )
     .with_thread(Some(thread));
 
-    record_session_start(cwd, &session, Utc::now(), None, None).unwrap();
+    record_session_start(cwd, &session, Utc::now(), None, None, None).unwrap();
 
     let events = read_events(cwd).unwrap();
     assert_eq!(events.len(), 1);
@@ -81,7 +81,7 @@ fn test_record_session_start_no_thread() {
     );
     // No .with_thread() — thread is None
 
-    record_session_start(cwd, &session, Utc::now(), None, None).unwrap();
+    record_session_start(cwd, &session, Utc::now(), None, None, None).unwrap();
 
     let events = read_events(cwd).unwrap();
     assert_eq!(events.len(), 1);

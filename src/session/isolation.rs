@@ -1177,6 +1177,44 @@ mod tests {
             .expect("jj describe failed");
     }
 
+    /// Helper: create a JJ repo in a temp dir, make an initial commit,
+    /// and set up AIKI_WORKSPACES_DIR. Returns (repo_root, workspaces_dir).
+    fn setup_jj_repo() -> (tempfile::TempDir, tempfile::TempDir) {
+        use std::process::Command;
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let ws_dir = tempfile::tempdir().unwrap();
+
+        let output = Command::new("jj")
+            .args(["git", "init", "--colocate"])
+            .current_dir(repo_dir.path())
+            .output()
+            .expect("jj git init failed");
+        assert!(
+            output.status.success(),
+            "jj git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        fs::write(repo_dir.path().join("init.txt"), "initial").unwrap();
+        Command::new("jj")
+            .args(["describe", "-m", "initial content"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+        Command::new("jj")
+            .args(["new"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+
+        let aiki_dir = repo_dir.path().join(".aiki");
+        fs::create_dir_all(&aiki_dir).unwrap();
+        fs::write(aiki_dir.join("repo-id"), "testrepo\n").unwrap();
+
+        (repo_dir, ws_dir)
+    }
+
     /// Regression test for fix-absorbtion-on-multiple-runs.md:
     /// Two sequential absorptions into default@ must both survive on disk.
     #[test]
