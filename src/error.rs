@@ -342,6 +342,13 @@ Alternatively, install the agent globally:
         missing: Vec<(String, String)>, // Vec of (task_id, title)
     },
 
+    // Harness runtime errors
+    #[error("Harness '{id}' is not a CLI harness")]
+    HarnessNotCli { id: String },
+
+    #[error("CLI binary not found: {binary}")]
+    CliBinaryNotFound { binary: String },
+
     // Generic wrapper for underlying errors
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -440,6 +447,22 @@ mod tests {
         assert!(result.contains("top.yml"));
         assert!(result.contains("→ middle.yml"));
         assert!(result.contains("→ bottom.yml"));
+    }
+
+    #[test]
+    fn test_harness_not_cli_display() {
+        let err = AikiError::HarnessNotCli {
+            id: "gemini".to_string(),
+        };
+        assert_eq!(err.to_string(), "Harness 'gemini' is not a CLI harness");
+    }
+
+    #[test]
+    fn test_cli_binary_not_found_display() {
+        let err = AikiError::CliBinaryNotFound {
+            binary: "codex".to_string(),
+        };
+        assert_eq!(err.to_string(), "CLI binary not found: codex");
     }
 
     #[test]
