@@ -3,13 +3,9 @@
 //! This module provides the `AgentRuntime` trait that defines how to spawn
 //! agent sessions and the result types for tracking session outcomes.
 
-mod claude_code;
 mod cli;
-mod codex;
 
-pub use claude_code::ClaudeCodeRuntime;
 pub use cli::CliAgentRuntime;
-pub use codex::CodexRuntime;
 
 use crate::error::Result;
 use crate::tasks::lanes::ThreadId;
@@ -252,7 +248,7 @@ pub trait AgentRuntime {
 
 /// Build the common environment variables for spawning an agent.
 ///
-/// Both `ClaudeCodeRuntime` and `CodexRuntime` call this to ensure consistent
+/// `CliAgentRuntime` calls this for every spawn to ensure consistent
 /// env-var setup (`AIKI_THREAD`, `AIKI_SESSION_MODE`, and optionally
 /// `AIKI_PARENT_SESSION_UUID`).
 pub(crate) fn build_spawn_env(options: &AgentSpawnOptions, mode: &str) -> Vec<(String, String)> {
@@ -556,52 +552,4 @@ mod tests {
         );
     }
 
-    /// Structural invariant: every spawn method that sets AIKI_THREAD must also
-    /// set AIKI_SESSION_MODE. The one exception is plan.rs which spawns a truly
-    /// interactive user session (mode defaults to "interactive" intentionally).
-    ///
-    /// Regression guard for: spawn_blocking missing AIKI_SESSION_MODE caused
-    /// task.closed hook to SIGTERM background agents (exit code 143).
-    #[test]
-    fn test_all_spawn_methods_set_session_mode() {
-        let runtime_dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agents/runtime");
-
-        for filename in &["claude_code.rs", "codex.rs"] {
-            let path = runtime_dir.join(filename);
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("Failed to read {}: {}", filename, e));
-
-            // Split source into methods by finding `fn spawn_` boundaries
-            let method_starts: Vec<usize> = source
-                .match_indices("fn spawn_")
-                .map(|(idx, _)| idx)
-                .collect();
-
-            for (i, &start) in method_starts.iter().enumerate() {
-                let end = method_starts.get(i + 1).copied().unwrap_or(source.len());
-                let method_body = &source[start..end];
-
-                // Extract method name for error messages
-                let method_name: String = method_body
-                    .chars()
-                    .skip("fn ".len())
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-
-                let has_thread = method_body.contains("AIKI_THREAD");
-                let has_mode = method_body.contains("AIKI_SESSION_MODE");
-
-                if has_thread {
-                    assert!(
-                        has_mode,
-                        "{filename}::{method_name} sets AIKI_THREAD but not AIKI_SESSION_MODE. \
-                         Every spawn method that sets AIKI_THREAD must also set \
-                         AIKI_SESSION_MODE to prevent the task.closed hook from \
-                         treating background agents as interactive sessions."
-                    );
-                }
-            }
-        }
-    }
 }
