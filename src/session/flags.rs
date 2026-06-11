@@ -289,32 +289,33 @@ impl TaskAgentFlags {
 /// optional `AgentType`.
 ///
 /// Parses the `--agent` string (if present) via `AgentType::from_str`, otherwise
-/// maps the first `true` shorthand flag to its variant.  Returns `None` when
-/// neither source provides a valid agent.
-#[must_use]
+/// maps the first `true` shorthand flag to its variant.  Returns `Ok(None)` when
+/// neither source provides an agent, and `Err(UnknownAgentType)` when an
+/// explicitly passed `--agent` value does not parse — silently falling back to
+/// auto-detection would hide the typo from the user.
 pub fn resolve_agent_shorthand(
     agent: Option<String>,
     claude: bool,
     codex: bool,
     cursor: bool,
     gemini: bool,
-) -> Option<AgentType> {
-    agent
-        .as_deref()
-        .and_then(AgentType::from_str)
-        .or_else(|| {
-            if claude {
-                Some(AgentType::ClaudeCode)
-            } else if codex {
-                Some(AgentType::Codex)
-            } else if cursor {
-                Some(AgentType::Cursor)
-            } else if gemini {
-                Some(AgentType::Gemini)
-            } else {
-                None
-            }
-        })
+) -> crate::error::Result<Option<AgentType>> {
+    if let Some(name) = agent.as_deref() {
+        return AgentType::from_str(name)
+            .map(Some)
+            .ok_or_else(|| crate::error::AikiError::UnknownAgentType(name.to_string()));
+    }
+    Ok(if claude {
+        Some(AgentType::ClaudeCode)
+    } else if codex {
+        Some(AgentType::Codex)
+    } else if cursor {
+        Some(AgentType::Cursor)
+    } else if gemini {
+        Some(AgentType::Gemini)
+    } else {
+        None
+    })
 }
 
 /// Collapse per-agent shorthand flags (each carrying an event value) and
@@ -425,25 +426,25 @@ mod tests {
     #[test]
     fn resolve_shorthand_agent_takes_precedence() {
         let result = resolve_agent_shorthand(Some("gemini".into()), true, false, false, false);
-        assert_eq!(result, Some(AgentType::Gemini));
+        assert_eq!(result.unwrap(), Some(AgentType::Gemini));
     }
 
     #[test]
     fn resolve_shorthand_bool_fallback() {
         assert_eq!(
-            resolve_agent_shorthand(None, true, false, false, false),
+            resolve_agent_shorthand(None, true, false, false, false).unwrap(),
             Some(AgentType::ClaudeCode)
         );
         assert_eq!(
-            resolve_agent_shorthand(None, false, true, false, false),
+            resolve_agent_shorthand(None, false, true, false, false).unwrap(),
             Some(AgentType::Codex)
         );
         assert_eq!(
-            resolve_agent_shorthand(None, false, false, true, false),
+            resolve_agent_shorthand(None, false, false, true, false).unwrap(),
             Some(AgentType::Cursor)
         );
         assert_eq!(
-            resolve_agent_shorthand(None, false, false, false, true),
+            resolve_agent_shorthand(None, false, false, false, true).unwrap(),
             Some(AgentType::Gemini)
         );
     }
@@ -451,9 +452,18 @@ mod tests {
     #[test]
     fn resolve_shorthand_none() {
         assert_eq!(
-            resolve_agent_shorthand(None, false, false, false, false),
+            resolve_agent_shorthand(None, false, false, false, false).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn resolve_shorthand_rejects_unknown_agent() {
+        let result = resolve_agent_shorthand(Some("invalid-agent".into()), false, false, false, false);
+        assert!(matches!(
+            result,
+            Err(crate::error::AikiError::UnknownAgentType(ref name)) if name == "invalid-agent"
+        ));
     }
 
     #[test]
@@ -743,7 +753,7 @@ mod tests {
     #[test]
     fn resolve_shorthand_cursor() {
         assert_eq!(
-            resolve_agent_shorthand(None, false, false, true, false),
+            resolve_agent_shorthand(None, false, false, true, false).unwrap(),
             Some(AgentType::Cursor)
         );
     }
@@ -751,7 +761,7 @@ mod tests {
     #[test]
     fn resolve_shorthand_gemini() {
         assert_eq!(
-            resolve_agent_shorthand(None, false, false, false, true),
+            resolve_agent_shorthand(None, false, false, false, true).unwrap(),
             Some(AgentType::Gemini)
         );
     }

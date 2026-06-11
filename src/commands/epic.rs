@@ -95,7 +95,7 @@ pub fn run(command: EpicCommands) -> Result<()> {
             output,
         } => {
             use crate::session::flags::resolve_agent_shorthand;
-            let agent = resolve_agent_shorthand(agent, claude, codex, cursor, gemini);
+            let agent = resolve_agent_shorthand(agent, claude, codex, cursor, gemini)?;
             run_add(&cwd, &plan_path, restart, template, agent, output)
         }
         EpicCommands::Show { arg, output } => run_show(&cwd, &arg, output),

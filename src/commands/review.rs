@@ -180,7 +180,7 @@ impl crate::workflow::HasRunKind for ReviewArgs {
 /// Run the review command
 pub fn run(mut args: ReviewArgs) -> Result<()> {
     use crate::session::flags::resolve_agent_shorthand;
-    args.agent = resolve_agent_shorthand(args.agent, args.claude, args.codex, args.cursor, args.gemini)
+    args.agent = resolve_agent_shorthand(args.agent, args.claude, args.codex, args.cursor, args.gemini)?
         .map(|a| a.as_str().to_string());
 
     let cwd = env::current_dir()

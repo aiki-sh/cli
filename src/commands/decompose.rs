@@ -48,7 +48,7 @@ pub struct DecomposeArgs {
 /// CLI entry point for `aiki decompose`.
 pub fn run(args: DecomposeArgs) -> Result<()> {
     use crate::session::flags::resolve_agent_shorthand;
-    let agent_type = resolve_agent_shorthand(args.agent, args.claude, args.codex, args.cursor, args.gemini);
+    let agent_type = resolve_agent_shorthand(args.agent, args.claude, args.codex, args.cursor, args.gemini)?;
 
     let cwd = env::current_dir()
         .map_err(|_| AikiError::InvalidArgument("Failed to get current directory".to_string()))?;

@@ -86,7 +86,7 @@ impl crate::workflow::HasRunKind for FixArgs {
 /// Run the fix command — parse args and delegate to workflow.
 pub fn run(mut args: FixArgs) -> Result<()> {
     use crate::session::flags::resolve_agent_shorthand;
-    args.agent = resolve_agent_shorthand(args.agent, args.claude, args.codex, args.cursor, args.gemini)
+    args.agent = resolve_agent_shorthand(args.agent, args.claude, args.codex, args.cursor, args.gemini)?
         .map(|a| a.as_str().to_string());
 
     let cwd = env::current_dir()

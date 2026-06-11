@@ -1211,6 +1211,7 @@ pub fn run(command: Option<TaskCommands>) -> Result<()> {
             resolve_subtask_of_alias(subtask_of, parent)?,
             slug,
             resolve_agent_shorthand(assignee.clone(), claude, codex, cursor, gemini)
+                .unwrap_or(None)
                 .map(|a| a.as_str().to_string())
                 .or(assignee),
             resolve_sourced_from_alias(sourced_from, source)?,
@@ -1283,6 +1284,7 @@ pub fn run(command: Option<TaskCommands>) -> Result<()> {
             supersedes,
             resolve_subtask_of_alias(subtask_of, parent)?,
             resolve_agent_shorthand(assignee.clone(), claude, codex, cursor, gemini)
+                .unwrap_or(None)
                 .map(|a| a.as_str().to_string())
                 .or(assignee),
             slug,
@@ -1343,6 +1345,7 @@ pub fn run(command: Option<TaskCommands>) -> Result<()> {
             p3,
             name,
             resolve_agent_shorthand(assignee.clone(), claude, codex, cursor, gemini)
+                .unwrap_or(None)
                 .map(|a| a.as_str().to_string())
                 .or(assignee),
             data,

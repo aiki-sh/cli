@@ -120,7 +120,7 @@ impl crate::workflow::HasRunKind for BuildArgs {
 /// Run the build command
 pub fn run(args: BuildArgs) -> Result<()> {
     use crate::session::flags::resolve_agent_shorthand;
-    let agent = resolve_agent_shorthand(args.agent.clone(), args.claude, args.codex, args.cursor, args.gemini);
+    let agent = resolve_agent_shorthand(args.agent.clone(), args.claude, args.codex, args.cursor, args.gemini)?;
 
     let cwd = env::current_dir()
         .map_err(|_| AikiError::InvalidArgument("Failed to get current directory".to_string()))?;

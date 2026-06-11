@@ -83,7 +83,7 @@ fn has_jj_conflicts(cwd: &Path, change_id: &str) -> bool {
 /// Run the resolve command
 pub fn run(args: ResolveArgs) -> Result<()> {
     use crate::session::flags::resolve_agent_shorthand;
-    let agent_type = resolve_agent_shorthand(args.agent, args.claude, args.codex, args.cursor, args.gemini);
+    let agent_type = resolve_agent_shorthand(args.agent, args.claude, args.codex, args.cursor, args.gemini)?;
 
     let cwd = env::current_dir()
         .map_err(|_| AikiError::InvalidArgument("Failed to get current directory".to_string()))?;

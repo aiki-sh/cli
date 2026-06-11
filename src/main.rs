@@ -379,7 +379,7 @@ fn run() -> Result<()> {
             } => {
                 let agent_type = session::flags::resolve_agent_shorthand(
                     agent, claude, codex, cursor, gemini,
-                )
+                )?
                 .ok_or_else(|| {
                     error::AikiError::MissingArgument(
                         "--agent or an agent shorthand (--claude, --codex, --cursor, --gemini)".into(),
@@ -412,7 +412,7 @@ fn run() -> Result<()> {
             force,
             next_thread,
             lane,
-            session::flags::resolve_agent_shorthand(agent, claude, codex, cursor, gemini),
+            session::flags::resolve_agent_shorthand(agent, claude, codex, cursor, gemini)?,
             template,
             data,
             output,
@@ -444,7 +444,7 @@ fn run() -> Result<()> {
         } => commands::plan::run(
             args,
             template,
-            session::flags::resolve_agent_shorthand(agent, claude, codex, cursor, gemini),
+            session::flags::resolve_agent_shorthand(agent, claude, codex, cursor, gemini)?,
             output,
         ),
         Commands::Spec {
