@@ -10,6 +10,8 @@
 /// 7. Spawned-by link in show output
 /// 8. Idempotency (re-close doesn't duplicate)
 /// 9. {{spawner.approved}} defaults to "false" when parent lacks approved data
+mod common;
+
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use std::process::Command;
@@ -38,7 +40,9 @@ fn init_git_repo(path: &std::path::Path) {
 fn init_aiki_repo(path: &std::path::Path) {
     init_git_repo(path);
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
+    common::hermetic_env(&mut cmd);
+    let output = cmd
         .current_dir(path)
         .arg("init")
         .output()

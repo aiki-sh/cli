@@ -1,3 +1,5 @@
+mod common;
+
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use std::process::Command;
@@ -37,9 +39,14 @@ fn test_version_command() {
 #[test]
 fn test_init_command_wiring() {
     // Verify the command executes without panicking (tests Clap wiring)
-    // Using jj-lib directly, so no external JJ binary required
+    // Using jj-lib directly, so no external JJ binary required.
+    // Run in a temp dir — without an explicit cwd this would run `aiki init`
+    // inside the source tree.
+    let temp_dir = tempfile::tempdir().unwrap();
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
+    cmd.current_dir(temp_dir.path());
     cmd.arg("init");
+    common::hermetic_env(&mut cmd);
 
     let output = cmd.output().unwrap();
 
@@ -78,6 +85,7 @@ fn test_init_in_git_repo() {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
     cmd.current_dir(temp_dir.path());
     cmd.arg("init");
+    common::hermetic_env(&mut cmd);
 
     cmd.assert()
         .success()
@@ -93,6 +101,7 @@ fn test_init_not_in_git_repo() {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
     cmd.current_dir(temp_dir.path());
     cmd.arg("init");
+    common::hermetic_env(&mut cmd);
 
     cmd.assert()
         .failure()
@@ -115,6 +124,7 @@ fn test_init_from_subdirectory() {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
     cmd.current_dir(&subdir);
     cmd.arg("init");
+    common::hermetic_env(&mut cmd);
 
     cmd.assert()
         .success()
@@ -138,12 +148,14 @@ fn test_init_already_initialized() {
     let mut cmd1 = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
     cmd1.current_dir(temp_dir.path());
     cmd1.arg("init");
+    common::hermetic_env(&mut cmd1);
     cmd1.assert().success();
 
     // Run init again - should be idempotent
     let mut cmd2 = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
     cmd2.current_dir(temp_dir.path());
     cmd2.arg("init");
+    common::hermetic_env(&mut cmd2);
 
     cmd2.assert()
         .success()
@@ -162,6 +174,7 @@ fn test_init_creates_aiki_directory_structure() {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
     cmd.current_dir(temp_dir.path());
     cmd.arg("init");
+    common::hermetic_env(&mut cmd);
 
     cmd.assert().success().stdout(predicate::str::contains(
         "✓ Repository initialized successfully",
@@ -202,6 +215,7 @@ fn test_init_with_existing_jj() {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
     cmd.current_dir(temp_dir.path());
     cmd.arg("init");
+    common::hermetic_env(&mut cmd);
 
     cmd.assert()
         .success()

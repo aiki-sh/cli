@@ -425,9 +425,6 @@ version: "1"
     // Auto-fetch tests
     // -----------------------------------------------------------------------
 
-    /// Mutex + env override for AIKI_HOME (serializes tests that modify env).
-    static AIKI_HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn with_temp_aiki_home<F, R>(aiki_home: &Path, f: F) -> R
     where
         F: FnOnce() -> R,
@@ -442,7 +439,11 @@ version: "1"
             }
         }
 
-        let _lock = AIKI_HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // Process-wide lock shared with every other module that touches
+        // AIKI_HOME; a module-local mutex cannot stop cross-module races.
+        let _lock = crate::global::AIKI_HOME_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _restore = RestoreEnv(std::env::var("AIKI_HOME").ok());
         std::env::set_var("AIKI_HOME", aiki_home);
         f()

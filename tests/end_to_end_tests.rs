@@ -28,6 +28,7 @@ fn test_complete_workflow_init_to_provenance_tracking() {
 
     // Step 2: Run aiki init (no plugin copying needed - using global hooks)
     let mut cmd = Command::cargo_bin("aiki").unwrap();
+    common::hermetic_env_assert(&mut cmd);
     cmd.current_dir(repo_path).arg("init");
 
     cmd.assert()

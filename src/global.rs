@@ -22,19 +22,20 @@ pub const AIKI_HOME_ENV: &str = "AIKI_HOME";
 /// Get the global aiki directory.
 ///
 /// Resolution order:
-/// 1. `AIKI_HOME` environment variable (if set)
+/// 1. `AIKI_HOME` environment variable (if set to a non-empty value;
+///    an empty string is treated as unset)
 /// 2. `~/.aiki/` (default)
 ///
 /// # Panics
 ///
-/// Panics if `AIKI_HOME` is set to an empty string or if the home directory
-/// cannot be determined when falling back to the default.
+/// Panics if the home directory cannot be determined when falling back
+/// to the default.
 #[must_use]
 pub fn global_aiki_dir() -> PathBuf {
-    if let Ok(aiki_home) = std::env::var(AIKI_HOME_ENV) {
-        if aiki_home.is_empty() {
-            panic!("{} is set but empty", AIKI_HOME_ENV);
-        }
+    if let Some(aiki_home) = std::env::var(AIKI_HOME_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
         return PathBuf::from(aiki_home);
     }
 
@@ -115,17 +116,16 @@ mod tests {
     }
 
     #[test]
-    fn test_global_aiki_dir_empty_env_var_panics() {
-        use std::panic::{catch_unwind, AssertUnwindSafe};
-
-        // Test that empty AIKI_HOME triggers a panic
-        // We need AssertUnwindSafe because our mutex helper has mutable state
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            with_aiki_home(Some(""), || {
-                let _ = global_aiki_dir();
-            });
-        }));
-        assert!(result.is_err(), "Empty AIKI_HOME should panic");
+    fn test_global_aiki_dir_empty_env_var_treated_as_unset() {
+        with_aiki_home(Some(""), || {
+            let dir = global_aiki_dir();
+            let home = dirs::home_dir().expect("home dir");
+            assert_eq!(
+                dir,
+                home.join(".aiki"),
+                "Empty AIKI_HOME should fall back to the default"
+            );
+        });
     }
 
     #[test]

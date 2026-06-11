@@ -13,6 +13,9 @@ mod provenance;
 mod session_thread;
 mod task_lifecycle;
 
+#[path = "../common/mod.rs"]
+mod common;
+
 use assert_cmd::Command;
 use std::path::Path;
 use std::process;
@@ -50,8 +53,9 @@ pub fn init_git_repo(path: &Path) {
 pub fn init_aiki_repo(repo_path: &Path) {
     init_git_repo(repo_path);
 
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let mut cmd = Command::cargo_bin("aiki").unwrap();
+    common::hermetic_env_assert(&mut cmd);
+    let output = cmd
         .current_dir(repo_path)
         .arg("init")
         .output()

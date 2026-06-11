@@ -6,6 +6,8 @@
 /// - Set env var: CLAUDE_INTEGRATION_TEST=1 to enable
 ///
 /// Run with: CLAUDE_INTEGRATION_TEST=1 cargo test test_real_claude_code_integration -- --nocapture
+mod common;
+
 use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
@@ -85,7 +87,9 @@ fn test_real_claude_code_integration() {
     println!("✓ Plugin directory copied");
 
     // Step 3: Run aiki init
-    let init_output = Command::new(env!("CARGO_BIN_EXE_aiki"))
+    let mut init_cmd = Command::new(env!("CARGO_BIN_EXE_aiki"));
+    common::hermetic_env(&mut init_cmd);
+    let init_output = init_cmd
         .arg("init")
         .current_dir(repo_path)
         .output()

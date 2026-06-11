@@ -1,3 +1,5 @@
+mod common;
+
 use jj_lib::repo::{Repo, StoreFactories};
 use jj_lib::workspace::{default_working_copy_factories, Workspace};
 use std::fs;
@@ -50,7 +52,9 @@ fn test_blame_shows_recorded_change() {
 
     // Initialize aiki (this will also do git import)
     let aiki_bin = get_aiki_binary_path();
-    let output = Command::new(&aiki_bin)
+    let mut cmd = Command::new(&aiki_bin);
+    common::hermetic_env(&mut cmd);
+    let output = cmd
         .arg("init")
         .current_dir(repo_path)
         .output()

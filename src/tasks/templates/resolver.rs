@@ -1106,23 +1106,30 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Mutex to serialize tests that modify the AIKI_HOME env var.
-    static AIKI_HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Run a closure with AIKI_HOME set, serialized via mutex.
+    /// Run a closure with AIKI_HOME set, serialized via the shared
+    /// process-wide mutex (a module-local mutex cannot stop cross-module
+    /// races). Restores the original value on drop so a panicking closure
+    /// cannot leak the override into other tests.
     fn with_aiki_home<F, R>(aiki_home: &Path, f: F) -> R
     where
         F: FnOnce() -> R,
     {
-        let _lock = AIKI_HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let old = std::env::var("AIKI_HOME").ok();
-        std::env::set_var("AIKI_HOME", aiki_home.to_str().unwrap());
-        let result = f();
-        match old {
-            Some(v) => std::env::set_var("AIKI_HOME", v),
-            None => std::env::remove_var("AIKI_HOME"),
+        struct RestoreEnv(Option<String>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("AIKI_HOME", v),
+                    None => std::env::remove_var("AIKI_HOME"),
+                }
+            }
         }
-        result
+
+        let _lock = crate::global::AIKI_HOME_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = RestoreEnv(std::env::var("AIKI_HOME").ok());
+        std::env::set_var("AIKI_HOME", aiki_home.to_str().unwrap());
+        f()
     }
 
     fn create_test_templates(dir: &Path) {

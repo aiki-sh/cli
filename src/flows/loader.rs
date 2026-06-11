@@ -274,6 +274,15 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// Loader `load()` paths probe plugin dirs under the global aiki home,
+    /// so every test here holds the shared AIKI_HOME lock to avoid reading
+    /// another test's temporary home mid-window.
+    fn lock_aiki_home() -> std::sync::MutexGuard<'static, ()> {
+        crate::global::AIKI_HOME_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Create a test project with .aiki/ directory structure
     fn create_test_project() -> TempDir {
         let temp_dir = TempDir::new().unwrap();
@@ -326,6 +335,7 @@ version: "1"
 
     #[test]
     fn test_load_simple_flow() {
+        let _env_lock = lock_aiki_home();
         let temp_dir = create_test_project();
         let flow_path = temp_dir.path().join(".aiki/hooks/aiki/simple.yml");
         create_flow_file(&flow_path, "Simple Flow", &[], &[]);
@@ -342,6 +352,7 @@ version: "1"
 
     #[test]
     fn test_load_flow_with_before_after() {
+        let _env_lock = lock_aiki_home();
         let temp_dir = create_test_project();
         let flow_path = temp_dir.path().join(".aiki/hooks/aiki/composed.yml");
         create_flow_file(
@@ -366,6 +377,7 @@ version: "1"
 
     #[test]
     fn test_load_caching() {
+        let _env_lock = lock_aiki_home();
         let temp_dir = create_test_project();
         let flow_path = temp_dir.path().join(".aiki/hooks/aiki/cached.yml");
         create_flow_file(&flow_path, "Cached Flow", &[], &[]);
@@ -387,6 +399,7 @@ version: "1"
 
     #[test]
     fn test_clear_cache() {
+        let _env_lock = lock_aiki_home();
         let temp_dir = create_test_project();
         let flow_path = temp_dir.path().join(".aiki/hooks/aiki/clearable.yml");
         create_flow_file(&flow_path, "Clearable Flow", &[], &[]);
@@ -408,6 +421,7 @@ version: "1"
 
     #[test]
     fn test_load_flow_not_found() {
+        let _env_lock = lock_aiki_home();
         let temp_dir = create_test_project();
         let mut loader = HookLoader::with_start_dir(temp_dir.path()).unwrap();
 
@@ -422,6 +436,7 @@ version: "1"
 
     #[test]
     fn test_load_invalid_yaml() {
+        let _env_lock = lock_aiki_home();
         let temp_dir = create_test_project();
         let flow_path = temp_dir.path().join(".aiki/hooks/aiki/invalid.yml");
         fs::write(&flow_path, "invalid: yaml: content: [").unwrap();
@@ -434,6 +449,7 @@ version: "1"
 
     #[test]
     fn test_default_hooks_dir() {
+        let _env_lock = lock_aiki_home();
         let temp_dir = create_test_project();
         let loader = HookLoader::with_start_dir(temp_dir.path()).unwrap();
 
@@ -443,12 +459,14 @@ version: "1"
 
     #[test]
     fn test_load_core_hook() {
+        let _env_lock = lock_aiki_home();
         let core = HookLoader::load_core_hook();
         assert_eq!(core.name, "Aiki Core");
     }
 
     #[test]
     fn test_load_builtin_fallback() {
+        let _env_lock = lock_aiki_home();
         let temp_dir = create_test_project();
         // No aiki/default.yml file on disk
         let mut loader = HookLoader::with_start_dir(temp_dir.path()).unwrap();
@@ -461,6 +479,7 @@ version: "1"
 
     #[test]
     fn test_load_project_overrides_builtin() {
+        let _env_lock = lock_aiki_home();
         let temp_dir = create_test_project();
         // Create a project-level override for aiki/default
         let flow_path = temp_dir.path().join(".aiki/hooks/aiki/default.yml");
@@ -477,6 +496,7 @@ version: "1"
 
     #[test]
     fn test_load_builtin_caching() {
+        let _env_lock = lock_aiki_home();
         let temp_dir = create_test_project();
         let mut loader = HookLoader::with_start_dir(temp_dir.path()).unwrap();
 
@@ -493,6 +513,7 @@ version: "1"
 
     #[test]
     fn test_auto_fetch_failed_memoization() {
+        let _env_lock = lock_aiki_home();
         let temp_dir = create_test_project();
         let mut loader = HookLoader::with_start_dir(temp_dir.path()).unwrap();
 
@@ -522,6 +543,7 @@ version: "1"
 
     #[test]
     fn test_clear_cache_clears_failed_fetches() {
+        let _env_lock = lock_aiki_home();
         let temp_dir = create_test_project();
         let mut loader = HookLoader::with_start_dir(temp_dir.path()).unwrap();
 
@@ -559,6 +581,7 @@ version: "1"
 
     #[test]
     fn test_memoized_auto_fetch_does_not_affect_other_plugins() {
+        let _env_lock = lock_aiki_home();
         let temp_dir = create_test_project();
         let mut loader = HookLoader::with_start_dir(temp_dir.path()).unwrap();
 
@@ -583,6 +606,7 @@ version: "1"
 
     #[test]
     fn test_load_not_found_records_auto_fetch_failure() {
+        let _env_lock = lock_aiki_home();
         let temp_dir = create_test_project();
         let mut loader = HookLoader::with_start_dir(temp_dir.path()).unwrap();
 

@@ -7,6 +7,8 @@
 //! - Task ID extraction from XML (for piping support)
 //! - Terminate background task function (mock scenarios)
 
+mod common;
+
 use std::fs;
 use std::io::Write;
 use std::sync::mpsc;
@@ -44,7 +46,9 @@ fn init_git_repo(path: &std::path::Path) {
 fn init_aiki_repo(path: &std::path::Path) {
     init_git_repo(path);
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
+    common::hermetic_env(&mut cmd);
+    let output = cmd
         .current_dir(path)
         .arg("init")
         .output()

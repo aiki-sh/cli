@@ -5,6 +5,51 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// Give a spawned `aiki` command a hermetic environment so machine-mutating
+/// commands (`aiki init` in particular) cannot write to the real `~/.aiki`,
+/// `~/.config`, or home directory.
+///
+/// Creates a fresh temp dir per call holding a fake `AIKI_HOME`, `HOME`, and
+/// `XDG_CONFIG_HOME`, plus a `.gitconfig` and `JJ_USER`/`JJ_EMAIL` so git/jj
+/// invoked by the spawned binary still find a user identity once `HOME`
+/// moves. The temp dir is intentionally leaked: it must outlive the spawned
+/// process, and the OS cleans the temp filesystem.
+pub fn hermetic_env(cmd: &mut std::process::Command) {
+    for (key, value) in hermetic_env_vars() {
+        cmd.env(key, value);
+    }
+}
+
+/// `assert_cmd::Command` flavor of [`hermetic_env`].
+pub fn hermetic_env_assert(cmd: &mut assert_cmd::Command) {
+    for (key, value) in hermetic_env_vars() {
+        cmd.env(key, value);
+    }
+}
+
+fn hermetic_env_vars() -> Vec<(&'static str, std::ffi::OsString)> {
+    let dir = tempfile::tempdir().expect("create hermetic home");
+    let home = dir.path().join("home");
+    let aiki_home = dir.path().join("aiki");
+    let config = home.join(".config");
+    std::fs::create_dir_all(&aiki_home).expect("create hermetic aiki home");
+    std::fs::create_dir_all(&config).expect("create hermetic config dir");
+    std::fs::write(
+        home.join(".gitconfig"),
+        "[user]\n\tname = Aiki Test\n\temail = test@example.com\n",
+    )
+    .expect("write hermetic gitconfig");
+    let vars = vec![
+        ("AIKI_HOME", aiki_home.into_os_string()),
+        ("HOME", home.into_os_string()),
+        ("XDG_CONFIG_HOME", config.into_os_string()),
+        ("JJ_USER", "Aiki Test".into()),
+        ("JJ_EMAIL", "test@example.com".into()),
+    ];
+    std::mem::forget(dir);
+    vars
+}
+
 /// Check if jj binary is available in PATH
 pub fn jj_available() -> bool {
     std::process::Command::new("jj")
