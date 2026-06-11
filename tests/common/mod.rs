@@ -5,6 +5,68 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// Shared hermetic home for every `aiki` spawned through [`aiki_cmd`].
+///
+/// One home per test binary mirrors the A0 baseline environment (one temp
+/// `AIKI_HOME` per suite run): init-created global state stays visible to
+/// later commands in the same test, while the developer's real `~/.aiki`
+/// stays untouched — in particular `task close` cannot trip the
+/// requires-confidence gate on the developer's live agent session.
+static SHARED_TEST_HOME: std::sync::LazyLock<std::path::PathBuf> =
+    std::sync::LazyLock::new(|| {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("create shared test home");
+        let base = dir.path().to_path_buf();
+        let home = base.join("home");
+        std::fs::create_dir_all(base.join("aiki")).expect("create shared aiki home");
+        std::fs::create_dir_all(home.join(".config")).expect("create shared config dir");
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[user]\n\tname = Aiki Test\n\temail = test@example.com\n",
+        )
+        .expect("write shared gitconfig");
+        // Fake agent binaries: any `aiki` command that spawns an agent
+        // (`aiki run`, `aiki build --review --fix`, …) must resolve these
+        // instead of live CLIs — a real spawn burns tokens and runs for
+        // unbounded wall clock (see ops/now/fix-refactor.md A8a).
+        let fake_bin = base.join("fake-bin");
+        std::fs::create_dir_all(&fake_bin).expect("create fake-bin dir");
+        for agent in ["claude", "codex"] {
+            let script = fake_bin.join(agent);
+            std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write fake agent");
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        // Keep the directory for the whole test-binary lifetime.
+        std::mem::forget(dir);
+        base
+    });
+
+/// Construct an `aiki` Command pre-wired to the shared hermetic home, with
+/// fake `claude`/`codex` binaries shadowing any real agent CLIs on PATH.
+///
+/// Use this instead of `Command::new(cargo_bin!("aiki"))` in integration
+/// tests so spawned binaries never read or write the real machine state and
+/// never start live agents.
+pub fn aiki_cmd() -> std::process::Command {
+    let base = &*SHARED_TEST_HOME;
+    let home = base.join("home");
+    let path_value = format!(
+        "{}:{}",
+        base.join("fake-bin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
+    cmd.env("AIKI_HOME", base.join("aiki"))
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("JJ_USER", "Aiki Test")
+        .env("JJ_EMAIL", "test@example.com")
+        .env("PATH", path_value);
+    cmd
+}
+
 /// Give a spawned `aiki` command a hermetic environment so machine-mutating
 /// commands (`aiki init` in particular) cannot write to the real `~/.aiki`,
 /// `~/.config`, or home directory.

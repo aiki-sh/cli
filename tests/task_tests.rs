@@ -38,8 +38,7 @@ fn init_git_repo(path: &std::path::Path) {
 fn init_aiki_repo(path: &std::path::Path) {
     init_git_repo(path);
 
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
-    common::hermetic_env(&mut cmd);
+    let mut cmd = common::aiki_cmd();
     let output = cmd
         .current_dir(path)
         .arg("init")
@@ -56,7 +55,7 @@ fn init_aiki_repo(path: &std::path::Path) {
 
 /// Helper to run aiki task command
 fn aiki_task(path: &std::path::Path, args: &[&str]) -> assert_cmd::assert::Assert {
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
+    let mut cmd = common::aiki_cmd();
     cmd.current_dir(path);
     cmd.arg("task");
     for arg in args {
@@ -129,7 +128,7 @@ fn task_stdout(path: &std::path::Path, args: &[&str]) -> String {
 }
 
 fn task_stdout_without_thread(path: &std::path::Path, args: &[&str]) -> String {
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
+    let mut cmd = common::aiki_cmd();
     cmd.current_dir(path).arg("task").env_remove("AIKI_THREAD");
     for arg in args {
         cmd.arg(arg);
@@ -169,7 +168,7 @@ fn run_jj(path: &Path, args: &[&str]) -> String {
 }
 
 fn aiki_task_with_env(path: &Path, args: &[&str], envs: &[(&str, &str)]) -> String {
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
+    let mut cmd = common::aiki_cmd();
     cmd.current_dir(path).arg("task");
     for (key, value) in envs {
         cmd.env(key, value);
@@ -189,7 +188,7 @@ fn aiki_task_with_env(path: &Path, args: &[&str], envs: &[(&str, &str)]) -> Stri
 }
 
 fn aiki_stdout_with_env(path: &Path, args: &[&str], envs: &[(&str, &str)]) -> String {
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
+    let mut cmd = common::aiki_cmd();
     cmd.current_dir(path);
     for (key, value) in envs {
         cmd.env(key, value);
@@ -667,7 +666,7 @@ fn test_task_add_with_parent() {
     init_aiki_repo(temp_dir.path());
 
     // Add parent task and get its ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Parent task"])
         .output()
@@ -691,7 +690,7 @@ fn test_task_subtasks_use_independent_ids() {
     init_aiki_repo(temp_dir.path());
 
     // Add parent task
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Parent"])
         .output()
@@ -701,21 +700,21 @@ fn test_task_subtasks_use_independent_ids() {
     let parent_id = extract_short_id(&stdout);
 
     // Add first child and verify the parent show output lists it as a subtask
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "First child", "--parent", &parent_id])
         .output()
         .unwrap();
 
     // Add second child
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Second child", "--parent", &parent_id])
         .output()
         .unwrap();
 
     // Verify subtasks exist via show on parent
-    let show_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let show_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "show", &parent_id])
         .output()
@@ -788,7 +787,7 @@ fn test_task_list_in_progress_filter() {
     aiki_task(temp_dir.path(), &["add", "In progress task"]).success();
 
     // Start the first task from ready queue
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list"])
         .output()
@@ -1100,7 +1099,7 @@ fn test_task_set_name() {
     init_aiki_repo(temp_dir.path());
 
     // Create a task and extract short ID from "Added <id>" output
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Original name"])
         .output()
@@ -1129,7 +1128,7 @@ fn test_task_set_priority() {
     init_aiki_repo(temp_dir.path());
 
     // Create a task (default P2) and extract short ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Priority task"])
         .output()
@@ -1153,7 +1152,7 @@ fn test_task_unset_assignee() {
     init_aiki_repo(temp_dir.path());
 
     // Create a task with assignee
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Assigned task", "--assignee", "claude-code"])
         .output()
@@ -1174,7 +1173,7 @@ fn test_task_unset_rejects_name() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "My task"])
         .output()
@@ -1194,7 +1193,7 @@ fn test_task_unset_rejects_priority() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "My task"])
         .output()
@@ -1214,7 +1213,7 @@ fn test_task_unset_rejects_unknown_field() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "My task"])
         .output()
@@ -1232,7 +1231,7 @@ fn test_task_set_rejects_empty_data_value() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "My task"])
         .output()
@@ -1387,7 +1386,7 @@ fn test_task_start_does_not_stop_other_tasks() {
     aiki_task(temp_dir.path(), &["start"]).success();
 
     // Get second task ID from list (in ready queue)
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list"])
         .output()
@@ -1401,7 +1400,7 @@ fn test_task_start_does_not_stop_other_tasks() {
         .stdout(predicate::str::contains("Stopped").not());
 
     // Verify both tasks are now in progress
-    let list_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let list_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--in-progress"])
         .output()
@@ -1539,7 +1538,7 @@ fn test_parent_auto_starts_when_all_subtasks_closed() {
     init_aiki_repo(temp_dir.path());
 
     // Create parent task
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Parent task"])
         .output()
@@ -1548,7 +1547,7 @@ fn test_parent_auto_starts_when_all_subtasks_closed() {
     let parent_id = extract_short_id(&stdout);
 
     // Create two subtasks (they get full IDs, linked via subtask-of edges)
-    let output1 = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output1 = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Subtask 1", "--parent", &parent_id])
         .output()
@@ -1556,7 +1555,7 @@ fn test_parent_auto_starts_when_all_subtasks_closed() {
     let stdout1 = String::from_utf8_lossy(&output1.stdout);
     let subtask1_id = extract_short_id(&stdout1);
 
-    let output2 = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output2 = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Subtask 2", "--parent", &parent_id])
         .output()
@@ -1565,20 +1564,20 @@ fn test_parent_auto_starts_when_all_subtasks_closed() {
     let subtask2_id = extract_short_id(&stdout2);
 
     // Start and close subtask 1
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &subtask1_id])
         .output()
         .expect("Failed to start subtask 1");
 
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "close", &subtask1_id, "--summary", "Done"])
         .output()
         .expect("Failed to close subtask 1");
 
     // Start and close subtask 2 - this should trigger parent auto-start
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &subtask2_id])
         .output()
@@ -1695,7 +1694,7 @@ Fix all issues identified in the review.
     );
 
     // Create a source task
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Code review"])
         .output()
@@ -1705,7 +1704,7 @@ Fix all issues identified in the review.
 
     // Add comments to the source task with structured data
     // Comment 1: file=auth.rs
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args([
             "task",
@@ -1720,7 +1719,7 @@ Fix all issues identified in the review.
         .expect("Failed to add comment 1");
 
     // Comment 2: file=utils.rs
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args([
             "task",
@@ -1838,7 +1837,7 @@ Do work.
     );
 
     // Create a source task
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Source task"])
         .output()
@@ -1867,7 +1866,7 @@ fn test_template_static_subtasks_honor_frontmatter_sources() {
     init_aiki_repo(temp_dir.path());
 
     // Create a source task to reference
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Original review"])
         .output()
@@ -1927,7 +1926,7 @@ Fix the validation issue.
     .success();
 
     // Show the subtasks to verify sources are included
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--all"])
         .output()
@@ -1945,7 +1944,7 @@ Fix the validation issue.
     let subtask_id = extract_id_from_list_by_name(&stdout, "Fix auth issue");
 
     // Show the subtask to verify it has the source
-    let show_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let show_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "show", &subtask_id])
         .output()
@@ -2690,7 +2689,7 @@ fn test_review_non_task_scope_succeeds() {
         .expect("git commit failed");
 
     // Run a non-task review with --start (plan scope, no validates edge)
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["review", "design.md", "--start"])
         .output()
@@ -2816,7 +2815,7 @@ fn test_run_requires_id_or_template() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["run"])
         .assert()
@@ -2831,7 +2830,7 @@ fn test_run_id_conflicts_with_template() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["run", "someid", "--template", "foo"])
         .assert()
@@ -2844,7 +2843,7 @@ fn test_run_data_requires_template() {
     let temp_dir = tempfile::tempdir().unwrap();
     init_aiki_repo(temp_dir.path());
 
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["run", "someid", "--data", "key=value"])
         .assert()
@@ -2866,7 +2865,7 @@ fn test_run_invalid_data_format() {
         "---\nversion: 1.0.0\ndescription: Test\n---\n# Test\nBody",
     );
 
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args([
             "run",
@@ -2895,7 +2894,7 @@ fn test_run_template_creates_task() {
 
     // This will create the task from template and then try to run it.
     // The run may fail at agent spawning, but we should see the task was created.
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["run", "--template", "test/run-me", "--data", "key=hello"])
         .output()
@@ -2928,14 +2927,14 @@ fn test_parent_autostart_skips_when_parent_already_in_progress() {
     init_aiki_repo(temp_dir.path());
 
     // Create parent + 1 subtask
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Parent already running"])
         .output()
         .unwrap();
     let parent_id = extract_short_id(&String::from_utf8_lossy(&output.stdout));
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Only subtask", "--parent", &parent_id])
         .output()
@@ -2943,20 +2942,20 @@ fn test_parent_autostart_skips_when_parent_already_in_progress() {
     let sub_id = extract_short_id(&String::from_utf8_lossy(&output.stdout));
 
     // Start parent (puts it InProgress)
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &parent_id])
         .output()
         .unwrap();
 
     // Start and close the only subtask
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &sub_id])
         .output()
         .unwrap();
 
-    let close_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let close_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "close", &sub_id, "--summary", "Done"])
         .output()
@@ -2971,7 +2970,7 @@ fn test_parent_autostart_skips_when_parent_already_in_progress() {
     );
 
     // Parent should still be InProgress (unchanged)
-    let show_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let show_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "show", &parent_id])
         .output()
@@ -2992,14 +2991,14 @@ fn test_parent_autostart_skips_when_parent_already_closed() {
     init_aiki_repo(temp_dir.path());
 
     // Create parent + 1 subtask
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Parent closed early"])
         .output()
         .unwrap();
     let parent_id = extract_short_id(&String::from_utf8_lossy(&output.stdout));
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Subtask A", "--parent", &parent_id])
         .output()
@@ -3007,24 +3006,24 @@ fn test_parent_autostart_skips_when_parent_already_closed() {
     let sub_id = extract_short_id(&String::from_utf8_lossy(&output.stdout));
 
     // Start and close the parent directly
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &parent_id])
         .output()
         .unwrap();
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "close", &parent_id, "--summary", "Closed early"])
         .output()
         .unwrap();
 
     // Now close the subtask
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &sub_id])
         .output()
         .unwrap();
-    let close_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let close_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "close", &sub_id, "--summary", "Done"])
         .output()
@@ -3046,20 +3045,20 @@ fn test_parent_autostart_not_triggered_with_partial_close() {
     init_aiki_repo(temp_dir.path());
 
     // Create parent + 2 subtasks
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Partial parent"])
         .output()
         .unwrap();
     let parent_id = extract_short_id(&String::from_utf8_lossy(&output.stdout));
 
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Sub 1", "--parent", &parent_id])
         .output()
         .unwrap();
 
-    let output2 = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output2 = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Sub 2", "--parent", &parent_id])
         .output()
@@ -3067,25 +3066,25 @@ fn test_parent_autostart_not_triggered_with_partial_close() {
     let sub2_id = extract_short_id(&String::from_utf8_lossy(&output2.stdout));
 
     // Start parent, start and close only subtask 2
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &parent_id])
         .output()
         .unwrap();
     // Stop parent so it's no longer InProgress (otherwise the InProgress guard hides the test)
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "stop"])
         .output()
         .unwrap();
 
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &sub2_id])
         .output()
         .unwrap();
 
-    let close_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let close_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "close", &sub2_id, "--summary", "Done"])
         .output()
@@ -3108,21 +3107,21 @@ fn test_parent_autostart_triggers_with_wontdo_subtasks() {
     init_aiki_repo(temp_dir.path());
 
     // Create parent + 2 subtasks
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Wontdo parent"])
         .output()
         .unwrap();
     let parent_id = extract_short_id(&String::from_utf8_lossy(&output.stdout));
 
-    let out1 = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let out1 = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Sub done", "--parent", &parent_id])
         .output()
         .unwrap();
     let sub1_id = extract_short_id(&String::from_utf8_lossy(&out1.stdout));
 
-    let out2 = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let out2 = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Sub wontdo", "--parent", &parent_id])
         .output()
@@ -3130,19 +3129,19 @@ fn test_parent_autostart_triggers_with_wontdo_subtasks() {
     let sub2_id = extract_short_id(&String::from_utf8_lossy(&out2.stdout));
 
     // Start and close sub1 normally
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &sub1_id])
         .output()
         .unwrap();
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "close", &sub1_id, "--summary", "Done"])
         .output()
         .unwrap();
 
     // Close sub2 as wont-do
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &sub2_id])
         .output()
@@ -3168,14 +3167,14 @@ fn test_parent_autostart_skips_when_orchestrated() {
     init_aiki_repo(temp_dir.path());
 
     // Create parent + subtask + orchestrator
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Orchestrated parent"])
         .output()
         .unwrap();
     let parent_id = extract_short_id(&String::from_utf8_lossy(&output.stdout));
 
-    let out_sub = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let out_sub = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Sub orchestrated", "--parent", &parent_id])
         .output()
@@ -3183,7 +3182,7 @@ fn test_parent_autostart_skips_when_orchestrated() {
     let sub_id = extract_short_id(&String::from_utf8_lossy(&out_sub.stdout));
 
     // Create an orchestrator task that orchestrates the parent
-    let out_orch = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let out_orch = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Loop orchestrator"])
         .output()
@@ -3198,20 +3197,20 @@ fn test_parent_autostart_skips_when_orchestrated() {
     .success();
 
     // Start the orchestrator (it's the active orchestrator)
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &orch_id])
         .output()
         .unwrap();
 
     // Start and close the subtask
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &sub_id])
         .output()
         .unwrap();
 
-    let close_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let close_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "close", &sub_id, "--summary", "Done"])
         .output()
@@ -3226,7 +3225,7 @@ fn test_parent_autostart_skips_when_orchestrated() {
     );
 
     // Parent should still be in its original state (Open/Stopped, not InProgress)
-    let show = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let show = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "show", &parent_id])
         .output()
@@ -3249,7 +3248,7 @@ fn test_blocking_link_autorun_starts_task_on_close() {
     init_aiki_repo(temp_dir.path());
 
     // Create task A (the blocker)
-    let out_a = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let out_a = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Blocker task"])
         .output()
@@ -3257,7 +3256,7 @@ fn test_blocking_link_autorun_starts_task_on_close() {
     let a_id = extract_short_id(&String::from_utf8_lossy(&out_a.stdout));
 
     // Create task B with --blocked-by A --autorun (creates link at add time)
-    let out_b = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let out_b = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args([
             "task",
@@ -3272,13 +3271,13 @@ fn test_blocking_link_autorun_starts_task_on_close() {
     let b_id = extract_short_id(&String::from_utf8_lossy(&out_b.stdout));
 
     // Start and close A
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &a_id])
         .output()
         .unwrap();
 
-    let close_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let close_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "close", &a_id, "--summary", "Done"])
         .output()
@@ -3293,7 +3292,7 @@ fn test_blocking_link_autorun_starts_task_on_close() {
     );
 
     // Verify B is now InProgress
-    let show = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let show = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "show", &b_id])
         .output()
@@ -3313,7 +3312,7 @@ fn test_blocking_link_no_autorun_does_not_start() {
     init_aiki_repo(temp_dir.path());
 
     // Create task A
-    let out_a = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let out_a = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Blocker no-auto"])
         .output()
@@ -3321,7 +3320,7 @@ fn test_blocking_link_no_autorun_does_not_start() {
     let a_id = extract_short_id(&String::from_utf8_lossy(&out_a.stdout));
 
     // Create task B with --blocked-by A (NO --autorun)
-    let out_b = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let out_b = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Blocked no-autorun", "--blocked-by", &a_id])
         .output()
@@ -3329,13 +3328,13 @@ fn test_blocking_link_no_autorun_does_not_start() {
     let b_id = extract_short_id(&String::from_utf8_lossy(&out_b.stdout));
 
     // Start and close A
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &a_id])
         .output()
         .unwrap();
 
-    let close_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let close_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "close", &a_id, "--summary", "Done"])
         .output()
@@ -3350,7 +3349,7 @@ fn test_blocking_link_no_autorun_does_not_start() {
     );
 
     // Verify B is still Open
-    let show = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let show = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "show", &b_id])
         .output()
@@ -3370,14 +3369,14 @@ fn test_blocking_link_autorun_stays_blocked_with_multiple_blockers() {
     init_aiki_repo(temp_dir.path());
 
     // Create blocker tasks A and B
-    let out_a = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let out_a = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Blocker A"])
         .output()
         .unwrap();
     let a_id = extract_short_id(&String::from_utf8_lossy(&out_a.stdout));
 
-    let out_b = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let out_b = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Blocker B"])
         .output()
@@ -3385,7 +3384,7 @@ fn test_blocking_link_autorun_stays_blocked_with_multiple_blockers() {
     let b_id = extract_short_id(&String::from_utf8_lossy(&out_b.stdout));
 
     // Create task C blocked by A with autorun
-    let out_c = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let out_c = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args([
             "task",
@@ -3403,12 +3402,12 @@ fn test_blocking_link_autorun_stays_blocked_with_multiple_blockers() {
     aiki_task(temp_dir.path(), &["link", &c_id, "--blocked-by", &b_id]).success();
 
     // Close only A
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &a_id])
         .output()
         .unwrap();
-    let close_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let close_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "close", &a_id, "--summary", "Done"])
         .output()
@@ -3423,12 +3422,12 @@ fn test_blocking_link_autorun_stays_blocked_with_multiple_blockers() {
     );
 
     // Now close B too
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &b_id])
         .output()
         .unwrap();
-    let close_output2 = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let close_output2 = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "close", &b_id, "--summary", "Done"])
         .output()
@@ -3443,7 +3442,7 @@ fn test_blocking_link_autorun_stays_blocked_with_multiple_blockers() {
     );
 
     // Verify C is InProgress
-    let show = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let show = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "show", &c_id])
         .output()
@@ -4065,7 +4064,7 @@ fn test_task_diff_fallback_summary_scoping_handles_renames() {
 }
 
 #[test]
-fn test_tldr_renders_snapshot_scoped_epic_diff_and_fix_metadata() {
+fn test_tldr_defers_diff_artifacts_and_renders_fix_metadata() {
     if !jj_available() {
         eprintln!("Skipping test: jj binary not found in PATH");
         return;
@@ -4085,7 +4084,13 @@ fn test_tldr_renders_snapshot_scoped_epic_diff_and_fix_metadata() {
     run_jj(temp_dir.path(), &["describe", "-m", "base"]);
     run_jj(temp_dir.path(), &["new"]);
 
-    let epic_short = extract_short_id(&task_stdout(temp_dir.path(), &["add", "Epic: TLDR scope"]));
+    // tldr v1 only supports epics: an implements-plan link (or epic type)
+    // plus subtasks satisfies the epic-structure predicate.
+    fs::write(temp_dir.path().join("tldr-plan.md"), "# TLDR scope plan\n").unwrap();
+    let epic_short = extract_short_id(&task_stdout(
+        temp_dir.path(),
+        &["add", "Epic: TLDR scope", "--implements", "tldr-plan.md"],
+    ));
     let epic_full =
         extract_full_id_from_show(&task_stdout(temp_dir.path(), &["show", &epic_short]));
     let subtask_short = extract_short_id(&task_stdout(
@@ -4192,19 +4197,22 @@ fn test_tldr_renders_snapshot_scoped_epic_diff_and_fix_metadata() {
         &envs,
     );
 
+    // Diff artifacts are deferred to the agent session (computing them
+    // inline is O(n) JJ queries per subtask): the payload carries defer
+    // stubs plus per-fix revsets so the agent can run `aiki task diff`.
     assert!(
-        instructions.contains("<files-changed>\nM tracked.txt"),
-        "TLDR payload should include the snapshot-scoped file list: {}",
+        instructions.contains("Run `aiki task diff` to view the diff."),
+        "TLDR payload should defer the diff to `aiki task diff`: {}",
         instructions
     );
     assert!(
-        instructions.contains("<file-stats>") && instructions.contains("tracked.txt"),
-        "TLDR payload should include scoped diff stats: {}",
+        instructions.contains("Run `aiki task diff --stat` to view file stats."),
+        "TLDR payload should defer file stats to `aiki task diff --stat`: {}",
         instructions
     );
     assert!(
-        instructions.contains("\"files_changed\": [\n            \"tracked.txt\""),
-        "review-history fix metadata should report the scoped tracked file: {}",
+        instructions.contains(&format!("task={}", fix_full)),
+        "review-history fix metadata should carry the fix revset: {}",
         instructions
     );
     assert!(
@@ -4215,7 +4223,7 @@ fn test_tldr_renders_snapshot_scoped_epic_diff_and_fix_metadata() {
 }
 
 #[test]
-fn test_tldr_fallback_renders_legacy_tasks_without_started_snapshots() {
+fn test_tldr_handles_legacy_tasks_without_started_snapshots() {
     if !jj_available() {
         eprintln!("Skipping test: jj binary not found in PATH");
         return;
@@ -4231,9 +4239,12 @@ fn test_tldr_fallback_renders_legacy_tasks_without_started_snapshots() {
     run_jj(temp_dir.path(), &["describe", "-m", "base"]);
     run_jj(temp_dir.path(), &["new"]);
 
+    // tldr v1 only supports epics: an implements-plan link (or epic type)
+    // plus subtasks satisfies the epic-structure predicate.
+    fs::write(temp_dir.path().join("legacy-plan.md"), "# Legacy fallback plan\n").unwrap();
     let epic_short = extract_short_id(&task_stdout(
         temp_dir.path(),
-        &["add", "Epic: Legacy fallback"],
+        &["add", "Epic: Legacy fallback", "--implements", "legacy-plan.md"],
     ));
     let epic_full =
         extract_full_id_from_show(&task_stdout(temp_dir.path(), &["show", &epic_short]));
@@ -4334,19 +4345,22 @@ fn test_tldr_fallback_renders_legacy_tasks_without_started_snapshots() {
         &envs,
     );
 
+    // Even for legacy tasks closed without started snapshots, the payload
+    // must render: diff artifacts are deferred to `aiki task diff` and the
+    // review history carries a description-based revset for the fix.
     assert!(
-        instructions.contains("<diff>") && instructions.contains("tracked.txt"),
-        "legacy TLDR fallback should still render a diff: {}",
+        instructions.contains("Run `aiki task diff` to view the diff."),
+        "legacy TLDR payload should defer the diff to `aiki task diff`: {}",
         instructions
     );
     assert!(
-        instructions.contains("<file-stats>") && !instructions.contains("File stats unavailable."),
-        "legacy TLDR fallback should still render file stats: {}",
+        instructions.contains("Run `aiki task diff --stat` to view file stats."),
+        "legacy TLDR payload should defer file stats: {}",
         instructions
     );
     assert!(
-        instructions.contains("\"diff_stat\":") && !instructions.contains("\"diff_stat\": null"),
-        "legacy review-history fallback should still render fix diff stats: {}",
+        instructions.contains(&format!("task={}", fix_full)),
+        "legacy review-history should carry the fix's description revset: {}",
         instructions
     );
 }
@@ -4570,3 +4584,70 @@ fn test_task_show_without_with_instructions_hides_instructions() {
     );
 }
 
+
+/// Deliberate coverage for the close-requires-confidence session gate
+/// (`commands/task.rs::close_requires_owned_session_gate`).
+///
+/// The gate fires when the spawned binary finds a live agent session in
+/// `$AIKI_HOME/sessions` by ancestor PID whose session id matches the task's
+/// `last_session_id`. Before the hermetic shared home landed, 36 tests
+/// tripped this gate accidentally whenever the suite ran from a real agent
+/// session; this test stages the gate deliberately so the behavior keeps
+/// end-to-end coverage on the consumer path.
+#[test]
+fn test_close_confidence_gate_fires_for_owned_session() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    init_aiki_repo(temp_dir.path());
+
+    // Dedicated AIKI_HOME, NOT the shared per-binary home: the staged
+    // session's pid (this test process) is an ancestor of every aiki the
+    // whole binary spawns, so in the shared home it would trip the gate for
+    // unrelated concurrent tests.
+    let gate_home = tempfile::tempdir().unwrap();
+    let sessions_dir = gate_home.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let gate_home_str = gate_home.path().to_str().unwrap().to_owned();
+    let envs: &[(&str, &str)] = &[("AIKI_HOME", &gate_home_str)];
+
+    // Stage a live session owned by this test process.
+    let session_id = "aiki-gate-test-session";
+    fs::write(
+        sessions_dir.join(session_id),
+        format!(
+            "parent_pid={}\nagent=claude-code\nexternal_session_id=ext-gate\nsession_id={}\n",
+            std::process::id(),
+            session_id
+        ),
+    )
+    .unwrap();
+
+    // add + start while the session is active: Started stamps the task's
+    // last_session_id with the discovered session.
+    let add_out = aiki_task_with_env(temp_dir.path(), &["add", "Gate coverage task"], envs);
+    let task_id = extract_short_id(&add_out);
+    aiki_task_with_env(temp_dir.path(), &["start", &task_id], envs);
+
+    // Closing without --confidence must trip the gate.
+    let mut cmd = common::aiki_cmd();
+    cmd.current_dir(temp_dir.path())
+        .env("AIKI_HOME", gate_home.path())
+        .args(["task", "close", &task_id, "--summary", "done"]);
+    let output = cmd.output().unwrap();
+    assert!(
+        !output.status.success(),
+        "close without --confidence should fail under an owned session"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--confidence is required"),
+        "gate message expected, got: {}",
+        stderr
+    );
+
+    // Closing with --confidence succeeds.
+    aiki_task_with_env(
+        temp_dir.path(),
+        &["close", &task_id, "--confidence", "3", "--summary", "done"],
+        envs,
+    );
+}

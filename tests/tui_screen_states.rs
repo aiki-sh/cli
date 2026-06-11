@@ -544,8 +544,9 @@ fn flow2_state_10_build_complete() {
     // Should have summary
     assert_line_contains(&lines, "build completed");
     assert_line_contains(&lines, "plan.md");
-    // Should have hint
-    assert_line_contains(&lines, "aiki task diff");
+    // Should have hint (context-dependent tip: no review exists yet, so the
+    // summary suggests `aiki review <id>`)
+    assert_line_contains(&lines, "aiki review");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

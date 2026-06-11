@@ -46,8 +46,7 @@ fn init_git_repo(path: &std::path::Path) {
 fn init_aiki_repo(path: &std::path::Path) {
     init_git_repo(path);
 
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
-    common::hermetic_env(&mut cmd);
+    let mut cmd = common::aiki_cmd();
     let output = cmd
         .current_dir(path)
         .arg("init")
@@ -64,7 +63,7 @@ fn init_aiki_repo(path: &std::path::Path) {
 
 /// Helper to run aiki task command
 fn aiki_task(path: &std::path::Path, args: &[&str]) -> assert_cmd::assert::Assert {
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
+    let mut cmd = common::aiki_cmd();
     cmd.current_dir(path);
     cmd.arg("task");
     for arg in args {
@@ -75,7 +74,7 @@ fn aiki_task(path: &std::path::Path, args: &[&str]) -> assert_cmd::assert::Asser
 
 /// Helper to run aiki task wait command
 fn aiki_wait(path: &std::path::Path, args: &[&str]) -> assert_cmd::assert::Assert {
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
+    let mut cmd = common::aiki_cmd();
     cmd.current_dir(path);
     cmd.args(["task", "wait"]);
     for arg in args {
@@ -131,10 +130,14 @@ fn test_task_run_async_flag_exists() {
     init_aiki_repo(temp_dir.path());
 
     // Add a task to exercise top-level `aiki run`
-    aiki_task(temp_dir.path(), &["add", "Test async task"]).success();
+    aiki_task(
+        temp_dir.path(),
+        &["add", "Test async task", "-i", "Run the async flag check."],
+    )
+    .success();
 
     // Get the task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list"])
         .output()
@@ -145,7 +148,7 @@ fn test_task_run_async_flag_exists() {
 
     // Try running with --async flag - should be recognized and succeed
     // (auto-detects agent from session context)
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["run", &task_id, "--async"])
         .output()
@@ -171,7 +174,7 @@ fn test_task_run_short_async_flag() {
     aiki_task(temp_dir.path(), &["add", "Test short flag"]).success();
 
     // Get the task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list"])
         .output()
@@ -181,7 +184,7 @@ fn test_task_run_short_async_flag() {
     let task_id = extract_task_id(&stdout).expect("Should find task ID");
 
     // -a short flag is NOT defined for --async; verify it's rejected as a parse error
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["run", &task_id, "-a"])
         .assert()
@@ -196,7 +199,7 @@ fn test_task_run_requires_task_id() {
     init_aiki_repo(temp_dir.path());
 
     // Try running without task ID - should fail with argument error
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["run"])
         .assert()
@@ -211,10 +214,14 @@ fn test_task_run_with_agent_override() {
     init_aiki_repo(temp_dir.path());
 
     // Add a task
-    aiki_task(temp_dir.path(), &["add", "Test agent override"]).success();
+    aiki_task(
+        temp_dir.path(),
+        &["add", "Test agent override", "-i", "Run the agent override check."],
+    )
+    .success();
 
     // Get the task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list"])
         .output()
@@ -227,7 +234,7 @@ fn test_task_run_with_agent_override() {
     // The command should be parsed correctly (flags recognized)
     // It may succeed (if agent is installed) or fail (if not), but either way
     // the flags should be recognized
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["run", &task_id, "--agent", "claude-code", "--async"])
         .output()
@@ -257,8 +264,12 @@ fn test_task_run_reserved_without_force_rejects() {
     init_aiki_repo(temp_dir.path());
 
     // Add and capture a task ID
-    aiki_task(temp_dir.path(), &["add", "Reserved test task"]).success();
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    aiki_task(
+        temp_dir.path(),
+        &["add", "Reserved test task", "-i", "Run the reserved-task check."],
+    )
+    .success();
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list"])
         .output()
@@ -267,13 +278,13 @@ fn test_task_run_reserved_without_force_rejects() {
     let short_id = extract_task_id(&stdout).expect("Should find task ID");
 
     // Make an initial run attempt to transition the task to reserved status.
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["run", &short_id, "--async"])
         .assert()
         .failure();
 
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["run", &short_id, "--async"])
         .assert()
@@ -291,7 +302,7 @@ fn test_task_run_in_progress_without_force_rejects() {
 
     // Add and capture a task ID
     aiki_task(temp_dir.path(), &["add", "In-progress test task"]).success();
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list"])
         .output()
@@ -300,13 +311,13 @@ fn test_task_run_in_progress_without_force_rejects() {
     let short_id = extract_task_id(&stdout).expect("Should find task ID");
 
     // Mark it in progress.
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "start", &short_id])
         .assert()
         .success();
 
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["run", &short_id, "--async"])
         .assert()
@@ -323,10 +334,14 @@ fn test_task_run_invalid_agent() {
     init_aiki_repo(temp_dir.path());
 
     // Add a task
-    aiki_task(temp_dir.path(), &["add", "Test invalid agent"]).success();
+    aiki_task(
+        temp_dir.path(),
+        &["add", "Test invalid agent", "-i", "Run the invalid-agent check."],
+    )
+    .success();
 
     // Get the task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list"])
         .output()
@@ -336,7 +351,7 @@ fn test_task_run_invalid_agent() {
     let task_id = extract_task_id(&stdout).expect("Should find task ID");
 
     // Try running with invalid agent name
-    Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["run", &task_id, "--agent", "invalid-agent"])
         .assert()
@@ -354,7 +369,7 @@ fn test_review_continue_async_flag() {
     init_aiki_repo(temp_dir.path());
 
     // Add a task to use as the review target and extract ID from add output
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Test review target"])
         .output()
@@ -366,7 +381,7 @@ fn test_review_continue_async_flag() {
     // Run review with --_continue-async flag
     // Should be recognized by the parser (not an "unexpected argument" error)
     // May fail at runtime since no actual review task exists, but that's expected
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["review", "--_continue-async", &task_id])
         .output()
@@ -390,7 +405,7 @@ fn test_review_continue_async_reads_json_payload() {
     init_aiki_repo(temp_dir.path());
 
     // Add a task to get a valid-format task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Test review target for stdin piping"])
         .output()
@@ -424,7 +439,7 @@ fn test_review_continue_async_reads_json_payload() {
     let json_bytes = serde_json::to_vec(&payload).unwrap();
 
     // Spawn `aiki review --_continue-async <task_id>` with piped stdin
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let mut child = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["review", "--_continue-async", &task_id])
         .stdin(Stdio::piped())
@@ -592,7 +607,7 @@ fn test_wait_command_requires_task_id_or_stdin() {
     init_aiki_repo(temp_dir.path());
 
     // Run task wait with explicit empty stdin
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "wait"])
         .stdin(std::process::Stdio::null())
@@ -626,7 +641,7 @@ fn test_wait_with_closed_task_exits_immediately() {
     aiki_task(temp_dir.path(), &["close", "--summary", "Done"]).success();
 
     // Get the task ID from closed tasks
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--closed"])
         .output()
@@ -653,7 +668,7 @@ fn test_wait_with_stopped_task_returns_error() {
     aiki_task(temp_dir.path(), &["stop", "--reason", "Blocked"]).success();
 
     // Get the task ID from stopped tasks
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--stopped"])
         .output()
@@ -683,7 +698,7 @@ fn test_wait_with_stopped_task_absorbed() {
     aiki_task(temp_dir.path(), &["stop", "--reason", "test"]).success();
 
     // Get the short task ID from stopped tasks
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--stopped"])
         .output()
@@ -692,7 +707,7 @@ fn test_wait_with_stopped_task_absorbed() {
     let short_id = extract_task_id(&stdout).expect("Should find stopped task ID");
 
     // Get the full 32-char task ID via show -o id
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "show", &short_id, "-o", "id"])
         .output()
@@ -891,7 +906,7 @@ fn test_task_run_sync_output_format() {
 
     aiki_task(temp_dir.path(), &["add", "Output format test"]).success();
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list"])
         .output()
@@ -901,7 +916,7 @@ fn test_task_run_sync_output_format() {
     let task_id = extract_task_id(&stdout).expect("Should find task ID");
 
     // Run async (to avoid hanging on agent spawn) and check markdown format
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["run", &task_id, "--async"])
         .output()
@@ -938,7 +953,7 @@ fn test_async_wait_conceptual_flow() {
     aiki_task(temp_dir.path(), &["add", "Async workflow test"]).success();
 
     // Get task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list"])
         .output()
@@ -948,7 +963,7 @@ fn test_async_wait_conceptual_flow() {
     let task_id = extract_task_id(&stdout).expect("Should find task ID");
 
     // 2. Verify top-level run --async is a valid command (recognized by parser)
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["run", &task_id, "--async"])
         .output()
@@ -981,7 +996,7 @@ fn test_async_wait_conceptual_flow() {
     .success();
 
     // Get the task ID from closed list
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--closed"])
         .output()
@@ -1002,7 +1017,7 @@ fn test_async_wait_conceptual_flow() {
 
 /// Helper to run aiki review command
 fn aiki_review(path: &std::path::Path, args: &[&str]) -> assert_cmd::assert::Assert {
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
+    let mut cmd = common::aiki_cmd();
     cmd.current_dir(path);
     cmd.arg("review");
     for arg in args {
@@ -1021,7 +1036,7 @@ fn test_review_fix_and_start_conflict() {
     // Add a task to use as review target
     aiki_task(temp_dir.path(), &["add", "Task to review"]).success();
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list"])
         .output()
@@ -1054,7 +1069,7 @@ fn test_review_fix_flag_accepted_by_parser() {
     aiki_task(temp_dir.path(), &["close", "--summary", "Done"]).success();
 
     // Get the closed task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--closed"])
         .output()
@@ -1064,7 +1079,7 @@ fn test_review_fix_flag_accepted_by_parser() {
 
     // Run review with --fix-template; it may succeed or fail, but should NOT
     // produce an "unexpected argument" error (which would indicate --fix-template isn't recognized)
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["review", &task_id, "--fix-template"])
         .output()
@@ -1087,7 +1102,7 @@ fn test_review_autorun_flag_accepted_by_parser() {
     // Add a task as review target
     aiki_task(temp_dir.path(), &["add", "Autorun review task"]).success();
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list"])
         .output()
@@ -1096,7 +1111,7 @@ fn test_review_autorun_flag_accepted_by_parser() {
     let task_id = extract_task_id(&stdout).expect("Should find task ID");
 
     // Run review with --autorun; should not produce a parser error
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["review", &task_id, "--autorun", "--start"])
         .output()
@@ -1133,7 +1148,7 @@ fn test_review_output_id_no_extra_output() {
     aiki_task(temp_dir.path(), &["close", "--summary", "Done"]).success();
 
     // Get the closed task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--closed"])
         .output()
@@ -1142,7 +1157,7 @@ fn test_review_output_id_no_extra_output() {
     let task_id = extract_task_id(&stdout).expect("Should find closed task ID");
 
     // Run review with --start -o id
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["review", &task_id, "--start", "-o", "id"])
         .output()
@@ -1204,7 +1219,7 @@ fn test_review_fix_output_id_no_extra_output() {
     aiki_task(temp_dir.path(), &["close", "--summary", "Done"]).success();
 
     // Get the closed task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--closed"])
         .output()
@@ -1213,7 +1228,7 @@ fn test_review_fix_output_id_no_extra_output() {
     let task_id = extract_task_id(&stdout).expect("Should find closed task ID");
 
     // Run review with --fix-template fix -o id
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["review", &task_id, "--fix-template", "fix", "-o", "id"])
         .output()
@@ -1261,7 +1276,7 @@ fn test_review_fix_output_id_no_extra_output() {
         // --- Fix-execution assertions ---
         // Verify the review task exists and is properly formed
         let review_id = trimmed;
-        let show_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+        let show_output = common::aiki_cmd()
             .current_dir(temp_dir.path())
             .args(["task", "show", review_id])
             .output()
@@ -1332,7 +1347,7 @@ fn test_async_review_fix_template_stores_fix_data() {
     aiki_task(temp_dir.path(), &["close", "--summary", "Done"]).success();
 
     // Get the closed task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--closed"])
         .output()
@@ -1341,7 +1356,7 @@ fn test_async_review_fix_template_stores_fix_data() {
     let task_id = extract_task_id(&stdout).expect("Should find closed task ID");
 
     // Run review with --fix-template fix --async -o id
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args([
             "review",
@@ -1443,7 +1458,7 @@ fn test_async_review_without_fix_template_no_fix_data() {
     aiki_task(temp_dir.path(), &["close", "--summary", "Done"]).success();
 
     // Get the closed task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--closed"])
         .output()
@@ -1452,7 +1467,7 @@ fn test_async_review_without_fix_template_no_fix_data() {
     let task_id = extract_task_id(&stdout).expect("Should find closed task ID");
 
     // Run review with --async but WITHOUT --fix-template
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["review", &task_id, "--async", "-o", "id"])
         .output()
@@ -1511,7 +1526,7 @@ fn test_continue_async_with_fix_template_flag_accepted() {
     // Call --_continue-async with --fix-template and a fake review ID.
     // The command will fail (review task doesn't exist), but the flags
     // should be recognized by the parser (no "unexpected argument" error).
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args([
             "review",
@@ -1543,7 +1558,7 @@ fn test_continue_async_without_fix_template_flag_accepted() {
     // Call --_continue-async without --fix-template and a fake review ID.
     // The command will fail (review task doesn't exist), but the flag
     // should be recognized by the parser.
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args([
             "review",
@@ -1586,7 +1601,7 @@ fn test_async_review_fix_template_custom_value_stored() {
     aiki_task(temp_dir.path(), &["close", "--summary", "Done"]).success();
 
     // Get the closed task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--closed"])
         .output()
@@ -1595,7 +1610,7 @@ fn test_async_review_fix_template_custom_value_stored() {
     let task_id = extract_task_id(&stdout).expect("Should find closed task ID");
 
     // Run review with a CUSTOM --fix-template value via --async
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args([
             "review",
@@ -1676,7 +1691,7 @@ fn test_blocking_review_fix_template_creates_review_with_fix_options() {
     aiki_task(temp_dir.path(), &["close", "--summary", "Done"]).success();
 
     // Get the closed task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--closed"])
         .output()
@@ -1687,7 +1702,7 @@ fn test_blocking_review_fix_template_creates_review_with_fix_options() {
     // Run blocking review with --fix-template fix
     // The command may fail at task_run if no agent is available, but the review
     // task is created and its data stored BEFORE task_run is called.
-    let _output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let _output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["review", &task_id, "--fix-template", "fix", "-o", "id"])
         .output()
@@ -1762,7 +1777,7 @@ fn test_blocking_review_issue_count_set_when_issues_exist() {
     aiki_task(temp_dir.path(), &["close", "--summary", "Done"]).success();
 
     // Get the closed task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--closed"])
         .output()
@@ -1771,7 +1786,7 @@ fn test_blocking_review_issue_count_set_when_issues_exist() {
     let task_id = extract_task_id(&stdout).expect("Should find closed task ID");
 
     // Create a review task using --start (assigns to current agent, no task_run)
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["review", &task_id, "--start", "-o", "id"])
         .output()
@@ -1872,7 +1887,7 @@ fn test_blocking_review_no_fix_template_no_fix_options() {
     aiki_task(temp_dir.path(), &["close", "--summary", "Done"]).success();
 
     // Get the closed task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--closed"])
         .output()
@@ -1881,7 +1896,7 @@ fn test_blocking_review_no_fix_template_no_fix_options() {
     let task_id = extract_task_id(&stdout).expect("Should find closed task ID");
 
     // Create a review task WITHOUT --fix-template using --start
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["review", &task_id, "--start", "-o", "id"])
         .output()
@@ -1967,7 +1982,7 @@ fn test_review_short_fix_flag_recognized() {
     aiki_task(temp_dir.path(), &["close", "--summary", "Done"]).success();
 
     // Get the closed task ID
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "list", "--closed"])
         .output()
@@ -1976,7 +1991,7 @@ fn test_review_short_fix_flag_recognized() {
     let task_id = extract_task_id(&stdout).expect("Should find closed task ID");
 
     // Run review with -f (short flag)
-    let short_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let short_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["review", &task_id, "-f"])
         .output()
@@ -1989,7 +2004,7 @@ fn test_review_short_fix_flag_recognized() {
     );
 
     // Run review with --fix (long flag)
-    let long_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let long_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["review", &task_id, "--fix"])
         .output()
@@ -2034,7 +2049,7 @@ fn test_build_short_review_flag_recognized() {
     .unwrap();
 
     // Run build with -r (short flag)
-    let short_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let short_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["build", "test-plan.md", "-r"])
         .output()
@@ -2047,7 +2062,7 @@ fn test_build_short_review_flag_recognized() {
     );
 
     // Run build with --review (long flag)
-    let long_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let long_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["build", "test-plan.md", "--review"])
         .output()
@@ -2091,7 +2106,7 @@ fn test_build_short_fix_flag_recognized() {
     .unwrap();
 
     // Run build with -f (short flag)
-    let short_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let short_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["build", "test-plan.md", "-f"])
         .output()
@@ -2104,7 +2119,7 @@ fn test_build_short_fix_flag_recognized() {
     );
 
     // Run build with --fix (long flag)
-    let long_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let long_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["build", "test-plan.md", "--fix"])
         .output()
@@ -2148,7 +2163,7 @@ fn test_build_combined_short_flags() {
     .unwrap();
 
     // Run build with -r -f (short flags)
-    let short_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let short_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["build", "test-plan.md", "-r", "-f"])
         .output()
@@ -2161,7 +2176,7 @@ fn test_build_combined_short_flags() {
     );
 
     // Run build with --review --fix (long flags)
-    let long_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let long_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["build", "test-plan.md", "--review", "--fix"])
         .output()
@@ -2199,7 +2214,7 @@ fn test_build_continue_async_flag() {
     init_aiki_repo(temp_dir.path());
 
     // Create a task to use as the continue target
-    let add_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let add_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Test build target"])
         .output()
@@ -2209,7 +2224,7 @@ fn test_build_continue_async_flag() {
     // Get the task ID from add output or list output
     let add_stdout = String::from_utf8_lossy(&add_output.stdout);
     let task_id = extract_task_id(&add_stdout).unwrap_or_else(|| {
-        let list_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+        let list_output = common::aiki_cmd()
             .current_dir(temp_dir.path())
             .args(["task", "list"])
             .output()
@@ -2219,7 +2234,7 @@ fn test_build_continue_async_flag() {
     });
 
     // Run build --_continue-async <task-id>
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["build", "--_continue-async", &task_id])
         .output()
@@ -2244,7 +2259,7 @@ fn test_build_continue_async_reads_json_payload() {
     init_aiki_repo(temp_dir.path());
 
     // Create a task to get a valid-format task ID
-    let add_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let add_output = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["task", "add", "Test build target"])
         .output()
@@ -2253,7 +2268,7 @@ fn test_build_continue_async_reads_json_payload() {
 
     let add_stdout = String::from_utf8_lossy(&add_output.stdout);
     let task_id = extract_task_id(&add_stdout).unwrap_or_else(|| {
-        let list_output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+        let list_output = common::aiki_cmd()
             .current_dir(temp_dir.path())
             .args(["task", "list"])
             .output()
@@ -2286,7 +2301,7 @@ fn test_build_continue_async_reads_json_payload() {
     });
 
     // Spawn with piped stdin so we can write JSON
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let mut child = common::aiki_cmd()
         .current_dir(temp_dir.path())
         .args(["build", "--_continue-async", &task_id])
         .stdin(std::process::Stdio::piped())

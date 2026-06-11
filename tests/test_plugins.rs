@@ -403,7 +403,9 @@ fn test_plugin_remove_with_dot_in_namespace() {
         .stderr(predicate::str::contains("Only GitHub plugins"));
 }
 
-/// Outside-repo `plugin list` reports no project plugin references.
+/// Outside-repo `plugin list` falls back to the installed-plugin view; in a
+/// dependency cycle every plugin is someone's dependency, so all of them
+/// must still appear as top-level entries.
 #[test]
 fn test_plugin_list_outside_repo_cycle_shows_all_top_level() {
     use std::process::Command;
@@ -427,13 +429,20 @@ fn test_plugin_list_outside_repo_cycle_shows_all_top_level() {
     assert!(output.status.success(), "plugin list should succeed");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("No plugin references found in project."),
-        "expected outside-repo plugin list message, got: {}",
+        stdout.contains("Installed ("),
+        "expected installed-plugin listing, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\n  ns/alpha") && stdout.contains("\n  ns/beta"),
+        "cycle members must both stay top-level, got: {}",
         stdout
     );
 }
 
-/// Outside-repo `plugin list` reports no project plugin references.
+/// Outside-repo `plugin list` falls back to the installed-plugin view;
+/// plugins that are dependencies of a root are nested under it, not listed
+/// as top-level entries.
 #[test]
 fn test_plugin_list_outside_repo_hides_deps_of_roots() {
     use std::process::Command;
@@ -456,8 +465,18 @@ fn test_plugin_list_outside_repo_hides_deps_of_roots() {
     assert!(output.status.success(), "plugin list should succeed");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("No plugin references found in project."),
-        "expected outside-repo plugin list message, got: {}",
+        stdout.contains("\n  ns/root"),
+        "root must be a top-level entry, got: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("\n  ns/dep"),
+        "dep must not be a top-level entry, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("(dependency)"),
+        "dep should appear nested as a dependency, got: {}",
         stdout
     );
 }

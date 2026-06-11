@@ -40,8 +40,7 @@ fn init_git_repo(path: &std::path::Path) {
 fn init_aiki_repo(path: &std::path::Path) {
     init_git_repo(path);
 
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
-    common::hermetic_env(&mut cmd);
+    let mut cmd = common::aiki_cmd();
     let output = cmd
         .current_dir(path)
         .arg("init")
@@ -58,7 +57,7 @@ fn init_aiki_repo(path: &std::path::Path) {
 
 /// Helper to run aiki task command and return Assert
 fn aiki_task(path: &std::path::Path, args: &[&str]) -> assert_cmd::assert::Assert {
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
+    let mut cmd = common::aiki_cmd();
     cmd.current_dir(path);
     cmd.arg("task");
     for arg in args {
@@ -69,7 +68,7 @@ fn aiki_task(path: &std::path::Path, args: &[&str]) -> assert_cmd::assert::Asser
 
 /// Helper to run aiki task command and return raw output
 fn aiki_task_output(path: &std::path::Path, args: &[&str]) -> String {
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("aiki"))
+    let output = common::aiki_cmd()
         .current_dir(path)
         .arg("task")
         .args(args)

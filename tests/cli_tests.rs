@@ -217,9 +217,15 @@ fn test_init_with_existing_jj() {
     cmd.arg("init");
     common::hermetic_env(&mut cmd);
 
+    // Init has since learned to distinguish colocated from non-colocated
+    // workspaces: a jj workspace built on the user's external .git is not
+    // the non-colocated layout aiki prefers, so init warns (and suggests
+    // re-initializing) but still completes successfully.
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("✓ Found existing JJ repository"))
+        .stdout(predicate::str::contains(
+            "⚠ JJ workspace exists but is not non-colocated",
+        ))
         .stdout(predicate::str::contains(
             "✓ Repository initialized successfully",
         ));

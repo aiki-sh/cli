@@ -513,10 +513,10 @@ fn fix8_build_summary_renders_stats() {
         lines.iter().any(|l| l.text.contains("build completed")),
         "Should have 'build completed' in output"
     );
-    // Should contain the hint
+    // Should contain the hint (context-dependent tip suggests `aiki review`)
     assert!(
-        lines.iter().any(|l| l.text.contains("aiki task diff")),
-        "Should have diff hint"
+        lines.iter().any(|l| l.text.contains("aiki review")),
+        "Should have review hint"
     );
 }
 
