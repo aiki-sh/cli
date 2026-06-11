@@ -273,14 +273,16 @@ pub(crate) fn build_spawn_env(options: &AgentSpawnOptions, mode: &str) -> Vec<(S
 }
 
 /// Get the appropriate runtime for an agent type
+///
+/// Resolution goes through the harness registry. Harnesses without a wired
+/// runtime (Cursor, Gemini) and runtime construction failures (e.g. the CLI
+/// binary is not on PATH) both yield `None` — callers pre-check
+/// `is_installed()` and map `None` to `AgentNotInstalled`.
 #[must_use]
 pub fn get_runtime(agent_type: AgentType) -> Option<Box<dyn AgentRuntime>> {
-    match agent_type {
-        AgentType::ClaudeCode => Some(Box::new(ClaudeCodeRuntime::new())),
-        AgentType::Codex => Some(Box::new(CodexRuntime::new())),
-        // Other agent types not yet supported for task execution
-        AgentType::Cursor | AgentType::Gemini | AgentType::Unknown => None,
-    }
+    crate::harnesses::lookup_by_agent_type(&agent_type)
+        .and_then(|harness| harness.runtime())
+        .and_then(|runtime| runtime.ok())
 }
 
 /// Poll session state until a thread-bound session is registered.
@@ -350,11 +352,35 @@ mod tests {
 
     #[test]
     fn test_get_runtime() {
-        assert!(get_runtime(AgentType::ClaudeCode).is_some());
-        assert!(get_runtime(AgentType::Codex).is_some());
+        // Cursor and Gemini have no runtime config, so they always return None.
         assert!(get_runtime(AgentType::Cursor).is_none());
         assert!(get_runtime(AgentType::Gemini).is_none());
         assert!(get_runtime(AgentType::Unknown).is_none());
+        // Claude Code and Codex are wired; resolution depends on the binary
+        // being on PATH.
+        if which::which("claude").is_ok() {
+            assert!(get_runtime(AgentType::ClaudeCode).is_some());
+        }
+        if which::which("codex").is_ok() {
+            assert!(get_runtime(AgentType::Codex).is_some());
+        }
+    }
+
+    #[test]
+    fn get_runtime_dispatch() {
+        // Cursor and Gemini have no runtime config; resolution returns None
+        // regardless of whether their binary is on PATH.
+        assert!(get_runtime(AgentType::Cursor).is_none());
+        assert!(get_runtime(AgentType::Gemini).is_none());
+
+        // ClaudeCode / Codex use the generic CliAgentRuntime; resolution
+        // succeeds only when the binary is installed.
+        if which::which("claude").is_ok() {
+            assert!(get_runtime(AgentType::ClaudeCode).is_some());
+        }
+        if which::which("codex").is_ok() {
+            assert!(get_runtime(AgentType::Codex).is_some());
+        }
     }
 
     /// 6a: task_prompt contains thread display, expected keywords
