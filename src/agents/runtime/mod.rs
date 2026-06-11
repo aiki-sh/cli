@@ -96,6 +96,16 @@ impl MonitoredChild {
     }
 }
 
+/// Test-only access to the underlying child: `MonitoredChild` has no Drop
+/// impl and no reap-on-drop contract, so lifecycle tests need an explicit
+/// kill for cleanup.
+#[cfg(test)]
+impl MonitoredChild {
+    pub(crate) fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+}
+
 /// Result of an agent session
 #[derive(Debug, Clone)]
 pub enum AgentSessionResult {

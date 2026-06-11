@@ -239,4 +239,177 @@ mod tests {
         // through `which` and the harness wiring is complete.
         CliAgentRuntime::from_harness(def).expect("sh should resolve via which");
     }
+
+    // ── Spawn lifecycle tests against fake binaries (B4/B5) ──
+
+    #[cfg(unix)]
+    fn write_fake_binary(dir: &std::path::Path, name: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// Build a runtime directly around an absolute fake-binary path,
+    /// bypassing the registry: these tests exercise spawn lifecycle, not
+    /// harness resolution.
+    #[cfg(unix)]
+    fn fake_runtime(
+        binary: PathBuf,
+        args_fn: fn(&AgentSpawnOptions) -> CliArgs,
+    ) -> CliAgentRuntime {
+        CliAgentRuntime {
+            binary,
+            args_fn,
+            env_fn: None,
+            agent_type: AgentType::Unknown,
+            label: "fake",
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_options(dir: &std::path::Path) -> AgentSpawnOptions {
+        use crate::tasks::lanes::ThreadId;
+        AgentSpawnOptions::new(dir, ThreadId::single("task123".to_string()))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spawn_blocking_passes_args_and_returns_completed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = write_fake_binary(
+            tmp.path(),
+            "fake-agent",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/argv.txt\"\nprintenv AIKI_THREAD > \"$(dirname \"$0\")/thread.txt\"\necho \"did the work\"\n",
+        );
+        fn args(_: &AgentSpawnOptions) -> CliArgs {
+            let mut a = CliArgs::new();
+            a.push("--alpha");
+            a.push("--beta");
+            a
+        }
+        let runtime = fake_runtime(bin, args);
+        let result = runtime
+            .spawn_blocking(&fake_options(tmp.path()))
+            .expect("spawn_blocking should not error");
+
+        match result {
+            AgentSessionResult::Completed { summary } => {
+                assert!(
+                    summary.contains("did the work"),
+                    "summary should carry stdout, got: {summary}"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        let argv = std::fs::read_to_string(tmp.path().join("argv.txt")).unwrap();
+        assert_eq!(argv, "--alpha\n--beta\n", "argv order must match args fn");
+        let thread = std::fs::read_to_string(tmp.path().join("thread.txt")).unwrap();
+        assert_eq!(thread.trim(), "task123", "AIKI_THREAD must reach the child");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spawn_blocking_maps_failure_exit_to_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = write_fake_binary(
+            tmp.path(),
+            "fake-agent",
+            "#!/bin/sh\necho \"boom\" >&2\nexit 3\n",
+        );
+        fn args(_: &AgentSpawnOptions) -> CliArgs {
+            CliArgs::new()
+        }
+        let runtime = fake_runtime(bin, args);
+        let result = runtime
+            .spawn_blocking(&fake_options(tmp.path()))
+            .expect("spawn_blocking should not error");
+        match result {
+            AgentSessionResult::Failed { error } => {
+                assert!(error.contains("boom"), "stderr should surface, got: {error}");
+                assert!(error.contains("3"), "exit code should surface, got: {error}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spawn_background_detaches_and_runs_the_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = write_fake_binary(
+            tmp.path(),
+            "fake-agent",
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/ran.marker\"\n",
+        );
+        fn args(_: &AgentSpawnOptions) -> CliArgs {
+            CliArgs::new()
+        }
+        let runtime = fake_runtime(bin, args);
+        let handle = runtime
+            .spawn_background(&fake_options(tmp.path()))
+            .expect("spawn_background should succeed");
+        assert_eq!(handle.thread.head, "task123");
+        assert_eq!(handle.agent_type, AgentType::Unknown);
+        assert!(handle.session_id.is_none());
+
+        // The child is detached (no Child handle), so prove execution via a
+        // marker file with a generous timeout.
+        let marker = tmp.path().join("ran.marker");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detached child never ran (no marker file)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spawn_monitored_try_wait_then_kill_then_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = write_fake_binary(tmp.path(), "fake-agent", "#!/bin/sh\nsleep 30\n");
+        fn args(_: &AgentSpawnOptions) -> CliArgs {
+            CliArgs::new()
+        }
+        let runtime = fake_runtime(bin, args);
+        let mut child = runtime
+            .spawn_monitored(&fake_options(tmp.path()))
+            .expect("spawn_monitored should succeed");
+
+        // Still running: try_wait must report None without blocking.
+        assert!(
+            child.try_wait().expect("try_wait should not error").is_none(),
+            "child should still be running"
+        );
+
+        // Explicit kill-based cleanup, then wait() must reap it.
+        child.kill().expect("kill should succeed");
+        let status = child.wait().expect("wait should reap the child");
+        assert!(!status.success(), "killed child must not report success");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spawn_monitored_wait_reaps_completed_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = write_fake_binary(tmp.path(), "fake-agent", "#!/bin/sh\nexit 0\n");
+        fn args(_: &AgentSpawnOptions) -> CliArgs {
+            CliArgs::new()
+        }
+        let runtime = fake_runtime(bin, args);
+        let mut child = runtime
+            .spawn_monitored(&fake_options(tmp.path()))
+            .expect("spawn_monitored should succeed");
+        let status = child.wait().expect("wait should reap the child");
+        assert!(status.success(), "clean exit should report success");
+        // After reaping, try_wait keeps returning the status without error.
+        let again = child.try_wait().expect("try_wait after reap should not error");
+        assert!(again.is_some(), "reaped child should keep reporting an exit status");
+    }
 }
