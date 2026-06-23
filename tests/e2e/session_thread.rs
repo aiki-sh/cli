@@ -59,8 +59,7 @@ fn e2e_claude_session_detected_with_thread() {
     );
 
     // Run with AIKI_THREAD set
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let output = crate::common::e2e_aiki_agent(repo)
         .current_dir(repo)
         .env("AIKI_THREAD", "test-thread-claude-123")
         .args(["run", &task_id])
@@ -107,8 +106,7 @@ fn e2e_codex_session_detected_with_thread() {
     );
 
     // Run with AIKI_THREAD set — Codex path uses find_session_by_agent_type
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let output = crate::common::e2e_aiki_agent(repo)
         .current_dir(repo)
         .env("AIKI_THREAD", "test-thread-codex-456")
         .args(["run", &task_id, "--agent", "codex"])
@@ -150,8 +148,7 @@ fn run_unmatched_thread_test(agent_args: &[&str]) {
     let mut args = vec!["run", &task_id];
     args.extend_from_slice(agent_args);
 
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let output = crate::common::e2e_aiki_agent(repo)
         .current_dir(repo)
         .env("AIKI_THREAD", "nonexistent-thread-999")
         .args(&args)

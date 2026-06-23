@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Shared hermetic home for every `aiki` spawned through [`aiki_cmd`].
@@ -110,6 +110,70 @@ fn hermetic_env_vars() -> Vec<(&'static str, std::ffi::OsString)> {
     ];
     std::mem::forget(dir);
     vars
+}
+
+/// Derive one stable hermetic global home for an e2e test from its repo dir.
+///
+/// The home lives *beside* the repo temp dir (never inside it, so it can't
+/// leak into jj/git history assertions) and is keyed to the repo's unique
+/// tempdir name, so every `aiki` invocation in a single test resolves the
+/// SAME `AIKI_HOME`. That isolates each test's global aiki state from the
+/// developer's real `~/.aiki` and from other tests running in parallel —
+/// concurrent writes to one shared global conversation repo serialize behind
+/// a single write lock and were timing out session discovery.
+///
+/// Returns `(aiki_home, home, xdg_config_home)`.
+fn e2e_home_dirs(repo: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let name = repo
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("e2e");
+    let base = repo.with_file_name(format!("{name}-aiki-home"));
+    let aiki_home = base.join("aiki");
+    let home = base.join("home");
+    let config = home.join(".config");
+    std::fs::create_dir_all(&aiki_home).expect("create e2e aiki home");
+    std::fs::create_dir_all(&config).expect("create e2e config dir");
+    let gitconfig = home.join(".gitconfig");
+    if !gitconfig.exists() {
+        std::fs::write(
+            &gitconfig,
+            "[user]\n\tname = Aiki Test\n\temail = test@example.com\n",
+        )
+        .expect("write e2e gitconfig");
+    }
+    (aiki_home, home, config)
+}
+
+/// `aiki` command for pure-aiki e2e steps (`init`, `task add/set/close/start/
+/// list/show`, `task diff`): fully hermetic `AIKI_HOME` + `HOME` so it never
+/// reads or writes the developer's real global state. Shares one `AIKI_HOME`
+/// per test via [`e2e_home_dirs`]. PATH is inherited so real `jj`/`git`
+/// resolve, but these commands never spawn a live agent.
+pub fn e2e_aiki(repo: &Path) -> assert_cmd::Command {
+    let (aiki_home, home, config) = e2e_home_dirs(repo);
+    let mut cmd = assert_cmd::Command::cargo_bin("aiki").unwrap();
+    cmd.env("AIKI_HOME", aiki_home)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", config)
+        .env("JJ_USER", "Aiki Test")
+        .env("JJ_EMAIL", "test@example.com");
+    cmd
+}
+
+/// `aiki` command for e2e steps that spawn a LIVE agent (`run`, `build`,
+/// `review`, `loop`): hermetic `AIKI_HOME` (the same per-test dir as
+/// [`e2e_aiki`]) but the REAL `HOME`/PATH, so `claude`/`codex` find their
+/// credentials and the developer's installed agent hooks. The spawned agent
+/// inherits `AIKI_HOME`, so its hooks record `session.started` into the
+/// test's isolated global dir — exactly where `discover_session_id` polls.
+pub fn e2e_aiki_agent(repo: &Path) -> assert_cmd::Command {
+    let (aiki_home, _home, _config) = e2e_home_dirs(repo);
+    let mut cmd = assert_cmd::Command::cargo_bin("aiki").unwrap();
+    cmd.env("AIKI_HOME", aiki_home)
+        .env("JJ_USER", "Aiki Test")
+        .env("JJ_EMAIL", "test@example.com");
+    cmd
 }
 
 /// Check if jj binary is available in PATH

@@ -26,8 +26,7 @@ fn strip_ansi(s: &str) -> String {
 /// Helper: close a task with a summary
 #[allow(dead_code)]
 fn close_task(repo_path: &Path, task_id: &str, summary: &str) {
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let output = crate::common::e2e_aiki(repo_path)
         .current_dir(repo_path)
         .args([
             "task", "close", task_id, "--confidence", "3", "--summary", summary,
@@ -44,8 +43,7 @@ fn close_task(repo_path: &Path, task_id: &str, summary: &str) {
 
 /// Helper: start a task by ID and return stdout
 fn start_task(repo_path: &Path, task_id: &str) -> String {
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let output = crate::common::e2e_aiki(repo_path)
         .current_dir(repo_path)
         .args(["task", "start", task_id])
         .output()
@@ -62,8 +60,7 @@ fn start_task(repo_path: &Path, task_id: &str) -> String {
 
 /// Helper: get task list output
 fn get_task_list(repo_path: &Path) -> String {
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let output = crate::common::e2e_aiki(repo_path)
         .current_dir(repo_path)
         .args(["task", "list"])
         .output()
@@ -91,16 +88,14 @@ fn e2e_start_by_id_shows_subtask_listing() {
     // Create parent with subtasks
     let parent_id = create_task(repo, "Parent task");
 
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let output = crate::common::e2e_aiki(repo)
         .current_dir(repo)
         .args(["task", "add", "--subtask-of", &parent_id, "Subtask A"])
         .output()
         .unwrap();
     assert!(output.status.success());
 
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let output = crate::common::e2e_aiki(repo)
         .current_dir(repo)
         .args(["task", "add", "--subtask-of", &parent_id, "Subtask B"])
         .output()
@@ -143,8 +138,7 @@ fn e2e_start_quickstart_does_not_show_subtasks() {
     init_aiki_repo(repo);
 
     // Quick-start (pass description, not ID)
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let output = crate::common::e2e_aiki(repo)
         .current_dir(repo)
         .args(["task", "start", "Quick task"])
         .output()
@@ -174,8 +168,7 @@ fn e2e_subtasks_visible_in_ready_queue_when_parent_in_progress() {
     // Create parent with subtasks
     let parent_id = create_task(repo, "Parent with children");
 
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let output = crate::common::e2e_aiki(repo)
         .current_dir(repo)
         .args(["task", "add", "--subtask-of", &parent_id, "Child A"])
         .output()
@@ -234,8 +227,7 @@ fn run_build_and_review(reviewer: &str) {
     .unwrap();
 
     // Build the plan — creates an epic with subtasks and implements them
-    let build_output = Command::cargo_bin("aiki")
-        .unwrap()
+    let build_output = crate::common::e2e_aiki_agent(repo)
         .current_dir(repo)
         .args(["build", "ops/now/e2e-greeting.md"])
         .timeout(Duration::from_secs(600))
@@ -290,8 +282,7 @@ fn run_build_and_review(reviewer: &str) {
     eprintln!("Epic ID: {epic_id}");
 
     // Review the epic with the specified agent
-    let review_output = Command::cargo_bin("aiki")
-        .unwrap()
+    let review_output = crate::common::e2e_aiki_agent(repo)
         .current_dir(repo)
         .args(["review", &epic_id, "--agent", reviewer])
         .timeout(Duration::from_secs(300))
@@ -366,8 +357,7 @@ fn run_session_ends_on_close(agent_args: &[&str]) {
     let mut args = vec!["run", &task_id];
     args.extend_from_slice(agent_args);
 
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let output = crate::common::e2e_aiki_agent(repo)
         .current_dir(repo)
         .args(&args)
         .timeout(Duration::from_secs(180))
@@ -435,8 +425,7 @@ fn run_loop_exits_cleanly(agent: &str, agent_flag: &str) {
     // Create parent with 2 subtasks
     let parent_id = create_task(repo, "Loop test parent");
 
-    let sub1 = Command::cargo_bin("aiki")
-        .unwrap()
+    let sub1 = crate::common::e2e_aiki(repo)
         .current_dir(repo)
         .args([
             "task",
@@ -452,8 +441,7 @@ fn run_loop_exits_cleanly(agent: &str, agent_flag: &str) {
         .expect("Failed to add subtask 1");
     assert!(sub1.status.success());
 
-    let sub2 = Command::cargo_bin("aiki")
-        .unwrap()
+    let sub2 = crate::common::e2e_aiki(repo)
         .current_dir(repo)
         .args([
             "task",
@@ -473,8 +461,7 @@ fn run_loop_exits_cleanly(agent: &str, agent_flag: &str) {
     start_task(repo, &parent_id);
 
     // Run loop with the specified agent
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let output = crate::common::e2e_aiki_agent(repo)
         .current_dir(repo)
         .args(["loop", &parent_id, agent_flag])
         .timeout(Duration::from_secs(180))
@@ -570,8 +557,7 @@ fn e2e_codex_build_absorbs_changes() {
     .unwrap();
 
     // Build with codex as the agent
-    let build_output = Command::cargo_bin("aiki")
-        .unwrap()
+    let build_output = crate::common::e2e_aiki_agent(repo)
         .current_dir(repo)
         .args(["build", "ops/now/e2e-greeting.md", "--codex"])
         .timeout(Duration::from_secs(600))

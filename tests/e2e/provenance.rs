@@ -126,8 +126,7 @@ fn run_task_diff_test(agent: &str) {
         "Task not closed"
     );
 
-    let output = assert_cmd::Command::cargo_bin("aiki")
-        .unwrap()
+    let output = crate::common::e2e_aiki(repo)
         .current_dir(repo)
         .args(["task", "diff", &task_id, "--name-only"])
         .output()

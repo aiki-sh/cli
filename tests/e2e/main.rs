@@ -8,6 +8,15 @@
 //!
 //! Run all e2e tests:  `cargo test --test e2e -- --ignored`
 //! Run one suite:      `cargo test --test e2e -- --ignored provenance`
+//!
+//! Isolation: every `aiki` invocation in a test MUST go through
+//! [`common::e2e_aiki`] (pure-aiki steps) or [`common::e2e_aiki_agent`]
+//! (steps that spawn a live agent). These share one hermetic `AIKI_HOME` per
+//! test so concurrent runs never share or pollute the developer's real
+//! `~/.aiki` — a shared global conversation repo serializes writes behind one
+//! lock and was timing out `discover_session_id`. Do NOT call
+//! `Command::cargo_bin("aiki")` directly here; it would resolve the real
+//! `~/.aiki` and reintroduce that flake.
 
 mod provenance;
 mod session_thread;
@@ -16,7 +25,6 @@ mod task_lifecycle;
 #[path = "../common/mod.rs"]
 mod common;
 
-use assert_cmd::Command;
 use std::path::Path;
 use std::process;
 use std::time::{Duration, Instant};
@@ -53,9 +61,7 @@ pub fn init_git_repo(path: &Path) {
 pub fn init_aiki_repo(repo_path: &Path) {
     init_git_repo(repo_path);
 
-    let mut cmd = Command::cargo_bin("aiki").unwrap();
-    common::hermetic_env_assert(&mut cmd);
-    let output = cmd
+    let output = common::e2e_aiki(repo_path)
         .current_dir(repo_path)
         .arg("init")
         .output()
@@ -70,8 +76,7 @@ pub fn init_aiki_repo(repo_path: &Path) {
 
 /// Run `aiki task add` and return the 32-char task ID
 pub fn create_task(repo_path: &Path, description: &str) -> String {
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let output = common::e2e_aiki(repo_path)
         .current_dir(repo_path)
         .args(["task", "add", description])
         .output()
@@ -94,8 +99,7 @@ pub fn create_task(repo_path: &Path, description: &str) -> String {
 
 /// Set instructions on a task
 pub fn set_task_instructions(repo_path: &Path, task_id: &str, instructions: &str) {
-    let output = Command::cargo_bin("aiki")
-        .unwrap()
+    let output = common::e2e_aiki(repo_path)
         .current_dir(repo_path)
         .args(["task", "set", task_id, "--instructions"])
         .write_stdin(instructions)
@@ -111,8 +115,7 @@ pub fn set_task_instructions(repo_path: &Path, task_id: &str, instructions: &str
 
 /// Run `aiki run <task-id>` synchronously, returns (success, stdout, stderr)
 pub fn aiki_run(repo_path: &Path, task_id: &str, timeout: Duration) -> (bool, String, String) {
-    let child = Command::cargo_bin("aiki")
-        .unwrap()
+    let child = common::e2e_aiki_agent(repo_path)
         .current_dir(repo_path)
         .args(["run", task_id])
         .timeout(timeout)
@@ -217,8 +220,7 @@ pub fn file_in_jj_history(repo_path: &Path, filename: &str) -> bool {
 pub fn wait_for_task_closed(repo_path: &Path, task_id: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        let output = Command::cargo_bin("aiki")
-            .unwrap()
+        let output = common::e2e_aiki(repo_path)
             .current_dir(repo_path)
             .args(["task", "show", task_id])
             .output()
