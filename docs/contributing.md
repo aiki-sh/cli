@@ -7,8 +7,8 @@ This guide covers everything you need to develop Aiki itself — the CLI, core f
 ### Build from source
 
 ```bash
-git clone https://github.com/glasner/aiki.git
-cd aiki/cli
+git clone https://github.com/aiki-sh/cli.git
+cd cli
 cargo build
 cargo test
 ```

@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
 description = "AI-native task tracking and agent orchestration CLI"
-homepage = "https://github.com/glasner/aiki"
-repository = "https://github.com/glasner/aiki"
+homepage = "https://github.com/aiki-sh/cli"
+repository = "https://github.com/aiki-sh/cli"
 
 [lib]
 name = "aiki"
