@@ -22,13 +22,13 @@ use std::fs;
 use crate::error::{AikiError, Result};
 use crate::plugins::manifest::resolve_display_name;
 
-/// Reserved namespace that maps to the `glasner` GitHub owner.
+/// Reserved namespace that maps to the `aiki-sh` GitHub owner.
 const AIKI_NAMESPACE: &str = "aiki";
-const AIKI_GITHUB_OWNER: &str = "glasner";
+const AIKI_GITHUB_OWNER: &str = "aiki-sh";
 
 /// A validated plugin reference in `namespace/name` format.
 ///
-/// The namespace maps to a GitHub owner (with `aiki` aliased to `glasner`).
+/// The namespace maps to a GitHub owner (with `aiki` aliased to `aiki-sh`).
 /// The name maps to a GitHub repository.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PluginRef {
@@ -39,7 +39,7 @@ pub struct PluginRef {
 impl PluginRef {
     /// Returns the GitHub HTTPS clone URL for this plugin.
     ///
-    /// The `aiki` namespace is aliased to the `glasner` GitHub owner.
+    /// The `aiki` namespace is aliased to the `aiki-sh` GitHub owner.
     #[must_use]
     pub fn github_url(&self) -> String {
         let owner = if self.namespace == AIKI_NAMESPACE {
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn test_github_url_aiki_namespace() {
         let r: PluginRef = "aiki/way".parse().unwrap();
-        assert_eq!(r.github_url(), "https://github.com/glasner/way.git");
+        assert_eq!(r.github_url(), "https://github.com/aiki-sh/way.git");
     }
 
     #[test]

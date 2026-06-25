@@ -2050,7 +2050,7 @@ Review the changes."#;
 
         let template = load_template("loop", temp_dir.path()).unwrap();
         assert_eq!(template.name, "loop");
-        assert_eq!(template.version, Some("2.0.0".to_string()));
+        assert_eq!(template.version, Some("2.1.0".to_string()));
         assert_eq!(
             template.defaults.task_type,
             Some("orchestrator".to_string())

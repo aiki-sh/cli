@@ -24,6 +24,20 @@ pub fn build_command_output(response: HookResult, event_type: &str) -> HookComma
     }
 }
 
+/// Build the "aiki not active" SessionStart output for Codex.
+///
+/// Codex exposes only the agent-visible `additionalContext` channel (no
+/// user-facing banner equivalent), so the dormancy notice rides there.
+pub fn build_not_active_output(reason: crate::editors::NotActiveReason) -> HookCommandOutput {
+    let json_value = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": reason.agent_context()
+        }
+    });
+    HookCommandOutput::new(Some(json_value), 0)
+}
+
 /// Build SessionStart command output for Codex
 ///
 /// Emit the published schema shape with `hookSpecificOutput.additionalContext`.

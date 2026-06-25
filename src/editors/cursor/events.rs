@@ -183,12 +183,9 @@ struct SessionEndPayload {
 // Event Building
 // ============================================================================
 
-/// Build AikiEvent from Cursor event read from stdin
-pub fn build_aiki_event_from_stdin() -> Result<AikiEvent> {
-    // Parse event - serde discriminates by eventName
-    let event: CursorEvent = super::super::read_stdin_json()?;
-
-    let aiki_event = match event {
+/// Map a parsed Cursor event to its AikiEvent.
+fn cursor_event_to_aiki(event: CursorEvent) -> AikiEvent {
+    match event {
         CursorEvent::BeforeSubmitPrompt { payload } => build_turn_started_event(payload),
         CursorEvent::BeforeShellExecution { payload } => {
             build_shell_permission_asked_event(payload)
@@ -199,9 +196,20 @@ pub fn build_aiki_event_from_stdin() -> Result<AikiEvent> {
         CursorEvent::AfterFileEdit { payload } => build_change_completed_event(payload),
         CursorEvent::Stop { payload } => build_turn_completed_event(payload),
         CursorEvent::SessionEnd { payload } => build_session_ended_event(payload),
-    };
+    }
+}
 
-    Ok(aiki_event)
+/// Build AikiEvent from Cursor event read from stdin
+pub fn build_aiki_event_from_stdin() -> Result<AikiEvent> {
+    // Parse event - serde discriminates by eventName
+    let event: CursorEvent = super::super::read_stdin_json()?;
+    Ok(cursor_event_to_aiki(event))
+}
+
+/// Build AikiEvent from a pre-read Cursor payload buffer (the stdin-once path).
+pub fn build_aiki_event_from_json(payload: &[u8]) -> Result<AikiEvent> {
+    let event: CursorEvent = serde_json::from_slice(payload).map_err(anyhow::Error::from)?;
+    Ok(cursor_event_to_aiki(event))
 }
 
 /// Build turn.started event from beforeSubmitPrompt payload

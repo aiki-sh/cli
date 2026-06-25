@@ -1,9 +1,13 @@
 pub mod detector;
 pub mod id;
+pub mod init_state;
 
 // Re-export commonly used items for convenience
 pub use detector::RepoDetector;
 pub use id::{compute_repo_id, ensure_repo_id};
+pub use init_state::{
+    enabled_repo_roots, find_aiki_root, init_state, marker_path, reap_stale_markers, InitState,
+};
 
 /// Get the repository folder name from a working directory.
 ///

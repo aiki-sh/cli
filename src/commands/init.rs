@@ -98,6 +98,29 @@ include:
 #   # Fires when a task is closed
 #   # Use for: notifications, triggering follow-up work
 #
+# --- Workflow Lifecycle ---
+#
+# Emitted by aiki's own orchestration commands (build, fix, loop, review),
+# not the editor. Neutral signals: plugins map them to external surfaces (the
+# aiki-sh/herdr plugin shows a running workflow as an agent row).
+#
+# workflow.started:
+#   # Fires when an aiki workflow command begins (brackets the whole run)
+#   # Vars: {{event.workflow.name}}
+#   # Use for: surfacing the workflow as an external "agent" or progress signal
+#
+# workflow.completed:
+#   # Fires when an aiki workflow command ends (success, error, or unwind)
+#   # Vars: {{event.workflow.name}}, {{event.workflow.success}}
+#
+# step.started:
+#   # Fires when a single step within a workflow begins (decompose, loop, ...)
+#   # Vars: {{event.step.name}}
+#
+# step.completed:
+#   # Fires when a workflow step ends (success or error)
+#   # Vars: {{event.step.name}}, {{event.step.success}}
+#
 # --- Other Events ---
 #
 # commit.message_started:
@@ -115,6 +138,13 @@ include:
 
 pub fn run(quiet: bool) -> Result<()> {
     prerequisites::check_prerequisites(quiet)?;
+
+    // Lazy reaper: clean per-user markers whose repos are gone (a teammate ran
+    // `aiki remove --shared`, or the repo was deleted). Best-effort, cheap.
+    let reaped = repos::reap_stale_markers();
+    if reaped > 0 && !quiet {
+        println!("✓ Reaped {reaped} stale aiki marker(s)");
+    }
 
     // Get current directory
     let current_dir = env::current_dir().context("Failed to get current directory")?;
@@ -155,6 +185,11 @@ pub fn run(quiet: bool) -> Result<()> {
 
             // Ensure instruction files exist even on re-init
             instructions::ensure_instruction_files(&repo_root, quiet)?;
+
+            // Opt this user into aiki for this repo (idempotent). On a legacy
+            // repo being upgraded to init-v2, this is where a previously
+            // auto-init'd user gets their explicit per-user marker.
+            ensure_enable_marker(&repo_root, quiet)?;
 
             if quiet {
                 // Silent success for auto mode
@@ -354,6 +389,11 @@ pub fn run(quiet: bool) -> Result<()> {
     }
     instructions::ensure_instruction_files(&repo_root, quiet)?;
 
+    // Record this user's explicit opt-in for this repo. The per-user marker is
+    // what distinguishes an Active repo from a cloned-but-not-enabled (Dormant)
+    // one — see ops/now/init-v2.md.
+    ensure_enable_marker(&repo_root, quiet)?;
+
     // Sync built-in templates
     if !quiet {
         println!("\nSyncing built-in templates...");
@@ -383,6 +423,10 @@ pub fn run(quiet: bool) -> Result<()> {
         }
     }
 
+    // Attribute the scaffolding we just created to Aiki (first-run provenance).
+    // Last, so every artifact above is part of the attributed change.
+    record_init_provenance(&repo_root, quiet);
+
     if !quiet {
         println!("\n✓ Repository initialized successfully!");
         println!("\nYour AI changes will now be tracked automatically.");
@@ -390,6 +434,89 @@ pub fn run(quiet: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Create the per-user enable marker recording that this user has opted into
+/// aiki for `repo_root`. Existence is the signal; the file contents are unused.
+///
+/// **Marker creation is reserved for `aiki init`.** Not `aiki doctor --fix`,
+/// not the lazy reaper, not migrations — otherwise legacy auto-init repos would
+/// silently re-enroll every user who clones them. The marker is what makes a
+/// repo `Active` rather than `Dormant` for a given user. See
+/// `ops/now/init-v2.md`.
+fn ensure_enable_marker(repo_root: &Path, quiet: bool) -> Result<()> {
+    let marker = repos::marker_path(repo_root);
+    if marker.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = marker.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create marker directory {}", parent.display())
+        })?;
+    }
+    fs::write(&marker, "").context("Failed to write per-user enable marker")?;
+    if !quiet {
+        println!("✓ Enabled aiki for you in this repo");
+    }
+    Ok(())
+}
+
+/// Attribute the scaffolding `aiki init` just created (`.aiki/`, the `<aiki>`
+/// block, the instruction symlink, `.gitignore`) to Aiki by describing the
+/// working-copy change with an `[aiki]` provenance block, then start a fresh
+/// change. This is the first-run provenance that used to live in `hooks.yaml`'s
+/// `session.started` (moved here so it survives once auto-init is stripped).
+///
+/// Best-effort and non-fatal: a missing/unhealthy jj never blocks init. Guarded
+/// to only describe an **undescribed** change, so it can never clobber a
+/// user's own working-copy description. The `user-init` session placeholder is
+/// replaced by real CLI session UUIDs once init-first-class-cli-sessions ships.
+fn record_init_provenance(repo_root: &Path, quiet: bool) {
+    use crate::jj::jj_cmd;
+
+    // Never clobber a described change (the user's working copy).
+    let described = jj_cmd()
+        .args([
+            "log", "-r", "@", "--no-graph", "--no-pager", "-T", "description",
+            "--ignore-working-copy",
+        ])
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(true); // On error, assume described and skip (safe).
+    if described {
+        return;
+    }
+
+    // Anything to attribute?
+    let has_changes = jj_cmd()
+        .args(["diff", "-r", "@", "--name-only", "--ignore-working-copy"])
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false);
+    if !has_changes {
+        return;
+    }
+
+    let message = "[aiki]\nauthor=aiki\nauthor_type=agent\nsession=user-init\n[/aiki]";
+    let ok = jj_cmd()
+        .args(["describe", "--message", message, "--ignore-working-copy"])
+        .env("JJ_USER", "Aiki")
+        .env("JJ_EMAIL", "noreply@aiki.sh")
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if ok {
+        // Leave a fresh empty working copy on top of the attributed change.
+        let _ = jj_cmd()
+            .args(["new", "--ignore-working-copy"])
+            .current_dir(repo_root)
+            .output();
+    } else if !quiet {
+        eprintln!("⚠ Could not record init provenance (non-fatal)");
+    }
 }
 
 /// Ensure .aiki/hooks.yml exists with default workflow automation.
@@ -472,4 +599,68 @@ fn init_global_directories(quiet: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run `f` with `AIKI_HOME` pointed at `home`, serialized against other
+    /// tests that touch the env var.
+    fn with_aiki_home<F: FnOnce() -> R, R>(home: &Path, f: F) -> R {
+        let _lock = global::AIKI_HOME_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let original = std::env::var(global::AIKI_HOME_ENV).ok();
+        std::env::set_var(global::AIKI_HOME_ENV, home);
+        let result = f();
+        match original {
+            Some(v) => std::env::set_var(global::AIKI_HOME_ENV, v),
+            None => std::env::remove_var(global::AIKI_HOME_ENV),
+        }
+        result
+    }
+
+    #[test]
+    fn ensure_enable_marker_creates_marker_and_is_idempotent() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        with_aiki_home(home.path(), || {
+            let marker = repos::marker_path(repo.path());
+            assert!(!marker.exists());
+
+            ensure_enable_marker(repo.path(), true).unwrap();
+            assert!(marker.is_file(), "marker should be created");
+
+            // Second call is a no-op (no error, marker still present).
+            ensure_enable_marker(repo.path(), true).unwrap();
+            assert!(marker.is_file());
+        });
+    }
+
+    #[test]
+    fn ensure_enable_marker_makes_repo_active() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir(repo.path().join(".aiki")).unwrap();
+        with_aiki_home(home.path(), || {
+            // Before opt-in: Dormant (has .aiki/, no marker).
+            assert_eq!(
+                repos::init_state(repo.path()).unwrap(),
+                repos::InitState::Dormant {
+                    root: repo.path().to_path_buf()
+                },
+            );
+
+            ensure_enable_marker(repo.path(), true).unwrap();
+
+            // After opt-in: Active.
+            assert_eq!(
+                repos::init_state(repo.path()).unwrap(),
+                repos::InitState::Active {
+                    root: repo.path().to_path_buf()
+                },
+            );
+        });
+    }
 }

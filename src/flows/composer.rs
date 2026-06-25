@@ -69,6 +69,10 @@ pub enum EventType {
     RepoChanged,
     TaskStarted,
     TaskClosed,
+    WorkflowStarted,
+    WorkflowCompleted,
+    StepStarted,
+    StepCompleted,
 }
 
 impl EventType {
@@ -102,6 +106,10 @@ impl EventType {
             EventType::RepoChanged => &handlers.repo_changed,
             EventType::TaskStarted => &handlers.task_started,
             EventType::TaskClosed => &handlers.task_closed,
+            EventType::WorkflowStarted => &handlers.workflow_started,
+            EventType::WorkflowCompleted => &handlers.workflow_completed,
+            EventType::StepStarted => &handlers.step_started,
+            EventType::StepCompleted => &handlers.step_completed,
         }
     }
 

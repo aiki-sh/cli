@@ -194,7 +194,7 @@ aiki plugin install myuser/my-plugin
 ## Plugin Management
 
 ```bash
-# Pre-fetch a plugin (optional — plugins auto-fetch on first reference)
+# Install a plugin (clones it and adds an `include:` line to .aiki/hooks.yml)
 aiki plugin install myuser/my-plugin
 
 # Pre-fetch all plugins referenced by the current project
@@ -213,7 +213,7 @@ aiki plugin list
 aiki plugin remove myuser/my-plugin
 ```
 
-> **Note:** `aiki plugin install` is a pre-fetch optimization, not a prerequisite. Plugins are automatically cloned from GitHub the first time they're referenced via `include:`, `hook:`, `before:`/`after:`, or `--template`. The first use is slightly slower (one-time clone); subsequent sessions use the cached copy.
+> **Note:** Inside a project, `aiki plugin install myuser/my-plugin` clones the plugin and adds an `include: - myuser/my-plugin` line to `.aiki/hooks.yml` (idempotent — re-running is a no-op, and `aiki plugin remove` reverses it). Even without an install, plugins are automatically cloned from GitHub the first time they're referenced via `include:`, `hook:`, `before:`/`after:`, or `--template`, so a hand-added `include:` line works on its own — the first use is slightly slower (one-time clone); subsequent sessions use the cached copy.
 
 ## Composition
 

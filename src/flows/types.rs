@@ -267,6 +267,32 @@ pub struct EventHandlers {
     )]
     pub task_closed: Vec<HookStatement>,
 
+    // Workflow command lifecycle (synthetic, emitted by aiki itself)
+    #[serde(
+        rename = "workflow.started",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
+    pub workflow_started: Vec<HookStatement>,
+    #[serde(
+        rename = "workflow.completed",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
+    pub workflow_completed: Vec<HookStatement>,
+    #[serde(
+        rename = "step.started",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
+    pub step_started: Vec<HookStatement>,
+    #[serde(
+        rename = "step.completed",
+        default,
+        deserialize_with = "deserialize_null_as_empty_vec"
+    )]
+    pub step_completed: Vec<HookStatement>,
+
     // Legacy
     #[serde(
         rename = "Stop",
@@ -426,6 +452,10 @@ impl EventHandlers {
             || !self.repo_changed.is_empty()
             || !self.task_started.is_empty()
             || !self.task_closed.is_empty()
+            || !self.workflow_started.is_empty()
+            || !self.workflow_completed.is_empty()
+            || !self.step_started.is_empty()
+            || !self.step_completed.is_empty()
             || !self.stop.is_empty()
     }
 }
