@@ -35,7 +35,7 @@ From the repo root (`/Users/glasner/code/aiki`):
 A push to a version tag triggers:
 - GitHub Actions release workflow
 - Cross-platform artifacts for GitHub Releases
-- Auto-updated Homebrew formula in `glasner/homebrew-tap`
+- Auto-updated Homebrew formula in `aiki-sh/homebrew-tap`
 
 > Note: you do **not** manually run `gh release create` anymore.
 

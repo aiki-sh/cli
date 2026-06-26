@@ -79,4 +79,4 @@ lto = "thin"
 
 [package.metadata.dist]
 # Homebrew tap to publish formula to
-tap = "glasner/homebrew-tap"
+tap = "aiki-sh/homebrew-tap"

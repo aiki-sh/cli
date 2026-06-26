@@ -7,7 +7,7 @@
 Aiki is now installed via Homebrew.
 
 ```bash
-brew tap glasner/tap
+brew tap aiki-sh/tap
 brew install aiki
 ```
 
