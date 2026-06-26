@@ -187,8 +187,15 @@ struct SessionEndPayload {
 pub fn build_aiki_event_from_stdin() -> Result<AikiEvent> {
     // Parse event - serde discriminates by eventName
     let event: CursorEvent = super::super::read_stdin_json()?;
+    Ok(cursor_event_to_aiki(event))
+}
 
-    let aiki_event = match event {
+/// Convert a parsed `CursorEvent` into an `AikiEvent`.
+///
+/// Split out from the stdin read so the deserialize-and-dispatch path can be
+/// driven directly in tests (mirrors `claude_code::events::claude_event_to_aiki`).
+fn cursor_event_to_aiki(event: CursorEvent) -> AikiEvent {
+    match event {
         CursorEvent::BeforeSubmitPrompt { payload } => build_turn_started_event(payload),
         CursorEvent::BeforeShellExecution { payload } => {
             build_shell_permission_asked_event(payload)
@@ -199,9 +206,7 @@ pub fn build_aiki_event_from_stdin() -> Result<AikiEvent> {
         CursorEvent::AfterFileEdit { payload } => build_change_completed_event(payload),
         CursorEvent::Stop { payload } => build_turn_completed_event(payload),
         CursorEvent::SessionEnd { payload } => build_session_ended_event(payload),
-    };
-
-    Ok(aiki_event)
+    }
 }
 
 /// Build turn.started event from beforeSubmitPrompt payload
@@ -324,6 +329,23 @@ fn build_change_completed_event(payload: AfterFileEditPayload) -> AikiEvent {
 }
 
 /// Build turn.completed event from stop payload
+///
+/// # Token usage is unavailable (documented gap, defect B1)
+///
+/// `tokens` is deliberately `None`, not a missing TODO. Cursor exposes no token
+/// usage on the surface aiki consumes:
+/// - Its vendor hooks (this `stop` payload, `sessionEnd`, `afterAgentResponse`)
+///   carry no usage fields — only model / status / duration.
+/// - Its transcript file (`transcript_path`) records tool inputs, not token
+///   counts.
+/// - The Cursor CLI's `--output-format stream-json` *does* now emit a final
+///   usage figure, but aiki has no Cursor execution runtime
+///   (`harnesses/cursor` is `runtime: None`, "task execution not yet
+///   supported") and never drives that CLI, so it is unreachable from here.
+///
+/// `None` is therefore the explicit "usage unavailable" state. The display
+/// renders it as such (defect C3) rather than as a silent `0`. See
+/// `ops/now/token-tracking-fixes.md` (B1) for the full rationale.
 fn build_turn_completed_event(payload: StopPayload) -> AikiEvent {
     AikiEvent::TurnCompleted(AikiTurnCompletedPayload {
         session: create_session(&payload.conversation_id, &payload.cursor_version),
@@ -333,19 +355,25 @@ fn build_turn_completed_event(payload: StopPayload) -> AikiEvent {
         response: String::new(),              // Cursor doesn't provide response text in stop hook
         modified_files: Vec::new(),           // Cursor doesn't track modified files in stop hook
         tasks: Default::default(),            // Populated by handle_turn_completed
-        tokens: None,
+        tokens: None,                         // usage unavailable — see fn doc (defect B1)
         model: None,
     })
 }
 
 /// Build session.ended event from sessionEnd payload
+///
+/// `tokens` is `None` for the same reason as the turn payload: Cursor reports no
+/// usage on the hooks surface aiki consumes (see [`build_turn_completed_event`]).
+/// Because every Cursor turn is also `None`, `aggregate_session_tokens` finds
+/// nothing to sum and keeps the session total `None`, so the display shows
+/// "usage unavailable" rather than a silent `0` (defects B1 / C3).
 fn build_session_ended_event(payload: SessionEndPayload) -> AikiEvent {
     AikiEvent::SessionEnded(AikiSessionEndedPayload {
         session: create_session(&payload.conversation_id, &payload.cursor_version),
         cwd: get_cwd(&payload.workspace_roots),
         timestamp: chrono::Utc::now(),
         reason: payload.reason,
-        tokens: None,
+        tokens: None, // usage unavailable — see fn doc (defect B1)
     })
 }
 
@@ -360,4 +388,66 @@ fn get_cwd(workspace_roots: &[String]) -> PathBuf {
         .first()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cursor's `stop` hook carries no token usage (documented gap B1), so the
+    /// turn.completed event it produces must surface that as `tokens: None` — the
+    /// explicit "usage unavailable" state — never a fabricated `0`. Drives the
+    /// real deserialize → dispatch path from a realistic hook payload.
+    #[test]
+    fn stop_hook_reports_token_usage_unavailable() {
+        let json = r#"{
+            "eventName": "stop",
+            "conversationId": "conv-abc",
+            "cursorVersion": "0.45.0",
+            "workspaceRoots": ["/tmp/project"]
+        }"#;
+
+        let event: CursorEvent =
+            serde_json::from_str(json).expect("stop hook payload deserializes");
+
+        match cursor_event_to_aiki(event) {
+            AikiEvent::TurnCompleted(payload) => assert!(
+                payload.tokens.is_none(),
+                "Cursor exposes no usage; turn.completed must be unavailable (None), not 0"
+            ),
+            other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+    }
+
+    /// Cursor's `sessionEnd` hook likewise carries no usage. With every turn also
+    /// `None`, `aggregate_session_tokens` keeps the session total `None`, which the
+    /// display renders as "usage unavailable" (B1 / C3).
+    #[test]
+    fn session_end_hook_reports_token_usage_unavailable() {
+        let json = r#"{
+            "eventName": "sessionEnd",
+            "conversationId": "conv-abc",
+            "cursorVersion": "0.45.0",
+            "workspaceRoots": ["/tmp/project"],
+            "reason": "completed"
+        }"#;
+
+        let event: CursorEvent =
+            serde_json::from_str(json).expect("sessionEnd hook payload deserializes");
+
+        match cursor_event_to_aiki(event) {
+            AikiEvent::SessionEnded(payload) => {
+                assert!(
+                    payload.tokens.is_none(),
+                    "Cursor exposes no usage; session.ended must be unavailable (None), not 0"
+                );
+                assert_eq!(payload.reason, "completed");
+            }
+            other => panic!("expected SessionEnded, got {other:?}"),
+        }
+    }
 }

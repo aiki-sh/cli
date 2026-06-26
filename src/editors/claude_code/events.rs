@@ -882,6 +882,13 @@ fn parse_transcript_lines(content: &str) -> Vec<TranscriptEntry> {
 
         let mut transcript_entry = TranscriptEntry::default();
 
+        // Extract the message id. Claude Code emits a streaming-snapshot entry
+        // and then a finalized entry for the SAME id, each carrying that call's
+        // usage; the id lets sum_tokens dedup the pair so the call counts once.
+        if let Some(id) = message.get("id").and_then(|v| v.as_str()) {
+            transcript_entry.id = Some(id.to_string());
+        }
+
         // Extract text from message.content array
         if let Some(content_arr) = message.get("content").and_then(|c| c.as_array()) {
             let text: String = content_arr
@@ -1223,14 +1230,17 @@ mod tests {
 
     #[test]
     fn test_extract_streaming_plus_tool_use_pair() {
-        // Real pattern: streaming snapshot (stop_reason=None, low output) followed by
-        // tool_use (higher output). Each has independent usage — must sum both.
+        // Real pattern: Claude Code writes an intermediate streaming-snapshot
+        // entry (stop_reason=null, partial output) and then the finalized entry
+        // for the SAME message id, both carrying that call's usage (identical
+        // cache/input, differing output). The pair is ONE API call: dedup by
+        // message id keeps the finalized usage, it must NOT sum to double values.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transcript.jsonl");
         let content = [
             r#"{"type":"user","message":{"content":"Do something"}}"#,
-            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":null,"content":[],"usage":{"input_tokens":3,"output_tokens":23,"cache_read_input_tokens":8693,"cache_creation_input_tokens":16911}}}"#,
-            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_01","name":"Read","input":{}}],"usage":{"input_tokens":3,"output_tokens":196,"cache_read_input_tokens":8693,"cache_creation_input_tokens":16911}}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_pair1","model":"claude-opus-4-6","stop_reason":null,"content":[],"usage":{"input_tokens":3,"output_tokens":23,"cache_read_input_tokens":8693,"cache_creation_input_tokens":16911}}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_pair1","model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_01","name":"Read","input":{}}],"usage":{"input_tokens":3,"output_tokens":196,"cache_read_input_tokens":8693,"cache_creation_input_tokens":16911}}}"#,
         ]
         .join("\n");
         std::fs::write(&path, content).unwrap();
@@ -1238,22 +1248,24 @@ mod tests {
         let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
         assert_eq!(extract.response, "");
         let tokens = extract.tokens.unwrap();
-        assert_eq!(tokens.input, 6);
-        assert_eq!(tokens.output, 219);
-        assert_eq!(tokens.cache_read, 8693 + 8693);
-        assert_eq!(tokens.cache_created, 16911 + 16911);
+        // Deduped to the single finalized call, not snapshot + finalized.
+        assert_eq!(tokens.input, 3);
+        assert_eq!(tokens.output, 196);
+        assert_eq!(tokens.cache_read, 8693);
+        assert_eq!(tokens.cache_created, 16911);
     }
 
     #[test]
     fn test_extract_streaming_plus_end_turn_pair() {
-        // Streaming snapshot followed by end_turn with text.
-        // Should sum tokens, take text from the final entry.
+        // Streaming snapshot followed by the finalized end_turn entry for the
+        // SAME message id. The pair is one API call: dedup keeps the finalized
+        // usage and text, not the doubled sum.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transcript.jsonl");
         let content = [
             r#"{"type":"user","message":{"content":"Explain this"}}"#,
-            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":null,"content":[],"usage":{"input_tokens":3,"output_tokens":28,"cache_read_input_tokens":39261,"cache_creation_input_tokens":412}}}"#,
-            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"Here is the explanation."}],"usage":{"input_tokens":3,"output_tokens":288,"cache_read_input_tokens":39261,"cache_creation_input_tokens":412}}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_pair2","model":"claude-opus-4-6","stop_reason":null,"content":[],"usage":{"input_tokens":3,"output_tokens":28,"cache_read_input_tokens":39261,"cache_creation_input_tokens":412}}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_pair2","model":"claude-opus-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"Here is the explanation."}],"usage":{"input_tokens":3,"output_tokens":288,"cache_read_input_tokens":39261,"cache_creation_input_tokens":412}}}"#,
         ]
         .join("\n");
         std::fs::write(&path, content).unwrap();
@@ -1261,21 +1273,27 @@ mod tests {
         let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
         assert_eq!(extract.response, "Here is the explanation.");
         let tokens = extract.tokens.unwrap();
-        assert_eq!(tokens.input, 6);
-        assert_eq!(tokens.output, 316);
+        // Deduped to the single finalized call.
+        assert_eq!(tokens.input, 3);
+        assert_eq!(tokens.output, 288);
+        assert_eq!(tokens.cache_read, 39261);
+        assert_eq!(tokens.cache_created, 412);
     }
 
     #[test]
     fn test_extract_multiple_tool_use_rounds() {
-        // Multiple tool calls in one turn — several assistant entries between user messages.
+        // Multiple tool calls in one turn — several assistant entries between
+        // user messages, each a DISTINCT API call (different message ids, input
+        // genuinely grows 100/200/300/400). Distinct ids must still sum; only a
+        // snapshot+finalized pair sharing one id is deduped.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transcript.jsonl");
         let content = [
             r#"{"type":"user","message":{"content":"Fix everything"}}"#,
-            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
-            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t2","name":"Edit","input":{}}],"usage":{"input_tokens":200,"output_tokens":80,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
-            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{}}],"usage":{"input_tokens":300,"output_tokens":60,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
-            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"All fixed."}],"usage":{"input_tokens":400,"output_tokens":120,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_r1","model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_r2","model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t2","name":"Edit","input":{}}],"usage":{"input_tokens":200,"output_tokens":80,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_r3","model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{}}],"usage":{"input_tokens":300,"output_tokens":60,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_r4","model":"claude-opus-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"All fixed."}],"usage":{"input_tokens":400,"output_tokens":120,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
         ]
         .join("\n");
         std::fs::write(&path, content).unwrap();
@@ -1289,14 +1307,15 @@ mod tests {
 
     #[test]
     fn test_extract_no_content_placeholder_skipped() {
-        // Claude Code writes "(no content)" as a streaming placeholder.
-        // Should be filtered out — not counted as real text.
+        // Claude Code writes "(no content)" as the streaming-snapshot placeholder
+        // for the SAME message id as the finalized entry. The placeholder text is
+        // filtered out AND its usage is deduped away — the pair is one API call.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transcript.jsonl");
         let content = [
             r#"{"type":"user","message":{"content":"Hello"}}"#,
-            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":null,"content":[{"type":"text","text":"(no content)"}],"usage":{"input_tokens":1,"output_tokens":4,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
-            r#"{"type":"assistant","message":{"model":"claude-opus-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"Hi there!"}],"usage":{"input_tokens":1,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_pair3","model":"claude-opus-4-6","stop_reason":null,"content":[{"type":"text","text":"(no content)"}],"usage":{"input_tokens":1,"output_tokens":4,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_pair3","model":"claude-opus-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"Hi there!"}],"usage":{"input_tokens":1,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
         ]
         .join("\n");
         std::fs::write(&path, content).unwrap();
@@ -1304,7 +1323,34 @@ mod tests {
         let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
         assert_eq!(extract.response, "Hi there!");
         let tokens = extract.tokens.unwrap();
-        assert_eq!(tokens.input, 2);
-        assert_eq!(tokens.output, 14);
+        // Deduped to the single finalized call (input 1, output 10), not summed.
+        assert_eq!(tokens.input, 1);
+        assert_eq!(tokens.output, 10);
+    }
+
+    #[test]
+    fn test_golden_streaming_and_tool_use_fixture_parses() {
+        // Drive the committed golden transcript through the real harness parser.
+        // Phase 0 (D2) asserts only structural facts that survive the A1
+        // snapshot-dedup fix — the exact per-bucket TokenUsage assertions land
+        // with the Phase 2 extractor change. See cli/tests/fixtures/tokens/.
+        let content =
+            include_str!("../../../tests/fixtures/tokens/claude_streaming_and_tool_use.jsonl");
+        let extract = TurnTranscript::from_entries(parse_transcript_lines(content));
+
+        // Response text and model come from the finalized end_turn entry.
+        assert_eq!(
+            extract.response,
+            "Done. Refactored the parser and the tests pass."
+        );
+        assert_eq!(extract.model.as_deref(), Some("claude-opus-4-8"));
+
+        // Every disjoint bucket is exercised (the fixture carries a
+        // cache-creation pair plus cache-read on every call).
+        let tokens = extract.tokens.expect("fixture carries usage");
+        assert!(tokens.input > 0, "input present");
+        assert!(tokens.output > 0, "output present");
+        assert!(tokens.cache_read > 0, "cache_read present");
+        assert!(tokens.cache_created > 0, "cache_created present");
     }
 }

@@ -618,6 +618,7 @@ fn event_to_metadata_block(event: &ConversationEvent) -> String {
             content,
             tokens,
             model,
+            task_id,
             timestamp,
             repo_id,
             cwd,
@@ -638,6 +639,9 @@ fn event_to_metadata_block(event: &ConversationEvent) -> String {
             }
             if let Some(m) = model {
                 add_metadata("model", m, &mut lines);
+            }
+            if let Some(tid) = task_id {
+                add_metadata("task_id", tid, &mut lines);
             }
             add_location_metadata(repo_id, cwd, &mut lines);
             add_metadata_timestamp(timestamp, &mut lines);
@@ -845,6 +849,13 @@ fn parse_metadata_block(block: &str) -> Option<ConversationEvent> {
 
             let model = fields.get("model").and_then(|v| v.first()).map(|s| s.to_string());
 
+            // Forward-only: events written before turn->task attribution lack the
+            // `task_id` field and parse as None (the unattributed bucket).
+            let task_id = fields
+                .get("task_id")
+                .and_then(|v| v.first())
+                .map(|s| s.to_string());
+
             Some(ConversationEvent::Response {
                 session_id,
                 agent_type,
@@ -853,6 +864,7 @@ fn parse_metadata_block(block: &str) -> Option<ConversationEvent> {
                 content,
                 tokens,
                 model,
+                task_id,
                 timestamp,
                 repo_id,
                 cwd,
@@ -1017,6 +1029,7 @@ mod tests {
             content: Some("Updated auth module\n\nMore details here.".to_string()),
             tokens: None,
             model: None,
+            task_id: None,
             timestamp: DateTime::parse_from_rfc3339("2026-01-09T10:30:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -1270,6 +1283,7 @@ timestamp=2026-01-09T10:30:00Z
             content: Some("Summary text\n\nFull response with details.".to_string()),
             tokens: None,
             model: None,
+            task_id: None,
             timestamp: Utc::now(),
             repo_id: Some("abc123".to_string()),
             cwd: Some("/path/to/project".to_string()),
@@ -1320,6 +1334,7 @@ timestamp=2026-01-09T10:30:00Z
                 cache_created: 50,
             }),
             model: None,
+            task_id: None,
             timestamp: Utc::now(),
             repo_id: None,
             cwd: None,
@@ -1357,6 +1372,7 @@ timestamp=2026-01-09T10:30:00Z
             content: None,
             tokens: None,
             model: None,
+            task_id: None,
             timestamp: Utc::now(),
             repo_id: None,
             cwd: None,
@@ -1373,6 +1389,67 @@ timestamp=2026-01-09T10:30:00Z
             ConversationEvent::Response { tokens, .. } => {
                 assert!(tokens.is_none());
             }
+            _ => panic!("Expected Response event"),
+        }
+    }
+
+    #[test]
+    fn test_response_task_id_roundtrip() {
+        let original = ConversationEvent::Response {
+            session_id: "sess-task".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            turn: 3,
+            files_written: vec![],
+            content: None,
+            tokens: None,
+            model: None,
+            task_id: Some("mvslrspmoynoxyyywqyutmovxpvztkls".to_string()),
+            timestamp: Utc::now(),
+            repo_id: None,
+            cwd: None,
+        };
+
+        let block = event_to_metadata_block(&original);
+        assert!(block.contains("task_id=mvslrspmoynoxyyywqyutmovxpvztkls"));
+
+        let start = block.find(METADATA_START).unwrap() + METADATA_START.len();
+        let end = block.find(METADATA_END).unwrap();
+        let parsed = parse_metadata_block(&block[start..end]).expect("Should parse");
+        match parsed {
+            ConversationEvent::Response { task_id, .. } => {
+                assert_eq!(task_id, Some("mvslrspmoynoxyyywqyutmovxpvztkls".to_string()));
+            }
+            _ => panic!("Expected Response event"),
+        }
+    }
+
+    #[test]
+    fn test_response_without_task_id_omits_field_and_parses_none() {
+        // Forward-only: a turn with no focused task writes no task_id line, and a
+        // legacy block lacking the field parses back to None (the unattributed
+        // bucket), not an error.
+        let original = ConversationEvent::Response {
+            session_id: "sess-none".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            turn: 1,
+            files_written: vec![],
+            content: None,
+            tokens: None,
+            model: None,
+            task_id: None,
+            timestamp: Utc::now(),
+            repo_id: None,
+            cwd: None,
+        };
+
+        let block = event_to_metadata_block(&original);
+        assert!(!block.contains("task_id="));
+
+        let start = block.find(METADATA_START).unwrap() + METADATA_START.len();
+        let end = block.find(METADATA_END).unwrap();
+        let parsed = parse_metadata_block(&block[start..end]).expect("Should parse");
+        match parsed {
+            ConversationEvent::Response { task_id, .. } => assert_eq!(task_id, None),
             _ => panic!("Expected Response event"),
         }
     }

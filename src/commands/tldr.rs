@@ -559,22 +559,26 @@ fn render_session_summary(
     let runs = session_summary_runs(epic, graph, subtasks, events);
 
     let mut total_secs = 0i64;
-    let mut total_tokens = 0u64;
+    // `None` until some run reports usage, so a summary where no harness reported
+    // tokens renders "usage unavailable" rather than "0 tokens".
+    let mut total_tokens: Option<u64> = None;
     let mut lines = Vec::new();
 
     for run in &runs {
         let secs = run.elapsed_secs();
         total_secs += secs;
-        total_tokens += run.tokens;
+        if let Some(tok) = run.tokens {
+            total_tokens = Some(total_tokens.unwrap_or(0) + tok);
+        }
         lines.push(session_summary_line(run, secs));
     }
 
     let mut summary = vec![format!(
-        "Total: {} session{} — {} — {} tokens",
+        "Total: {} session{} — {} — {}",
         runs.len(),
         if runs.len() == 1 { "" } else { "s" },
         format_duration(chrono::Duration::seconds(total_secs)),
-        format_tokens(total_tokens)
+        format_token_usage(total_tokens)
     )];
     summary.extend(lines);
     summary.join("\n")
@@ -604,11 +608,14 @@ fn session_summary_runs<'a>(
             Some((
                 task.id.as_str(),
                 FinalRunMetadata {
+                    // `None` when this task never recorded usage ("unavailable"),
+                    // distinct from a real zero. The stored figure is total-billed
+                    // (all four buckets) and only written for nonzero turns, so its
+                    // absence is exactly that case.
                     tokens: task
                         .data
                         .get("tokens")
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .unwrap_or(0),
+                        .and_then(|value| value.parse::<u64>().ok()),
                     last_session_id: task.last_session_id.as_deref(),
                     turn_closed: task.turn_closed.as_deref(),
                     turn_stopped: task.turn_stopped.as_deref(),
@@ -663,7 +670,7 @@ fn session_summary_runs<'a>(
                             status: SessionRunStatus::Stopped,
                             session_id: active_run.session_id,
                             turn_id: turn_id.clone().or(active_run.turn_id),
-                            tokens: 0,
+                            tokens: None,
                         });
                     }
                 }
@@ -686,7 +693,7 @@ fn session_summary_runs<'a>(
                             status: SessionRunStatus::Closed(*outcome),
                             session_id: active_run.session_id,
                             turn_id: turn_id.clone().or(active_run.turn_id),
-                            tokens: 0,
+                            tokens: None,
                         });
                     }
                 }
@@ -718,7 +725,7 @@ fn session_summary_runs<'a>(
                 status,
                 session_id: task.last_session_id.clone(),
                 turn_id: task.turn_closed.clone().or(task.turn_stopped.clone()),
-                tokens: 0,
+                tokens: None,
             });
         }
     }
@@ -791,6 +798,16 @@ fn format_tokens(tokens: u64) -> String {
     }
 }
 
+/// Render a token total as a complete display segment, keeping "no usage data"
+/// (`None` — no harness reported any usage) distinct from a real zero. The total
+/// is already billed across all four buckets (see `TokenUsage::total`).
+fn format_token_usage(tokens: Option<u64>) -> String {
+    match tokens {
+        Some(tokens) => format!("{} tokens", format_tokens(tokens)),
+        None => "usage unavailable".to_string(),
+    }
+}
+
 struct ActiveRun {
     started_at: DateTime<Utc>,
     session_id: Option<String>,
@@ -798,7 +815,8 @@ struct ActiveRun {
 }
 
 struct FinalRunMetadata<'a> {
-    tokens: u64,
+    /// Total-billed tokens for this run, or `None` when usage is unavailable.
+    tokens: Option<u64>,
     last_session_id: Option<&'a str>,
     turn_closed: Option<&'a str>,
     turn_stopped: Option<&'a str>,
@@ -813,7 +831,8 @@ struct SessionRun<'a> {
     status: SessionRunStatus,
     session_id: Option<String>,
     turn_id: Option<String>,
-    tokens: u64,
+    /// Total-billed tokens for this run, or `None` when usage is unavailable.
+    tokens: Option<u64>,
 }
 
 impl SessionRun<'_> {
@@ -905,6 +924,13 @@ mod tests {
             turn_id: None,
             timestamp,
         }
+    }
+
+    #[test]
+    fn format_token_usage_distinguishes_unavailable_from_zero() {
+        assert_eq!(format_token_usage(None), "usage unavailable");
+        assert_eq!(format_token_usage(Some(0)), "0 tokens");
+        assert_eq!(format_token_usage(Some(2_500)), "2.5K tokens");
     }
 
     #[test]
@@ -1032,7 +1058,9 @@ mod tests {
 
         let subtasks = vec![graph.tasks.get("subtask").unwrap()];
         let summary = render_session_summary(&epic, &graph, &subtasks, &events);
-        assert!(summary.contains("Total: 3 sessions — 14m — 0 tokens"));
+        // No task recorded token usage, so the total reads "unavailable" (C3),
+        // not a misleading "0 tokens".
+        assert!(summary.contains("Total: 3 sessions — 14m — usage unavailable"));
         assert_eq!(summary.matches("Write Tests").count(), 2);
     }
 
@@ -1081,7 +1109,8 @@ mod tests {
 
         let subtasks = vec![graph.tasks.get("handoff").unwrap()];
         let summary = render_session_summary(&epic, &graph, &subtasks, &events);
-        assert!(summary.contains("Total: 3 sessions — 12m — 0 tokens"));
+        // No task recorded token usage, so the total reads "unavailable" (C3).
+        assert!(summary.contains("Total: 3 sessions — 12m — usage unavailable"));
         assert!(summary.contains("Implement Parser — 2m [session alpha123]"));
         assert!(summary.contains("Implement Parser — 2m [session beta5678]"));
         assert_eq!(summary.matches("Implement Parser").count(), 2);

@@ -99,22 +99,160 @@ fn aggregate_session_tokens(payload: &AikiSessionEndedPayload) -> Option<super::
         }
     };
 
-    let turn_tokens: Vec<super::TokenUsage> = events
-        .into_iter()
-        .filter_map(|event| match event {
-            history::types::ConversationEvent::Response {
-                session_id: sid,
-                tokens: Some(t),
-                ..
-            } if sid == session_id => Some(t),
-            _ => None,
-        })
-        .collect();
+    sum_session_turn_tokens(session_id, &events)
+}
 
-    if turn_tokens.is_empty() {
+/// Sum the per-turn `Response` token usage for one session, **deduplicated by
+/// turn number** so a turn that was recorded more than once contributes exactly
+/// once.
+///
+/// Per-turn token slices are disjoint (the parsers reset their accumulators on
+/// each new turn; see `test_extract_resets_accumulators_on_user_entry`), so
+/// summing distinct turns is correct — but only while each turn is counted
+/// once. Without this guard a `Response` event written twice for the same turn
+/// (e.g. a re-dispatch) would compound into the session total. When a turn
+/// appears more than once the last record wins, matching the most-recent-wins
+/// turn attribution used elsewhere.
+///
+/// Returns `None` when no matching turn carried token data (rather than a zero
+/// total), per the session-aggregate contract.
+fn sum_session_turn_tokens(
+    session_id: &str,
+    events: &[history::types::ConversationEvent],
+) -> Option<super::TokenUsage> {
+    use std::collections::BTreeMap;
+
+    let mut by_turn: BTreeMap<u32, super::TokenUsage> = BTreeMap::new();
+    for event in events {
+        if let history::types::ConversationEvent::Response {
+            session_id: sid,
+            turn,
+            tokens: Some(t),
+            ..
+        } = event
+        {
+            if sid == session_id {
+                by_turn.insert(*turn, t.clone());
+            }
+        }
+    }
+
+    if by_turn.is_empty() {
         None
     } else {
-        let total: super::TokenUsage = turn_tokens.into_iter().sum();
-        Some(total)
+        Some(by_turn.into_values().sum())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::TokenUsage;
+    use crate::history::types::{AgentType, ConversationEvent};
+    use chrono::{DateTime, Utc};
+
+    fn tok(input: u64, output: u64) -> TokenUsage {
+        TokenUsage {
+            input,
+            output,
+            cache_read: 0,
+            cache_created: 0,
+        }
+    }
+
+    fn response(session_id: &str, turn: u32, tokens: Option<TokenUsage>) -> ConversationEvent {
+        ConversationEvent::Response {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            turn,
+            files_written: vec![],
+            content: None,
+            tokens,
+            model: None,
+            task_id: None,
+            timestamp: DateTime::parse_from_rfc3339("2026-01-09T10:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            repo_id: None,
+            cwd: None,
+        }
+    }
+
+    /// The headline D3 guard: a turn whose `Response` was recorded twice must
+    /// not compound into the session aggregate.
+    #[test]
+    fn two_identical_responses_for_one_turn_do_not_double() {
+        let single = super::sum_session_turn_tokens("s", &[response("s", 1, Some(tok(100, 50)))])
+            .expect("one turn with tokens aggregates");
+        assert_eq!(single.total(), 150);
+
+        let doubled = super::sum_session_turn_tokens(
+            "s",
+            &[
+                response("s", 1, Some(tok(100, 50))),
+                response("s", 1, Some(tok(100, 50))),
+            ],
+        )
+        .expect("duplicate turn still aggregates");
+
+        // Deduped by turn id: the second identical record is dropped.
+        assert_eq!(doubled.total(), single.total());
+        assert_eq!(doubled.input, 100);
+        assert_eq!(doubled.output, 50);
+    }
+
+    /// Dedup must not collapse genuinely distinct turns: each turn number is a
+    /// separate, disjoint slice and all of them are summed.
+    #[test]
+    fn distinct_turns_are_summed() {
+        let agg = super::sum_session_turn_tokens(
+            "s",
+            &[
+                response("s", 1, Some(tok(100, 50))),
+                response("s", 2, Some(tok(200, 25))),
+            ],
+        )
+        .expect("two turns aggregate");
+        assert_eq!(agg.input, 300);
+        assert_eq!(agg.output, 75);
+        assert_eq!(agg.total(), 375);
+    }
+
+    /// When a turn is re-recorded with updated tokens the last write wins.
+    #[test]
+    fn duplicate_turn_keeps_last_record() {
+        let agg = super::sum_session_turn_tokens(
+            "s",
+            &[
+                response("s", 1, Some(tok(100, 50))),
+                response("s", 1, Some(tok(999, 999))),
+            ],
+        )
+        .expect("aggregates");
+        assert_eq!(agg.input, 999);
+        assert_eq!(agg.output, 999);
+    }
+
+    /// Only the target session's turns count toward its aggregate.
+    #[test]
+    fn other_sessions_are_excluded() {
+        let agg = super::sum_session_turn_tokens(
+            "s",
+            &[
+                response("s", 1, Some(tok(100, 50))),
+                response("other", 1, Some(tok(9999, 9999))),
+            ],
+        )
+        .expect("target session aggregates");
+        assert_eq!(agg.total(), 150);
+    }
+
+    /// No turn carried token data => `None`, not a zero total.
+    #[test]
+    fn no_token_data_yields_none() {
+        assert!(super::sum_session_turn_tokens("s", &[]).is_none());
+        assert!(
+            super::sum_session_turn_tokens("s", &[response("s", 1, None)]).is_none(),
+            "a Response with tokens: None contributes nothing"
+        );
     }
 }

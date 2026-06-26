@@ -381,12 +381,15 @@ pub fn render_summary_line(model: &Model) -> Vec<Line> {
         children.len()
     };
 
-    // Sum tokens from graph children
-    let mut total_tokens: u64 = 0;
+    // Sum tokens from graph children. `None` until some child reports usage so a
+    // run where no harness reported tokens shows "usage unavailable", not "0
+    // tokens". The stored figure is total-billed (all four buckets) and is only
+    // written for nonzero turns, so its absence is exactly the unavailable case.
+    let mut total_tokens: Option<u64> = None;
     for child in &children {
         if let Some(tok_str) = child.data.get("tokens") {
             if let Ok(tok) = tok_str.parse::<u64>() {
-                total_tokens += tok;
+                total_tokens = Some(total_tokens.unwrap_or(0) + tok);
             }
         }
     }
@@ -403,12 +406,12 @@ pub fn render_summary_line(model: &Model) -> Vec<Line> {
         .map(format_instant_elapsed)
         .unwrap_or_else(|| "0s".to_string());
 
-    let tokens_str = format_tokens_compact(total_tokens);
+    let tokens_str = format_token_usage(total_tokens);
 
     vec![Line {
         indent: 0,
         text: format!(
-            "{} session{} \u{2014} {} \u{2014} {} tokens",
+            "{} session{} \u{2014} {} \u{2014} {}",
             sessions,
             if sessions == 1 { "" } else { "s" },
             elapsed,
@@ -512,6 +515,16 @@ fn format_tokens_compact(tokens: u64) -> String {
     }
 }
 
+/// Render a token total as a complete display segment, keeping "no usage data"
+/// (`None` — no harness reported any usage) distinct from a real zero. The total
+/// is already billed across all four buckets (see `TokenUsage::total`).
+fn format_token_usage(tokens: Option<u64>) -> String {
+    match tokens {
+        Some(tokens) => format!("{} tokens", format_tokens_compact(tokens)),
+        None => "usage unavailable".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,6 +572,13 @@ mod tests {
             edges: EdgeStore::default(),
             slug_index: FastHashMap::default(),
         }
+    }
+
+    #[test]
+    fn format_token_usage_distinguishes_unavailable_from_zero() {
+        assert_eq!(format_token_usage(None), "usage unavailable");
+        assert_eq!(format_token_usage(Some(0)), "0 tokens");
+        assert_eq!(format_token_usage(Some(2_500_000)), "2.5M tokens");
     }
 
     #[test]

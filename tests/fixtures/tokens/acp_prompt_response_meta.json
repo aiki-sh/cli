@@ -1,0 +1,12 @@
+{
+  "stopReason": "end_turn",
+  "_meta": {
+    "model": "claude-opus-4-8",
+    "usage": {
+      "input_tokens": 1200,
+      "output_tokens": 850,
+      "cache_read_input_tokens": 30000,
+      "cache_creation_input_tokens": 1024
+    }
+  }
+}

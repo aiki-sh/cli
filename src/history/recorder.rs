@@ -116,7 +116,12 @@ pub fn record_prompt(
     write_event(jj_cwd, &event)
 }
 
-/// Record a response event
+/// Record a response event.
+///
+/// `task_id` tags the turn with its focused task (the most-recently-started
+/// in-progress task claimed by the session) so token usage can be attributed
+/// per-turn and rolled up over the `subtask-of` tree. `None` means no task was
+/// focused — those tokens belong to the unattributed "session overhead" bucket.
 pub fn record_response(
     jj_cwd: &Path,
     session: &AikiSession,
@@ -128,6 +133,7 @@ pub fn record_response(
     event_cwd: Option<&str>,
     tokens: Option<crate::events::TokenUsage>,
     model: Option<String>,
+    task_id: Option<String>,
 ) -> Result<()> {
     // Store full response content (truncated to same limit as prompts)
     let content = if response_text.trim().is_empty() {
@@ -144,6 +150,7 @@ pub fn record_response(
         content,
         tokens,
         model,
+        task_id,
         timestamp,
         repo_id: repo_id.map(String::from),
         cwd: event_cwd.map(String::from),

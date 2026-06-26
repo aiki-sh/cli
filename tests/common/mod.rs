@@ -5,6 +5,53 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Env var naming the fixture a scripted fake agent should emit as its
+/// transcript. Set together with [`FAKE_TRANSCRIPT_DEST_ENV`].
+pub const FAKE_TRANSCRIPT_SRC_ENV: &str = "AIKI_FAKE_TRANSCRIPT_SRC";
+
+/// Env var naming the path the scripted fake agent should write its transcript
+/// to — i.e. the path the harness later reads (a Stop hook's `transcript_path`).
+pub const FAKE_TRANSCRIPT_DEST_ENV: &str = "AIKI_FAKE_TRANSCRIPT_DEST";
+
+/// Body of the fake `claude`/`codex` agent binaries.
+///
+/// Default behavior is the historical no-op (`exit 0`): no transcript, so most
+/// integration tests that only assert spawn/argv behavior are unaffected.
+///
+/// **Scripted-transcript mode.** When both [`FAKE_TRANSCRIPT_SRC_ENV`] and
+/// [`FAKE_TRANSCRIPT_DEST_ENV`] are set, the agent copies the named fixture to
+/// the destination before exiting, simulating a real harness flushing its
+/// transcript JSONL. An integration test can then drive a real extraction off
+/// the committed golden fixtures (`tests/fixtures/tokens/`) instead of the
+/// previous empty no-op, which exercised none of the token-extraction path.
+const FAKE_AGENT_SCRIPT: &str = r#"#!/bin/sh
+if [ -n "$AIKI_FAKE_TRANSCRIPT_SRC" ] && [ -n "$AIKI_FAKE_TRANSCRIPT_DEST" ]; then
+  mkdir -p "$(dirname "$AIKI_FAKE_TRANSCRIPT_DEST")"
+  cat "$AIKI_FAKE_TRANSCRIPT_SRC" > "$AIKI_FAKE_TRANSCRIPT_DEST"
+fi
+exit 0
+"#;
+
+/// Absolute path to a committed golden token transcript fixture under
+/// `cli/tests/fixtures/tokens/`.
+///
+/// Resolved from `CARGO_MANIFEST_DIR` so it is stable regardless of the test's
+/// working directory.
+pub fn tokens_fixture_path(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("tokens")
+        .join(name)
+}
+
+/// Configure a spawned `aiki` command so its fake agent emits `fixture` as the
+/// transcript at `dest` (the path the harness will read).
+pub fn scripted_transcript(cmd: &mut std::process::Command, fixture: &str, dest: &Path) {
+    cmd.env(FAKE_TRANSCRIPT_SRC_ENV, tokens_fixture_path(fixture))
+        .env(FAKE_TRANSCRIPT_DEST_ENV, dest);
+}
+
 /// Shared hermetic home for every `aiki` spawned through [`aiki_cmd`].
 ///
 /// One home per test binary mirrors the A0 baseline environment (one temp
@@ -33,7 +80,7 @@ static SHARED_TEST_HOME: std::sync::LazyLock<std::path::PathBuf> =
         std::fs::create_dir_all(&fake_bin).expect("create fake-bin dir");
         for agent in ["claude", "codex"] {
             let script = fake_bin.join(agent);
-            std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write fake agent");
+            std::fs::write(&script, FAKE_AGENT_SCRIPT).expect("write fake agent");
             let mut perms = std::fs::metadata(&script).unwrap().permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&script, perms).unwrap();
@@ -65,6 +112,15 @@ pub fn aiki_cmd() -> std::process::Command {
         .env("JJ_EMAIL", "test@example.com")
         .env("PATH", path_value);
     cmd
+}
+
+/// Absolute path to one of the installed fake agent binaries (`claude`,
+/// `codex`) shared via [`aiki_cmd`]. Forces the shared home to initialize, so
+/// the scripted fake agent is on disk. Lets a test invoke the real installed
+/// artifact (e.g. to exercise the scripted-transcript mode at the process
+/// boundary).
+pub fn fake_agent_path(name: &str) -> PathBuf {
+    SHARED_TEST_HOME.join("fake-bin").join(name)
 }
 
 /// Give a spawned `aiki` command a hermetic environment so machine-mutating

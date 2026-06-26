@@ -27,7 +27,7 @@ use crate::events::result::HookResult;
 use crate::events::{
     AikiChangeCompletedPayload, AikiChangePermissionAskedPayload, AikiEvent,
     AikiSessionStartPayload, AikiTurnCompletedPayload, AikiTurnStartedPayload, ChangeOperation,
-    DeleteOperation, MoveOperation, WriteOperation,
+    DeleteOperation, MoveOperation, TokenUsage, WriteOperation,
 };
 use crate::provenance::record::AgentType;
 use crate::session::AikiSession;
@@ -893,16 +893,88 @@ pub fn handle_session_prompt(
     Ok(())
 }
 
+// ============================================================================
+// Token usage parsing (ACP `_meta` extension)
+// ============================================================================
+
+/// Parse an ACP `_meta` extension object into per-turn token usage and model.
+///
+/// ACP agents report per-turn usage in the `_meta` extension that rides on the
+/// `session/prompt` `PromptResponse` (the documented channel) and, for agents
+/// that stream it, on `session/update` `agent_message_chunk` notifications. The
+/// exact JSON is agent-specific; this parses the `claude-code-acp` /
+/// Anthropic-style payload:
+///
+/// ```json
+/// { "model": "claude-opus-4-8",
+///   "usage": { "input_tokens": 1200, "output_tokens": 850,
+///              "cache_read_input_tokens": 30000,
+///              "cache_creation_input_tokens": 1024 } }
+/// ```
+///
+/// Anthropic reports `input_tokens` already excluding cache, so the four buckets
+/// map straight onto the disjoint [`TokenUsage`] invariant with no
+/// normalization. (An agent that reports cache *inside* `input` — OpenAI
+/// convention — would need a per-agent shim here, subtracting cache before
+/// populating `input`; none is needed for the ACP agents shipping today.)
+///
+/// Returns `(None, model)` when no parseable `usage` is present, so a `_meta`
+/// that carries only a model still restores model-drift detection.
+#[must_use]
+pub fn parse_acp_meta(meta: &serde_json::Value) -> (Option<TokenUsage>, Option<String>) {
+    let model = meta
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let tokens = meta.get("usage").and_then(parse_acp_usage);
+
+    (tokens, model)
+}
+
+/// Parse the `usage` sub-object of an ACP `_meta` into a disjoint [`TokenUsage`].
+///
+/// Requires both `input_tokens` and `output_tokens` (mirroring the Claude Code
+/// transcript parser) so a malformed or partial `usage` object never yields an
+/// all-zero usage record. Cache buckets default to 0 when absent.
+fn parse_acp_usage(usage: &serde_json::Value) -> Option<TokenUsage> {
+    let input = usage.get("input_tokens").and_then(|v| v.as_u64())?;
+    let output = usage.get("output_tokens").and_then(|v| v.as_u64())?;
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_created = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    Some(TokenUsage {
+        input,
+        output,
+        cache_read,
+        cache_created,
+    })
+}
+
 /// Handle session.ended event and autoreply
 ///
 /// Fires when the agent completes a turn (stopReason: end_turn).
 /// Dispatches session.ended event to flows, and if they return an autoreply,
 /// sends it back to the agent (up to MAX_AUTOREPLIES times per session).
+///
+/// `tokens` and `model` carry the per-turn usage and model parsed from the
+/// agent's `_meta` extension (see [`parse_acp_meta`]); threading them here is
+/// what lands token tracking and model-drift detection (`model.changed`) on the
+/// turn payload for all ACP/Zed agents.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_session_end(
     sid: &SessionId,
     agent_type: &AgentType,
     cwd: &Option<PathBuf>,
     response_text: &str,
+    tokens: Option<TokenUsage>,
+    model: Option<String>,
     autoreply_counters: &mut HashMap<SessionId, usize>,
     max_autoreplies: usize,
     autoreply_tx: &mpsc::Sender<AutoreplyMessage>,
@@ -924,8 +996,8 @@ pub fn handle_session_end(
         response: response_text.to_string(),
         modified_files: Vec::new(), // Files tracked separately via change.done events
         tasks: Default::default(),  // Populated by handle_turn_completed
-        tokens: None,
-        model: None,
+        tokens,
+        model,
     });
 
     let response = event_bus::dispatch(event)?;
@@ -1017,4 +1089,95 @@ pub fn handle_session_end(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The golden ACP `PromptResponse` fixture (Anthropic-style `_meta`), the
+    /// shape claude-code-acp puts on the wire. Loaded the same way the
+    /// Claude Code / Codex parser tests load theirs.
+    const ACP_PROMPT_RESPONSE_META: &str =
+        include_str!("../../../tests/fixtures/tokens/acp_prompt_response_meta.json");
+
+    #[test]
+    fn test_parse_acp_meta_from_golden_fixture() {
+        // The fixture is the full PromptResponse object; `_meta` is the sibling
+        // of `stopReason` the proxy reads off the same object.
+        let response: serde_json::Value = serde_json::from_str(ACP_PROMPT_RESPONSE_META).unwrap();
+        assert_eq!(
+            response.get("stopReason").and_then(|v| v.as_str()),
+            Some("end_turn")
+        );
+
+        let meta = response.get("_meta").expect("fixture carries _meta");
+        let (tokens, model) = parse_acp_meta(meta);
+
+        assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
+        let tokens = tokens.expect("usage parsed into TokenUsage");
+        assert_eq!(tokens.input, 1200);
+        assert_eq!(tokens.output, 850);
+        assert_eq!(tokens.cache_read, 30000);
+        assert_eq!(tokens.cache_created, 1024);
+        // Anthropic's buckets are disjoint, so total is the straight sum.
+        assert_eq!(tokens.total(), 1200 + 850 + 30000 + 1024);
+    }
+
+    #[test]
+    fn test_parse_acp_meta_model_only_restores_drift_detection() {
+        // A `_meta` that carries only a model (no usage) must still yield the
+        // model so model.changed drift detection stays alive.
+        let meta = json!({ "model": "claude-opus-4-8" });
+        let (tokens, model) = parse_acp_meta(&meta);
+        assert!(tokens.is_none());
+        assert_eq!(model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn test_parse_acp_meta_defaults_missing_cache_buckets() {
+        // Cache buckets are optional; absent buckets default to 0 rather than
+        // failing the parse.
+        let meta = json!({
+            "model": "gemini-2.5-pro",
+            "usage": { "input_tokens": 200, "output_tokens": 80 }
+        });
+        let (tokens, model) = parse_acp_meta(&meta);
+        assert_eq!(model.as_deref(), Some("gemini-2.5-pro"));
+        let tokens = tokens.expect("usage parsed");
+        assert_eq!(tokens.input, 200);
+        assert_eq!(tokens.output, 80);
+        assert_eq!(tokens.cache_read, 0);
+        assert_eq!(tokens.cache_created, 0);
+    }
+
+    #[test]
+    fn test_parse_acp_meta_rejects_partial_usage() {
+        // A usage object missing input_tokens or output_tokens is treated as no
+        // usage, never an all-zero TokenUsage.
+        let missing_output = json!({ "usage": { "input_tokens": 100 } });
+        assert!(parse_acp_meta(&missing_output).0.is_none());
+
+        let missing_input = json!({ "usage": { "output_tokens": 50 } });
+        assert!(parse_acp_meta(&missing_input).0.is_none());
+    }
+
+    #[test]
+    fn test_parse_acp_meta_aggregates_into_disjoint_buckets() {
+        // Two streamed chunks sum additively across the disjoint buckets, the
+        // accumulation the agent_message_chunk `_meta` path relies on.
+        let (t1, _) = parse_acp_meta(&json!({
+            "usage": { "input_tokens": 100, "output_tokens": 20,
+                       "cache_read_input_tokens": 10, "cache_creation_input_tokens": 5 }
+        }));
+        let (t2, _) = parse_acp_meta(&json!({
+            "usage": { "input_tokens": 150, "output_tokens": 30,
+                       "cache_read_input_tokens": 20, "cache_creation_input_tokens": 0 }
+        }));
+        let summed = t1.unwrap() + t2.unwrap();
+        assert_eq!(summed.input, 250);
+        assert_eq!(summed.output, 50);
+        assert_eq!(summed.cache_read, 30);
+        assert_eq!(summed.cache_created, 5);
+    }
 }

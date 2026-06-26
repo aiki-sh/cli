@@ -131,7 +131,8 @@ use crate::cache::debug_log;
 use crate::commands::zed_detection;
 use crate::editors::acp::handlers::{
     create_session, fire_pre_file_change_event, fire_session_start_event, handle_session_end,
-    handle_session_prompt, handle_session_update, parse_permission_request, ToolCallContext,
+    handle_session_prompt, handle_session_update, parse_acp_meta, parse_permission_request,
+    ToolCallContext,
 };
 use crate::editors::acp::protocol::{
     session_id, AgentInfo, ClientInfo, InitializeRequest, InitializeResponse, JsonRpcId,
@@ -142,7 +143,7 @@ use crate::editors::acp::state::{
 };
 use crate::error::{AikiError, Result};
 use crate::event_bus;
-use crate::events::{AikiEvent, AikiSessionEndedPayload};
+use crate::events::{AikiEvent, AikiSessionEndedPayload, TokenUsage};
 use crate::provenance::record::AgentType;
 use agent_client_protocol::{ContentBlock, SessionUpdate, ToolCallId};
 use std::collections::HashMap;
@@ -598,6 +599,15 @@ pub fn run(agent: String, bin: Option<String>, agent_args: Vec<String>) -> Resul
     // agent_message_chunk updates, which all share the same session_id.
     let mut response_accumulator: HashMap<SessionId, String> = HashMap::new();
 
+    // Track per-chunk token usage and model per session, for ACP agents that
+    // stream usage on `agent_message_chunk._meta` rather than (or in addition
+    // to) the final `PromptResponse._meta`. The final response usage is
+    // preferred; these aggregates are the fallback (and feed the
+    // connection-close session.ended path). Keyed by session_id like the
+    // response accumulator.
+    let mut token_accumulator: HashMap<SessionId, TokenUsage> = HashMap::new();
+    let mut model_accumulator: HashMap<SessionId, String> = HashMap::new();
+
     // Run main forwarding loop, capturing any errors
     let loop_result = (|| -> Result<()> {
         eprintln!("ACP Proxy: Agent → IDE thread started");
@@ -720,12 +730,29 @@ pub fn run(agent: String, bin: Option<String>, agent_args: Vec<String>) -> Resul
                                             .remove(&session_id)
                                             .unwrap_or_default();
 
+                                        // Per-turn usage + model: the PromptResponse `_meta`
+                                        // (the documented channel, sibling to stopReason on
+                                        // this same object) is authoritative; fall back to any
+                                        // usage streamed on agent_message_chunk `_meta` and
+                                        // accumulated for this session. Drain both accumulators
+                                        // either way to avoid leaks.
+                                        let (response_tokens, response_model) = result
+                                            .get("_meta")
+                                            .map(parse_acp_meta)
+                                            .unwrap_or((None, None));
+                                        let acc_tokens = token_accumulator.remove(&session_id);
+                                        let acc_model = model_accumulator.remove(&session_id);
+                                        let tokens = response_tokens.or(acc_tokens);
+                                        let model = response_model.or(acc_model);
+
                                         // Fire session.ended event
                                         if let Err(e) = handle_session_end(
                                             &session_id,
                                             &validated_agent_type,
                                             &cwd,
                                             &response_text,
+                                            tokens,
+                                            model,
                                             &mut autoreply_counters,
                                             MAX_AUTOREPLIES,
                                             &autoreply_tx,
@@ -740,6 +767,8 @@ pub fn run(agent: String, bin: Option<String>, agent_args: Vec<String>) -> Resul
                                         // Non-end_turn stopReason (max_tokens, refusal, cancelled, etc.)
                                         // Clean up accumulated response but don't fire session.ended
                                         response_accumulator.remove(&session_id);
+                                        token_accumulator.remove(&session_id);
+                                        model_accumulator.remove(&session_id);
 
                                         debug_log(|| {
                                             format!(
@@ -769,6 +798,8 @@ pub fn run(agent: String, bin: Option<String>, agent_args: Vec<String>) -> Resul
                             // Remove tracking entry and accumulated response
                             if let Some(session_id) = prompt_requests.remove(&request_id) {
                                 response_accumulator.remove(&session_id);
+                                token_accumulator.remove(&session_id);
+                                model_accumulator.remove(&session_id);
 
                                 debug_log(|| {
                                     format!(
@@ -845,6 +876,25 @@ pub fn run(agent: String, bin: Option<String>, agent_args: Vec<String>) -> Resul
                                             .push_str(&text_content.text);
                                     }
                                 }
+
+                                // Aggregate per-chunk usage + model when the agent streams it
+                                // on the `_meta` extension. The typed SessionNotification drops
+                                // unknown fields, so read `_meta` off the raw params (either at
+                                // the notification level or nested under `update`).
+                                if let Some(meta) = params
+                                    .get("_meta")
+                                    .or_else(|| params.get("update").and_then(|u| u.get("_meta")))
+                                {
+                                    let (chunk_tokens, chunk_model) = parse_acp_meta(meta);
+                                    if let Some(t) = chunk_tokens {
+                                        *token_accumulator
+                                            .entry(Arc::clone(&session_id))
+                                            .or_default() += t;
+                                    }
+                                    if let Some(m) = chunk_model {
+                                        model_accumulator.insert(Arc::clone(&session_id), m);
+                                    }
+                                }
                             }
                         }
 
@@ -903,20 +953,25 @@ pub fn run(agent: String, bin: Option<String>, agent_args: Vec<String>) -> Resul
 
     for (_request_id, session_id) in prompt_requests.drain() {
         let session = create_session(validated_agent_type, session_id.to_string(), None::<&str>);
+        // Use whatever per-chunk usage was streamed before the agent
+        // disconnected (there is no final PromptResponse on this path).
+        let tokens = token_accumulator.remove(&session_id);
         let event = AikiEvent::SessionEnded(AikiSessionEndedPayload {
             session,
             cwd: working_dir.clone(),
             timestamp: chrono::Utc::now(),
             reason: "connection_close".to_string(),
-            tokens: None,
+            tokens,
         });
         if let Err(e) = event_bus::dispatch(event) {
             debug_log(|| format!("[acp] Failed to fire session.ended on close: {}", e));
         }
     }
 
-    // Clean up accumulated response text for sessions that were ended above
+    // Clean up accumulated state for sessions that were ended above
     response_accumulator.clear();
+    token_accumulator.clear();
+    model_accumulator.clear();
 
     // Send explicit shutdown signals to threads
     // This is more robust than relying on channel closure via drop()

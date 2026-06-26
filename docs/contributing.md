@@ -272,6 +272,13 @@ cargo test tasks::
 - Integration tests live in `cli/tests/`
 - Use temp directories for tests that touch the filesystem
 - No network dependencies in tests
+- Golden agent transcripts (realistic provider output) live in
+  `cli/tests/fixtures/`; the token-usage ones are under
+  `cli/tests/fixtures/tokens/` (see its README). The shared fake agent in
+  `cli/tests/common/mod.rs` has a scripted-transcript mode
+  (`AIKI_FAKE_TRANSCRIPT_SRC`/`_DEST`, via `common::scripted_transcript`) that
+  emits a fixture to the path the harness reads, so a test can drive a real
+  extraction instead of a no-op spawn.
 
 ## The `ops/` Directory
 

@@ -70,6 +70,15 @@ pub enum ConversationEvent {
         tokens: Option<crate::events::TokenUsage>,
         /// Model used for this turn (extracted from transcript)
         model: Option<String>,
+        /// Focused task this turn's tokens are attributed to, if any.
+        ///
+        /// Set at `turn.completed` to the most-recently-started in-progress task
+        /// claimed by the session (the turn-level attribution unit). `None` means
+        /// no task was focused during the turn (pre-`task start` exploration, idle
+        /// chat); those tokens belong to the "session overhead / unattributed"
+        /// bucket and are never rolled onto an arbitrary task. Forward-only:
+        /// `Response` events written before this field existed parse as `None`.
+        task_id: Option<String>,
         timestamp: DateTime<Utc>,
         /// Stable repository identifier (from repo-id file)
         repo_id: Option<String>,

@@ -228,7 +228,7 @@ fn build_summary_lines(graph: &TaskGraph, epic_id: &str, plan_path: &str, group:
         for stat in &agent_stats {
             children.push(ChildLine::normal(
                 &format!(
-                    "{}: {} session{} \u{2014} {} \u{2014} {} tokens",
+                    "{}: {} session{} \u{2014} {} \u{2014} {}",
                     stat.agent,
                     stat.sessions,
                     if stat.sessions == 1 { "" } else { "s" },
@@ -243,7 +243,7 @@ fn build_summary_lines(graph: &TaskGraph, epic_id: &str, plan_path: &str, group:
     // Total line (always present, bold)
     let totals = sum_agent_stats(&agent_stats);
     children.push(ChildLine::bold(&format!(
-        "Total: {} session{} \u{2014} {} \u{2014} {} tokens",
+        "Total: {} session{} \u{2014} {} \u{2014} {}",
         totals.sessions,
         if totals.sessions == 1 { "" } else { "s" },
         totals.elapsed,
@@ -319,7 +319,9 @@ struct AgentStat {
     agent: String,
     sessions: usize,
     total_secs: i64,
-    total_tokens: u64,
+    /// `None` when no session under this agent reported usage ("unavailable"),
+    /// distinct from `Some(0)`. Total-billed across all four buckets.
+    total_tokens: Option<u64>,
     elapsed: String,
     tokens: String,
 }
@@ -332,12 +334,17 @@ fn aggregate_agent_stats(
     epic_closed_at: Option<DateTime<Utc>>,
 ) -> Vec<AgentStat> {
     let children = graph.children_of(epic_id);
-    let mut by_agent: HashMap<String, (usize, i64, u64)> = HashMap::new(); // (sessions, seconds, tokens)
+    // (sessions, seconds, tokens). Tokens are `Option<u64>`: `None` means no
+    // child reported any usage (render "usage unavailable"), distinct from a
+    // real zero. The denormalized `task.data["tokens"]` is total-billed (all
+    // four buckets) and is only written for nonzero turns, so its absence is
+    // exactly the "unavailable" case.
+    let mut by_agent: HashMap<String, (usize, i64, Option<u64>)> = HashMap::new();
 
     for task in &children {
         let agent = task.agent_label().unwrap_or("agent").to_string();
 
-        let entry = by_agent.entry(agent).or_insert((0, 0, 0));
+        let entry = by_agent.entry(agent).or_insert((0, 0, None));
         entry.0 += 1; // sessions
 
         // Elapsed seconds: use closed_at if available, otherwise cap at epic's
@@ -351,10 +358,11 @@ fn aggregate_agent_stats(
             entry.1 += secs;
         }
 
-        // Tokens from data field
+        // Tokens from data field. Present only for nonzero, total-billed turns;
+        // accumulate into `Some` so an agent with any usage reports a real total.
         if let Some(tok_str) = task.data.get("tokens") {
             if let Ok(tok) = tok_str.parse::<u64>() {
-                entry.2 += tok;
+                entry.2 = Some(entry.2.unwrap_or(0) + tok);
             }
         }
     }
@@ -367,7 +375,7 @@ fn aggregate_agent_stats(
             total_secs: secs,
             total_tokens: tokens,
             elapsed: format_duration(secs),
-            tokens: format_tokens(tokens),
+            tokens: format_token_usage(tokens),
         })
         .collect();
     stats.sort_by(|a, b| a.agent.cmp(&b.agent));
@@ -378,12 +386,16 @@ fn aggregate_agent_stats(
 fn sum_agent_stats(stats: &[AgentStat]) -> AgentStat {
     let mut total_sessions = 0usize;
     let mut total_secs = 0i64;
-    let mut total_tokens = 0u64;
+    // Stays `None` until some agent reports usage, so a build where no harness
+    // reported tokens renders "usage unavailable" rather than "0 tokens".
+    let mut total_tokens: Option<u64> = None;
 
     for stat in stats {
         total_sessions += stat.sessions;
         total_secs += stat.total_secs;
-        total_tokens += stat.total_tokens;
+        if let Some(t) = stat.total_tokens {
+            total_tokens = Some(total_tokens.unwrap_or(0) + t);
+        }
     }
 
     AgentStat {
@@ -392,7 +404,7 @@ fn sum_agent_stats(stats: &[AgentStat]) -> AgentStat {
         total_secs,
         total_tokens,
         elapsed: format_duration(total_secs),
-        tokens: format_tokens(total_tokens),
+        tokens: format_token_usage(total_tokens),
     }
 }
 
@@ -441,6 +453,16 @@ fn format_tokens(tokens: u64) -> String {
         format!("{:.1}K", tokens as f64 / 1_000.0)
     } else {
         format!("{}", tokens)
+    }
+}
+
+/// Render a token total as a complete display segment, keeping "no usage data"
+/// (`None` — no harness reported any usage) distinct from a real zero. The total
+/// is already billed across all four buckets (see `TokenUsage::total`).
+fn format_token_usage(tokens: Option<u64>) -> String {
+    match tokens {
+        Some(tokens) => format!("{} tokens", format_tokens(tokens)),
+        None => "usage unavailable".to_string(),
     }
 }
 
@@ -565,33 +587,142 @@ mod tests {
     }
 
     #[test]
+    fn format_token_usage_distinguishes_unavailable_from_zero() {
+        // No usage reported renders distinctly, not as "0 tokens".
+        assert_eq!(format_token_usage(None), "usage unavailable");
+        assert_eq!(format_token_usage(Some(0)), "0 tokens");
+        assert_eq!(format_token_usage(Some(1500)), "1.5K tokens");
+    }
+
+    #[test]
     fn sum_agent_stats_exact_totals() {
         let stats = vec![
             AgentStat {
                 agent: "opus".to_string(),
                 sessions: 3,
                 total_secs: 3661,
-                total_tokens: 1_500_123,
+                total_tokens: Some(1_500_123),
                 elapsed: format_duration(3661),
-                tokens: format_tokens(1_500_123),
+                tokens: format_token_usage(Some(1_500_123)),
             },
             AgentStat {
                 agent: "sonnet".to_string(),
                 sessions: 2,
                 total_secs: 90,
-                total_tokens: 500_456,
+                total_tokens: Some(500_456),
                 elapsed: format_duration(90),
-                tokens: format_tokens(500_456),
+                tokens: format_token_usage(Some(500_456)),
             },
         ];
 
         let totals = sum_agent_stats(&stats);
         assert_eq!(totals.sessions, 5);
         assert_eq!(totals.total_secs, 3751);
-        assert_eq!(totals.total_tokens, 2_000_579);
+        assert_eq!(totals.total_tokens, Some(2_000_579));
         assert_eq!(totals.agent, "Total");
         assert_eq!(totals.elapsed, format_duration(3751));
-        assert_eq!(totals.tokens, format_tokens(2_000_579));
+        assert_eq!(totals.tokens, format_token_usage(Some(2_000_579)));
+    }
+
+    #[test]
+    fn sum_agent_stats_unavailable_when_no_tokens_reported() {
+        // Every agent reported no usage: the total stays "unavailable", not 0.
+        let stats = vec![
+            AgentStat {
+                agent: "cursor".to_string(),
+                sessions: 1,
+                total_secs: 10,
+                total_tokens: None,
+                elapsed: format_duration(10),
+                tokens: format_token_usage(None),
+            },
+            AgentStat {
+                agent: "acp".to_string(),
+                sessions: 2,
+                total_secs: 20,
+                total_tokens: None,
+                elapsed: format_duration(20),
+                tokens: format_token_usage(None),
+            },
+        ];
+
+        let totals = sum_agent_stats(&stats);
+        assert_eq!(totals.total_tokens, None);
+        assert_eq!(totals.tokens, "usage unavailable");
+    }
+
+    #[test]
+    fn sum_agent_stats_mixed_availability_reports_real_total() {
+        // One agent reported usage, another did not: the available total wins.
+        let stats = vec![
+            AgentStat {
+                agent: "opus".to_string(),
+                sessions: 1,
+                total_secs: 10,
+                total_tokens: Some(1200),
+                elapsed: format_duration(10),
+                tokens: format_token_usage(Some(1200)),
+            },
+            AgentStat {
+                agent: "cursor".to_string(),
+                sessions: 1,
+                total_secs: 5,
+                total_tokens: None,
+                elapsed: format_duration(5),
+                tokens: format_token_usage(None),
+            },
+        ];
+
+        let totals = sum_agent_stats(&stats);
+        assert_eq!(totals.total_tokens, Some(1200));
+        assert_eq!(totals.tokens, "1.2K tokens");
+    }
+
+    #[test]
+    fn aggregate_agent_stats_unavailable_when_no_child_reports_tokens() {
+        // Drive the real aggregation: child runs with no `tokens` data key keep
+        // the per-agent and summed totals "unavailable", not a misleading 0 (C3).
+        let mut graph = make_graph();
+        let epic = make_task("epic1x", "Epic", TaskStatus::Closed);
+        let mut a = make_task("childa", "A", TaskStatus::Closed);
+        a.started_at = Some(Utc::now() - chrono::Duration::minutes(2));
+        a.closed_at = Some(Utc::now());
+        let mut b = make_task("childb", "B", TaskStatus::Closed);
+        b.started_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        b.closed_at = Some(Utc::now());
+        graph.tasks.insert("epic1x".to_string(), epic);
+        graph.tasks.insert("childa".to_string(), a);
+        graph.tasks.insert("childb".to_string(), b);
+        graph.edges.add("childa", "epic1x", "subtask-of");
+        graph.edges.add("childb", "epic1x", "subtask-of");
+
+        let stats = aggregate_agent_stats(&graph, "epic1x", None);
+        assert!(stats.iter().all(|s| s.total_tokens.is_none()));
+        let totals = sum_agent_stats(&stats);
+        assert_eq!(totals.total_tokens, None);
+        assert_eq!(totals.tokens, "usage unavailable");
+    }
+
+    #[test]
+    fn aggregate_agent_stats_sums_total_billed_tokens() {
+        // Children carrying a total-billed `tokens` rollup aggregate to a real,
+        // displayable total (C2).
+        let mut graph = make_graph();
+        let epic = make_task("epic1x", "Epic", TaskStatus::Closed);
+        let mut a = make_task("childa", "A", TaskStatus::Closed);
+        a.data.insert("tokens".to_string(), "1200".to_string());
+        let mut b = make_task("childb", "B", TaskStatus::Closed);
+        b.data.insert("tokens".to_string(), "800".to_string());
+        graph.tasks.insert("epic1x".to_string(), epic);
+        graph.tasks.insert("childa".to_string(), a);
+        graph.tasks.insert("childb".to_string(), b);
+        graph.edges.add("childa", "epic1x", "subtask-of");
+        graph.edges.add("childb", "epic1x", "subtask-of");
+
+        let stats = aggregate_agent_stats(&graph, "epic1x", None);
+        let totals = sum_agent_stats(&stats);
+        assert_eq!(totals.total_tokens, Some(2000));
+        assert_eq!(totals.tokens, "2.0K tokens");
     }
 
     #[test]

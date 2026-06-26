@@ -21,6 +21,7 @@ pub mod runner;
 pub mod spawner;
 pub mod storage;
 pub mod templates;
+pub mod token_rollup;
 pub mod types;
 
 pub use baseline::select_task_snapshot_baseline;

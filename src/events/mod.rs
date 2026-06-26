@@ -53,7 +53,37 @@ impl Turn {
 // Token Usage
 // ============================================================================
 
-/// Token usage counters for a turn or session
+/// Token usage counters for a turn or session.
+///
+/// # Bucket invariant
+///
+/// The four buckets are **disjoint and additive** (Anthropic's native
+/// convention). No token is counted in more than one bucket:
+///
+/// - `input` — uncached prompt tokens billed at the full rate.
+/// - `cache_read` — prompt tokens served from cache (discounted).
+/// - `cache_created` — prompt tokens written to cache (premium).
+/// - `output` — *all* generated tokens, **including** reasoning/thinking tokens.
+///
+/// Per-turn total = `input + cache_read + cache_created + output`.
+///
+/// A per-turn figure is the **sum across the distinct API calls the turn made**
+/// (cost semantics), not a single context-window snapshot. Distinct calls in a
+/// tool-use loop are legitimately additive; the only thing never summed is the
+/// *same* API call counted twice.
+///
+/// Anthropic reports `input` already excluding cache (disjoint). OpenAI/Codex
+/// reports `prompt_tokens` *including* cached tokens, so a Codex parser must
+/// normalize `input` down by subtracting cache before populating this struct
+/// (handled in the Codex parser, not here).
+///
+/// # Open question
+///
+/// The displayed headline number is "total billed" — all four buckets, as
+/// [`total`](Self::total) computes. There is an open product question of whether
+/// the headline should instead be `input + output` only, with cache shown as a
+/// separate breakdown. We adopt all-four for now; revisit if the display needs
+/// to distinguish billed-at-full-rate from cache traffic.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input: u64,
@@ -66,8 +96,12 @@ pub struct TokenUsage {
 
 #[allow(dead_code)]
 impl TokenUsage {
+    /// Total billed tokens for the turn: the sum of all four disjoint buckets.
+    ///
+    /// Consistent with [`is_zero`](Self::is_zero), which also considers every
+    /// field. See the type-level docs for the bucket invariant.
     pub fn total(&self) -> u64 {
-        self.input + self.output
+        self.input + self.cache_read + self.cache_created + self.output
     }
 
     /// Returns true if all fields are zero
@@ -684,6 +718,7 @@ mod tests {
             cache_read: 200,
             cache_created: 10,
         };
-        assert_eq!(usage.total(), 150); // Only input + output
+        // All four disjoint buckets summed: 100 + 200 + 10 + 50.
+        assert_eq!(usage.total(), 360);
     }
 }

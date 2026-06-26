@@ -319,6 +319,88 @@ impl AikiSessionFile {
         Ok(())
     }
 
+    /// Read an arbitrary `key=value` metadata line from the session file.
+    ///
+    /// Returns the value of the last `<key>=<value>` entry, if present. Generic
+    /// counterpart to [`read_repo_id`](Self::read_repo_id) for keys the session
+    /// file carries opportunistically (e.g. the Codex cumulative-token baseline
+    /// used to keep resumed-session token attribution correct).
+    pub fn read_metadata_value(&self, key: &str) -> Option<String> {
+        let prefix = format!("{}=", key);
+        fs::read_to_string(&self.path).ok().and_then(|content| {
+            content
+                .lines()
+                .filter_map(|line| line.strip_prefix(prefix.as_str()))
+                .last()
+                .map(String::from)
+        })
+    }
+
+    /// Insert or replace a `key=value` metadata line in the session file.
+    ///
+    /// Upserts inside the `[aiki]...[/aiki]` block, replacing any existing
+    /// `<key>=` line. No-op if the session file does not exist or has no closing
+    /// tag. Atomic via temp-file rename. Generic counterpart to
+    /// [`update_repo_id`](Self::update_repo_id).
+    pub fn upsert_metadata_value(&self, key: &str, value: &str) -> Result<()> {
+        use std::io::Write;
+
+        let content = match fs::read_to_string(&self.path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(AikiError::Other(anyhow::anyhow!(
+                    "Failed to read session file: {}",
+                    e
+                )))
+            }
+        };
+
+        let marker = format!("{}=", key);
+        let replacement = format!("{}={}", key, value);
+
+        let (before, after) = match content.split_once("[/aiki]") {
+            Some((before, after)) => (before, after),
+            None => return Ok(()),
+        };
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut replaced = false;
+        for line in before.lines() {
+            if line.starts_with(marker.as_str()) {
+                if !replaced {
+                    lines.push(replacement.clone());
+                    replaced = true;
+                }
+                continue;
+            }
+            lines.push(line.to_string());
+        }
+        if !replaced {
+            lines.push(replacement);
+        }
+
+        let mut rewritten = lines.join("\n");
+        if !rewritten.ends_with('\n') {
+            rewritten.push('\n');
+        }
+        rewritten.push_str("[/aiki]");
+        rewritten.push_str(after);
+
+        let tmp_path = self.path.with_extension("tmp");
+        let mut file = fs::File::create(&tmp_path)
+            .map_err(|e| AikiError::Other(anyhow::anyhow!("Failed to create temp file: {}", e)))?;
+        file.write_all(rewritten.as_bytes())
+            .map_err(|e| AikiError::Other(anyhow::anyhow!("Failed to write temp file: {}", e)))?;
+        file.sync_all()
+            .map_err(|e| AikiError::Other(anyhow::anyhow!("Failed to sync temp file: {}", e)))?;
+
+        fs::rename(&tmp_path, &self.path)
+            .map_err(|e| AikiError::Other(anyhow::anyhow!("Failed to rename temp file: {}", e)))?;
+
+        Ok(())
+    }
+
     /// Check if this session file exists
     pub fn exists(&self) -> bool {
         self.path.exists()
@@ -1870,6 +1952,74 @@ mod tests {
         let content = fs::read_to_string(&session_file_path).unwrap();
         assert!(content.contains("parent_pid=11111"));
         assert!(!content.contains("parent_pid=22222"));
+    }
+
+    #[test]
+    fn test_upsert_and_read_metadata_value() {
+        let _lock = env_lock();
+        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
+
+        let session = AikiSession::new(
+            AgentType::Codex,
+            "codex-meta-session",
+            None::<&str>,
+            DetectionMethod::Hook,
+            SessionMode::Interactive,
+        );
+        let session_file = session.file();
+        session_file.create().unwrap();
+
+        // Absent key reads as None.
+        assert_eq!(session_file.read_metadata_value("codex_token_total"), None);
+
+        // Insert, then read back.
+        session_file
+            .upsert_metadata_value("codex_token_total", "10,5,2,1")
+            .unwrap();
+        assert_eq!(
+            session_file.read_metadata_value("codex_token_total"),
+            Some("10,5,2,1".to_string())
+        );
+
+        // Upsert replaces (does not duplicate) the existing line.
+        session_file
+            .upsert_metadata_value("codex_token_total", "20,9,4,3")
+            .unwrap();
+        assert_eq!(
+            session_file.read_metadata_value("codex_token_total"),
+            Some("20,9,4,3".to_string())
+        );
+        let path = global::global_sessions_dir().join(session.uuid());
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content.matches("codex_token_total=").count(),
+            1,
+            "upsert must not duplicate the key"
+        );
+        assert!(content.contains("[/aiki]"), "closing tag preserved");
+        // Pre-existing metadata is untouched.
+        assert!(content.contains("external_session_id="));
+    }
+
+    #[test]
+    fn test_upsert_metadata_value_missing_file_is_noop() {
+        let _lock = env_lock();
+        let (_aiki_home, _guard) = setup_global_aiki_home_inner();
+
+        // Session file never created.
+        let session = AikiSession::new(
+            AgentType::Codex,
+            "codex-meta-absent",
+            None::<&str>,
+            DetectionMethod::Hook,
+            SessionMode::Interactive,
+        );
+        let session_file = session.file();
+        // No panic / error, and nothing to read.
+        session_file
+            .upsert_metadata_value("codex_token_total", "1,1,1,1")
+            .unwrap();
+        assert_eq!(session_file.read_metadata_value("codex_token_total"), None);
     }
 
     #[test]

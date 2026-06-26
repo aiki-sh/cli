@@ -80,6 +80,9 @@ Session Summary:
   Total: <sessions> sessions — <elapsed> — <tokens> tokens
   <per-subtask line: ✔/– name, duration>
 
+(The token segment reads "usage unavailable" when no session reported token
+usage, distinct from a real "0 tokens".)
+
 ## Before
 
 <Describe the problem/state before this epic. Draw out the data/code flow.

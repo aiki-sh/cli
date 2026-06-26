@@ -75,17 +75,32 @@ pub fn handle_turn_completed(mut payload: AikiTurnCompletedPayload) -> Result<Ho
         source.to_string(),
     );
 
-    // Populate task activity for this turn
-    payload.tasks = match crate::tasks::storage::read_events(&payload.cwd) {
-        Ok(events) => {
-            let graph = crate::tasks::graph::materialize_graph(&events);
-            crate::tasks::manager::get_task_activity_by_turn(&graph, &payload.turn.id)
-        }
+    // Materialize the task graph once: used both for this turn's task activity
+    // and to resolve the focused task that the turn's tokens attribute to.
+    let task_graph = match crate::tasks::storage::read_events(&payload.cwd) {
+        Ok(events) => Some(crate::tasks::graph::materialize_graph(&events)),
         Err(e) => {
-            debug_log(|| format!("Task activity lookup failed, using empty: {}", e));
-            crate::tasks::TaskActivity::default()
+            debug_log(|| format!("Task graph lookup failed, using empty: {}", e));
+            None
         }
     };
+    payload.tasks = task_graph
+        .as_ref()
+        .map(|graph| crate::tasks::manager::get_task_activity_by_turn(graph, &payload.turn.id))
+        .unwrap_or_default();
+
+    // Focused task = most-recently-started in-progress task claimed by this
+    // session (the turn-level attribution unit; see tasks::token_rollup). `None`
+    // when no task is in progress — those tokens belong to the unattributed
+    // "session overhead" bucket and are never rolled onto an arbitrary task.
+    let focused_task_id = task_graph.as_ref().and_then(|graph| {
+        crate::tasks::manager::get_in_progress_task_ids_for_session(
+            &graph.tasks,
+            payload.session.uuid(),
+        )
+        .into_iter()
+        .next()
+    });
 
     debug_log(|| {
         format!(
@@ -146,8 +161,22 @@ pub fn handle_turn_completed(mut payload: AikiTurnCompletedPayload) -> Result<Ho
         Some(&cwd_str),
         payload.tokens.clone(),
         payload.model.clone(),
+        focused_task_id.clone(),
     ) {
         debug_log(|| format!("Failed to record response: {}", e));
+    }
+
+    // Bridge this turn's tokens onto the focused task's denormalized rollup
+    // (`task.data["tokens"]`) so the build TUI, run summary, and `aiki tldr`
+    // render a real total. Rolls up over the `subtask-of` tree; best-effort and
+    // never fatal. Turns with no focused task or no token data write nothing.
+    if let (Some(graph), Some(focused)) = (task_graph.as_ref(), focused_task_id.as_deref()) {
+        let delta = payload.tokens.as_ref().map(|t| t.total()).unwrap_or(0);
+        if let Err(e) =
+            crate::tasks::token_rollup::record_turn_tokens(&payload.cwd, graph, focused, delta)
+        {
+            debug_log(|| format!("Failed to bridge turn tokens onto task rollup: {}", e));
+        }
     }
 
     // Save values needed for autoreply recording (payload is moved to state below)
