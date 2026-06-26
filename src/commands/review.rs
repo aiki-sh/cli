@@ -207,8 +207,14 @@ pub fn run(mut args: ReviewArgs) -> Result<()> {
         };
     }
 
+    // Emit workflow.started/completed lifecycle events so plugins (e.g. herdr)
+    // can observe this command. Neutral — no integration-specific code here.
+    let mut wf = crate::commands::lifecycle::WorkflowGuard::start("review");
+
     let opts = ReviewOpts::from_args(&args)?;
     crate::workflow::review::run(&cwd, &opts)?;
+
+    wf.succeeded();
     Ok(())
 }
 

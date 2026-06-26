@@ -34,9 +34,16 @@ aiki loop <parent-task-id> -o id
 5. **Execute** — The loop agent iterates:
    - Get ready lanes via `aiki task lane <parent-id>`
    - Start each ready lane with `aiki run <parent-id> --next-thread --lane <lane-id> --async`
-   - Wait for any thread to finish with `aiki task wait <ids> --any`
+   - Wait for any thread to finish with `aiki session wait <ids> --any --timeout 30`
    - Loop back — finished threads may unblock new lanes
    - Exit when no ready lanes remain
+
+   The wait uses a bounded `--timeout` so each step returns within 30 seconds
+   (exit `124` = timed out, still running; exit `0` = a thread finished). The
+   orchestrator runs as a headless agent that cannot block indefinitely — if a
+   single command runs too long the agent harness moves it to the background and
+   the orchestrator can exit before closing the loop task. Bounded polling keeps
+   each command short so the agent stays in control until every lane completes.
 
 ## Lanes
 

@@ -24,6 +24,43 @@ fn test_bool_false() {
     assert!(!eval("false", &[]));
 }
 
+// === Regression: hooks.yaml absorb_result conflict condition ===
+// The turn.completed / session.ended hooks bind `absorb_result` to the stdout
+// of workspace_absorb_all ("ok" | "0" | conflicted-file-list) and fire the
+// conflict autoreply only on a real conflict list. The original condition ended
+// in a bare `absorb_result` operand which Rhai rejected ("i64 expecting bool"
+// when "0" coerced to an int), defaulting the whole condition to false and
+// silently disabling conflict handling. The fix replaces the bare operand with
+// an explicit `absorb_result != ""`.
+const ABSORB_CONDITION: &str =
+    r#"absorb_result != "ok" and absorb_result != 0 and absorb_result != """#;
+
+#[test]
+fn test_absorb_condition_fires_on_conflict_list() {
+    // A conflicted-file list is the only case that should trigger the autoreply.
+    assert!(eval(
+        ABSORB_CONDITION,
+        &[("absorb_result", "src/a.rs\nsrc/b.rs")]
+    ));
+}
+
+#[test]
+fn test_absorb_condition_skips_no_workspaces() {
+    // "0" == no workspaces absorbed → no conflict.
+    assert!(!eval(ABSORB_CONDITION, &[("absorb_result", "0")]));
+}
+
+#[test]
+fn test_absorb_condition_skips_clean_absorb() {
+    // "ok" == absorbed with no conflicts.
+    assert!(!eval(ABSORB_CONDITION, &[("absorb_result", "ok")]));
+}
+
+#[test]
+fn test_absorb_condition_skips_empty() {
+    assert!(!eval(ABSORB_CONDITION, &[("absorb_result", "")]));
+}
+
 // === Numeric comparisons ===
 
 #[test]

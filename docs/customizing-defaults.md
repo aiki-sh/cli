@@ -93,6 +93,19 @@ Events fire at specific points in the AI agent lifecycle. Each event can have ha
 | `task.started` | Task transitioned to in_progress |
 | `task.closed` | Task reached closed state |
 
+### Workflow Lifecycle
+
+Emitted by Aiki's own orchestration commands (`build`, `fix`, `loop`, `review`), not by the editor. They are neutral lifecycle signals: plugins map them to external surfaces (for example, the `aiki-sh/herdr` plugin shows a running workflow as an agent row in herdr's sidebar).
+
+| Event | When it fires |
+|-------|--------------|
+| `workflow.started` | An aiki workflow command begins (brackets the whole run) |
+| `workflow.completed` | An aiki workflow command ends (success, error, or unwind) |
+| `step.started` | A single step within a workflow begins |
+| `step.completed` | A workflow step ends (success or error) |
+
+Variables: `workflow.*` handlers can read `{{event.workflow.name}}` (plus `{{event.workflow.success}}` on `workflow.completed`); `step.*` handlers can read `{{event.step.name}}` (plus `{{event.step.success}}` on `step.completed`). All events also expose `{{event.timestamp_ns}}` (integer nanoseconds since the Unix epoch).
+
 Events with `permission_asked` suffix are **gateable** — handlers can block the operation.
 
 ## Actions

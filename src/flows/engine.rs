@@ -508,6 +508,34 @@ impl HookEngine {
                     files.join(" ")
                 });
             }
+            // Workflow command lifecycle (synthetic, emitted by aiki itself).
+            // Nested under event.workflow.* / event.step.* (like event.task.*)
+            // so more attributes can be added without a breaking rename.
+            crate::events::AikiEvent::WorkflowStarted(e) => {
+                resolver.add_var("event.workflow.name".to_string(), e.workflow.clone());
+            }
+            crate::events::AikiEvent::WorkflowCompleted(e) => {
+                resolver.add_var("event.workflow.name".to_string(), e.workflow.clone());
+                resolver.add_var("event.workflow.success".to_string(), e.success.to_string());
+            }
+            crate::events::AikiEvent::StepStarted(e) => {
+                resolver.add_var("event.step.name".to_string(), e.step.clone());
+            }
+            crate::events::AikiEvent::StepCompleted(e) => {
+                resolver.add_var("event.step.name".to_string(), e.step.clone());
+                resolver.add_var("event.step.success".to_string(), e.success.to_string());
+            }
+        }
+
+        // Expose the event timestamp as integer nanoseconds since the Unix epoch
+        // (all events but Unsupported carry one). This is the finest unit, so a
+        // handler needing a herdr `--seq` uses it directly and anything coarser
+        // integer-divides — no float math, no perl/python/date subprocess.
+        if let Some(ts) = state.event.timestamp() {
+            resolver.add_var(
+                "event.timestamp_ns".to_string(),
+                ts.timestamp_nanos_opt().unwrap_or(0).to_string(),
+            );
         }
 
         // Add agent type as event.agent_type
@@ -2934,6 +2962,70 @@ mod tests {
         let result = HookEngine::execute_shell(&action, &mut state).unwrap();
         assert!(result.success);
         assert!(result.stdout.contains("test.rs"));
+    }
+
+    #[test]
+    fn test_workflow_started_exposes_event_workflow() {
+        // The herdr plugin's workflow.started handler uses {{event.workflow.name}}.
+        let action = ShellAction {
+            shell: "echo {{event.workflow.name}}".to_string(),
+            timeout: None,
+            on_failure: OnFailure::default(),
+            alias: None,
+        };
+        let mut state = AikiState::new(crate::events::AikiWorkflowStartedPayload {
+            workflow: "build".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            timestamp: chrono::Utc::now(),
+        });
+        let result = HookEngine::execute_shell(&action, &mut state).unwrap();
+        assert!(result.success);
+        assert!(result.stdout.contains("build"));
+    }
+
+    #[test]
+    fn test_step_started_exposes_event_step() {
+        // The herdr plugin's step.started handler uses {{event.step.name}}.
+        let action = ShellAction {
+            shell: "echo {{event.step.name}}".to_string(),
+            timeout: None,
+            on_failure: OnFailure::default(),
+            alias: None,
+        };
+        let mut state = AikiState::new(crate::events::AikiStepStartedPayload {
+            step: "decompose".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            timestamp: chrono::Utc::now(),
+        });
+        let result = HookEngine::execute_shell(&action, &mut state).unwrap();
+        assert!(result.success);
+        assert!(result.stdout.contains("decompose"));
+    }
+
+    #[test]
+    fn test_event_exposes_timestamp_ns() {
+        // Every event exposes its timestamp as integer epoch nanoseconds, so
+        // handlers (e.g. the herdr plugin's --seq) don't shell out to perl/date.
+        let action = ShellAction {
+            shell: "echo {{event.timestamp_ns}}".to_string(),
+            timeout: None,
+            on_failure: OnFailure::default(),
+            alias: None,
+        };
+        let mut state = AikiState::new(crate::events::AikiWorkflowStartedPayload {
+            workflow: "build".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            timestamp: chrono::Utc::now(),
+        });
+        let result = HookEngine::execute_shell(&action, &mut state).unwrap();
+        assert!(result.success);
+        let out = result.stdout.trim();
+        assert!(
+            !out.is_empty() && out.chars().all(|c| c.is_ascii_digit()),
+            "timestamp_ns should be a bare integer, got {out:?}"
+        );
+        // A current epoch in nanoseconds is ~19 digits.
+        assert!(out.len() >= 18, "expected epoch-ns magnitude, got {out:?}");
     }
 
     #[test]

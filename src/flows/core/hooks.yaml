@@ -16,20 +16,11 @@ session.started:
     # jj status snapshot (isolation.rs) before any rebase touches @.
     - jj: new --ignore-working-copy
 
-    # Initialize Aiki (idempotent - safe to run multiple times)
-    - shell: aiki init --quiet
-      on_failure:
-          - stop: "Failed to initialize Aiki repository"
-
-    # If aiki init created files, record them with Aiki as author
-    - jj: diff -r @ --name-only
-      alias: init_changes
-
-    - if: init_changes
-      then:
-          - with_author: "Aiki <noreply@aiki.sh>"
-            jj: describe --message "[aiki]\nauthor=aiki\nauthor_type=agent\nsession={{event.session.uuid}}\n[/aiki]" --ignore-working-copy
-          - jj: new --ignore-working-copy
+    # NOTE: auto-init was removed here in init-v2. Initialization is now an
+    # explicit user action (`aiki init`), which also records the first-run
+    # `[aiki]` provenance change that used to live in this block. A session only
+    # reaches this flow when the repo is already Active — the bash/Rust gates
+    # exit before dispatch otherwise — so there is nothing to initialize here.
 
     - let: ws_path = self.workspace_ensure_isolated
     - if: ws_path
@@ -187,7 +178,12 @@ turn.completed:
     # against the TARGET's @ (not the workspace's @).
     - let: absorb_result = self.workspace_absorb_all
 
-    - if: absorb_result != "ok" and absorb_result != "0" and absorb_result
+    # Fire only on a real conflicted-file list. workspace_absorb_all returns
+    # "ok" (clean), "0" (no workspaces), or the conflict list. The expression
+    # evaluator coerces the numeric string "0" to the integer 0, so the
+    # no-workspace case must be compared against `0` (not "0"), and `!= ""`
+    # guards the empty case — leaving the conflict-list string as the only match.
+    - if: absorb_result != "ok" and absorb_result != 0 and absorb_result != ""
       then:
           # Target's @ is conflicted after absorption.
           # autoreply triggers a follow-up turn — the agent MUST address
@@ -373,7 +369,12 @@ session.ended:
     # Absorb isolated workspace changes back into parent/main workspace
     # No-op if no workspaces were created (solo session)
     - let: absorb_result = self.workspace_absorb_all
-    - if: absorb_result != "ok" and absorb_result != "0" and absorb_result
+    # Fire only on a real conflicted-file list. workspace_absorb_all returns
+    # "ok" (clean), "0" (no workspaces), or the conflict list. The expression
+    # evaluator coerces the numeric string "0" to the integer 0, so the
+    # no-workspace case must be compared against `0` (not "0"), and `!= ""`
+    # guards the empty case — leaving the conflict-list string as the only match.
+    - if: absorb_result != "ok" and absorb_result != 0 and absorb_result != ""
       then:
           - log: |
                 WARNING: Workspace absorption at session end introduced conflicts.

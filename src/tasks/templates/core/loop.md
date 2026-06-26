@@ -1,5 +1,5 @@
 ---
-version: 2.0.0
+version: 2.1.0
 type: orchestrator
 ---
 
@@ -12,15 +12,11 @@ You are orchestrating the execution of subtasks under {{data.target}}.
     aiki task show {{data.target}}
     aiki task lane {{data.target}} --all
 
-## Step 2: Execute
+## Step 2: Execute the orchestration loop
 
-Loop until all lanes are complete:
-
-1. Get ready lanes via `aiki task lane {{data.target}} -o id`
-2. For each ready lane, start it with `aiki run {{data.target}} --next-thread --lane <lane-id> --async -o id`
-3. Collect the session IDs from started threads
-4. Wait for any to finish with `aiki session wait <sid1> <sid2> ... --any`
-5. Loop back — finished thread may have unblocked new lanes or the next thread in a lane
+Drive the loop below. It spawns each ready lane asynchronously, then waits in
+**bounded** 30-second steps — a finished thread may unblock new lanes or the
+next thread in a lane, so you re-check after every wait.
 
 ```bash
 while true; do
@@ -31,30 +27,43 @@ while true; do
   for lane in $ready; do
     sid=$(aiki run {{data.target}} --next-thread --lane $lane --async -o id) || {
       rc=$?
-      [ $rc -eq 2 ] && continue  # AllComplete for this lane
-      exit $rc                    # real error
+      [ $rc -eq 2 ] && continue   # AllComplete for this lane
+      exit $rc                     # real error
     }
     [ -n "$sid" ] && sids+=("$sid")
   done
 
   [ ${#sids[@]} -eq 0 ] && break
-  aiki session wait "${sids[@]}" --any
+
+  # Bounded wait: returns within 30s. Exit 124 = timed out, still running
+  # (re-loop and wait again); exit 0 = a thread finished (re-check lanes).
+  echo "orchestrator: waiting up to 30s on ${#sids[@]} lane(s): ${sids[*]}"
+  aiki session wait "${sids[@]}" --any --timeout 30 || true
 done
+echo "orchestrator: all lanes complete"
 ```
 
-**How it works:**
+## CRITICAL: never end your turn while lanes are running
 
-1. Get ready lanes (may be empty if all lanes are blocked or running)
-2. Start threads for ready lanes, collecting session IDs
-3. Handle exit code 2 (AllComplete) per lane — skip that lane
-4. Wait for any running thread to finish via `aiki session wait`
-5. Loop back - finished thread may have unblocked new lanes
-6. Exit when no ready lanes remain
+You run in headless mode. If you end your turn before the loop finishes, the
+loop task is never closed and the build is reported as **failed** — even though
+the subtasks may still be running. Rules:
+
+- Keep each command short. The `--timeout 30` on `aiki session wait` returns
+  control to you every 30 seconds; never run a command that blocks for the
+  whole build.
+- Do **not** end your turn and do **not** wait for a "background command
+  completed" notification — it never arrives in headless mode. Keep driving the
+  loop in this same turn until every lane shows done/closed.
+- If the harness still moves a command to the background, do not stop: re-check
+  `aiki task lane {{data.target}} --all` every few seconds (in this turn) until
+  all lanes are complete.
+- Only after every lane is complete do you run the Completion step.
 
 ## Failure handling
 
-If a thread fails, its lane cannot proceed. Dependent lanes
-are also blocked. Independent lanes continue.
+If a thread fails, its lane cannot proceed. Dependent lanes are also blocked;
+independent lanes continue.
 
     aiki task lane {{data.target}} --all
 

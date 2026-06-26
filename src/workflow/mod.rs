@@ -407,23 +407,50 @@ impl Workflow {
                 self.ctx.status(step.name());
             }
 
+            // Emit step.started so plugins (e.g. herdr) can show granular,
+            // within-workflow progress. Neutral and fire-and-forget.
+            Self::emit_step(step.name(), None, &self.ctx.cwd);
+
             match step.run(&mut self.ctx) {
                 Ok(result) => {
                     if verbose {
                         self.ctx.success(step.name(), &result.message);
                     }
+                    Self::emit_step(step.name(), Some(true), &self.ctx.cwd);
                     self.apply_change(result.change);
                 }
                 Err(e) => {
                     if verbose {
                         self.ctx.error(step.name(), &e.to_string());
                     }
+                    Self::emit_step(step.name(), Some(false), &self.ctx.cwd);
                     return Err(e);
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Emit a step lifecycle event: `step.started` when `success` is `None`,
+    /// `step.completed` (with the outcome) otherwise. Fire-and-forget — a no-op
+    /// for anyone not subscribed (the common case outside a herdr pane).
+    fn emit_step(step: &str, success: Option<bool>, cwd: &std::path::Path) {
+        use crate::events::{AikiEvent, AikiStepCompletedPayload, AikiStepStartedPayload};
+        let event = match success {
+            None => AikiEvent::StepStarted(AikiStepStartedPayload {
+                step: step.to_string(),
+                cwd: cwd.to_path_buf(),
+                timestamp: chrono::Utc::now(),
+            }),
+            Some(success) => AikiEvent::StepCompleted(AikiStepCompletedPayload {
+                step: step.to_string(),
+                success,
+                cwd: cwd.to_path_buf(),
+                timestamp: chrono::Utc::now(),
+            }),
+        };
+        let _ = crate::event_bus::dispatch(event);
     }
 }
 

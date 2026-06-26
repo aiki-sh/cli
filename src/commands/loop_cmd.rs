@@ -57,6 +57,10 @@ pub fn run(args: LoopArgs) -> Result<()> {
     let cwd = env::current_dir()
         .map_err(|_| AikiError::InvalidArgument("Failed to get current directory".to_string()))?;
 
+    // Emit workflow.started/completed lifecycle events so plugins (e.g. herdr)
+    // can observe this command. Neutral — no integration-specific code here.
+    let mut wf = crate::commands::lifecycle::WorkflowGuard::start("loop");
+
     let mut options = LoopOptions::new().with_async(args.run_async);
     if let Some(agent) = agent_type {
         options = options.with_agent(agent);
@@ -72,5 +76,6 @@ pub fn run(args: LoopArgs) -> Result<()> {
         println!("{}", loop_task_id);
     }
 
+    wf.succeeded();
     Ok(())
 }

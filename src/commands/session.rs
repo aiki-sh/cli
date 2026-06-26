@@ -92,6 +92,11 @@ pub enum SessionCommands {
         /// Return when any session completes (instead of waiting for all)
         #[arg(long)]
         any: bool,
+        /// Max seconds to wait before returning. On timeout, exits 124 (GNU
+        /// `timeout` convention) so callers can poll in bounded steps instead
+        /// of blocking indefinitely.
+        #[arg(long)]
+        timeout: Option<u64>,
         /// Output format (e.g., `id` for bare session IDs on stdout)
         #[arg(long, short = 'o')]
         output: Option<super::OutputFormat>,
@@ -136,7 +141,12 @@ pub fn run(command: SessionCommands) -> Result<()> {
             };
             run_show(&effective_id)
         }
-        SessionCommands::Wait { ids, any, output } => run_wait(ids, any, output),
+        SessionCommands::Wait {
+            ids,
+            any,
+            timeout,
+            output,
+        } => run_wait(ids, any, timeout, output),
         SessionCommands::Transcript {
             id,
             session,
@@ -848,7 +858,30 @@ fn has_session_ended(events: &[ConversationEvent], session_id: &str) -> bool {
     )
 }
 
-fn run_wait(ids: Vec<String>, any: bool, output_format: Option<super::OutputFormat>) -> Result<()> {
+/// Whether a bounded `--timeout` wait has elapsed. `None` means wait forever.
+fn wait_deadline_reached(elapsed: std::time::Duration, timeout: Option<u64>) -> bool {
+    matches!(timeout, Some(t) if elapsed >= std::time::Duration::from_secs(t))
+}
+
+/// Clamp the next poll sleep so a `--timeout` deadline isn't overshot by a full
+/// backoff interval. With no timeout, the backoff delay is used unchanged.
+/// Never returns 0 (so the poll loop always makes forward progress).
+fn bounded_sleep_ms(delay_ms: u64, elapsed: std::time::Duration, timeout: Option<u64>) -> u64 {
+    match timeout {
+        Some(t) => {
+            let remaining = std::time::Duration::from_secs(t).saturating_sub(elapsed);
+            delay_ms.min(remaining.as_millis() as u64).max(1)
+        }
+        None => delay_ms,
+    }
+}
+
+fn run_wait(
+    ids: Vec<String>,
+    any: bool,
+    timeout: Option<u64>,
+    output_format: Option<super::OutputFormat>,
+) -> Result<()> {
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
@@ -869,6 +902,7 @@ fn run_wait(ids: Vec<String>, any: bool, output_format: Option<super::OutputForm
     let ids = resolved_ids;
 
     let mut delay_ms = WAIT_INITIAL_DELAY_MS;
+    let wait_start = Instant::now();
 
     // Poll until condition is met
     loop {
@@ -986,7 +1020,25 @@ fn run_wait(ids: Vec<String>, any: bool, output_format: Option<super::OutputForm
             return Ok(());
         }
 
-        std::thread::sleep(Duration::from_millis(delay_ms));
+        // Bounded wait: if a --timeout was given and has elapsed, exit 124
+        // (GNU `timeout` convention) so callers can distinguish "timed out,
+        // still running" from "a session completed" (exit 0). The loop
+        // orchestrator uses this to poll in short steps, keeping each wait
+        // shorter than the agent harness's command-backgrounding threshold.
+        if wait_deadline_reached(wait_start.elapsed(), timeout) {
+            if !matches!(output_format, Some(super::OutputFormat::Id)) {
+                let still_running = ids.iter().filter(|id| !has_session_ended(&events, id)).count();
+                eprintln!(
+                    "Timed out after {}s; {} session(s) still running.",
+                    timeout.unwrap_or(0),
+                    still_running
+                );
+            }
+            std::process::exit(124);
+        }
+
+        let sleep_ms = bounded_sleep_ms(delay_ms, wait_start.elapsed(), timeout);
+        std::thread::sleep(Duration::from_millis(sleep_ms));
         delay_ms = (delay_ms * WAIT_BACKOFF_MULTIPLIER).min(WAIT_MAX_DELAY_MS);
     }
 }
@@ -994,6 +1046,7 @@ fn run_wait(ids: Vec<String>, any: bool, output_format: Option<super::OutputForm
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_read_external_session_id_from_file() {
@@ -1022,6 +1075,45 @@ mod tests {
     #[test]
     fn test_transcript_output_enum_values() {
         assert_eq!(TranscriptOutput::Path, TranscriptOutput::Path);
+    }
+
+    #[test]
+    fn test_wait_deadline_no_timeout_never_reached() {
+        // None == wait forever; never "timed out" regardless of elapsed.
+        assert!(!wait_deadline_reached(Duration::from_secs(0), None));
+        assert!(!wait_deadline_reached(Duration::from_secs(3600), None));
+    }
+
+    #[test]
+    fn test_wait_deadline_reached_at_and_past_timeout() {
+        assert!(!wait_deadline_reached(Duration::from_secs(29), Some(30)));
+        // Boundary: elapsed == timeout counts as reached.
+        assert!(wait_deadline_reached(Duration::from_secs(30), Some(30)));
+        assert!(wait_deadline_reached(Duration::from_secs(31), Some(30)));
+    }
+
+    #[test]
+    fn test_bounded_sleep_no_timeout_uses_delay() {
+        assert_eq!(bounded_sleep_ms(5000, Duration::from_secs(10), None), 5000);
+    }
+
+    #[test]
+    fn test_bounded_sleep_caps_to_remaining() {
+        // 30s timeout, 29.8s elapsed -> only ~200ms remain, so the 5s backoff
+        // is clamped down to avoid overshooting the deadline.
+        let ms = bounded_sleep_ms(5000, Duration::from_millis(29_800), Some(30));
+        assert!(ms <= 200, "expected <=200ms, got {ms}");
+        assert!(ms >= 1);
+    }
+
+    #[test]
+    fn test_bounded_sleep_never_zero_past_deadline() {
+        // Past the deadline, sleep is clamped to 1ms (never 0) so the next
+        // iteration runs and the deadline check fires.
+        assert_eq!(
+            bounded_sleep_ms(5000, Duration::from_secs(45), Some(30)),
+            1
+        );
     }
 
     #[test]

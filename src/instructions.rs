@@ -292,8 +292,128 @@ pub fn ensure_symlink(
         })?;
     }
 
+    // Record that aiki created this symlink so `aiki remove` can take it down
+    // again without clobbering a symlink the user set up themselves. Best
+    // effort — failure to record is not fatal to init.
+    record_created_symlink(repo_root, link_name);
+
     if !quiet {
         println!("✓ Created symlink {} -> {}", link_name, target_name);
+    }
+
+    Ok(())
+}
+
+/// Path of the file that records which instruction symlink aiki created.
+///
+/// The plan (`ops/now/init-v2.md`) calls this `.aiki/.init/created_symlink`;
+/// it is realized here as `.aiki/.created_symlink` to match the existing
+/// sibling artifact `.aiki/.previous_hooks_path`.
+fn created_symlink_marker(repo_root: &Path) -> std::path::PathBuf {
+    repo_root.join(".aiki").join(".created_symlink")
+}
+
+/// Record (best effort) that aiki created `link_name` as a symlink.
+fn record_created_symlink(repo_root: &Path, link_name: &str) {
+    let aiki_dir = repo_root.join(".aiki");
+    if !aiki_dir.is_dir() {
+        return;
+    }
+    let _ = fs::write(created_symlink_marker(repo_root), link_name);
+}
+
+/// Read the name of the instruction symlink aiki created, if recorded.
+#[must_use]
+pub fn aiki_created_symlink(repo_root: &Path) -> Option<String> {
+    fs::read_to_string(created_symlink_marker(repo_root))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// True if `content` contains only the aiki-generated scaffold (title +
+/// boilerplate comments + blank lines) and no real user instructions. Used by
+/// [`remove_aiki_block`] to decide whether to delete a file outright.
+fn is_scaffold_only(content: &str) -> bool {
+    const SCAFFOLD_LINES: [&str; 4] = [
+        "# Repo Instructions",
+        "<!-- Add your repo-specific instructions for AI agents below. -->",
+        "<!-- These instructions are shared across Cursor, Codex, and other AI tools that read AGENTS.md. -->",
+        "<!-- Claude Code is supported via a CLAUDE.md symlink that points to this file. -->",
+    ];
+    content
+        .lines()
+        .all(|line| line.trim().is_empty() || SCAFFOLD_LINES.contains(&line.trim()))
+}
+
+/// Strip the `<aiki>` block from the repo's instruction files (the inverse of
+/// [`ensure_aiki_block`]).
+///
+/// For each of AGENTS.md / CLAUDE.md that is a **real file** (never a symlink —
+/// we don't write through symlinks) containing an `<aiki version=` block:
+/// - Remove the `<aiki ...>...</aiki>` block plus one trailing newline.
+/// - If what remains is empty or aiki-scaffold-only, delete the file.
+/// - Otherwise rewrite the file with the block removed, preserving user content.
+///
+/// Files without a block, missing files, and symlinks are left untouched. A
+/// malformed block (missing `</aiki>`) is left in place rather than risk
+/// corrupting user content.
+pub fn remove_aiki_block(repo_root: &Path, quiet: bool) -> Result<()> {
+    for filename in [AGENTS_MD, CLAUDE_MD] {
+        let file_path = repo_root.join(filename);
+
+        // Only touch real files. A symlink is taken down separately (and only
+        // if aiki created it).
+        let Ok(meta) = file_path.symlink_metadata() else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+
+        let Ok(content) = fs::read_to_string(&file_path) else {
+            continue;
+        };
+        let Some(start) = content.find("<aiki version=") else {
+            continue; // No block to remove.
+        };
+        let end_tag = "</aiki>";
+        let Some(end) = content[start..]
+            .find(end_tag)
+            .map(|pos| start + pos + end_tag.len())
+        else {
+            // Malformed block — leave the file alone.
+            if !quiet {
+                eprintln!(
+                    "⚠ Malformed <aiki> block in {} (missing </aiki>); left in place",
+                    filename
+                );
+            }
+            continue;
+        };
+        // Consume one trailing newline so we don't leave a blank gap.
+        let end = if content[end..].starts_with("\r\n") {
+            end + 2
+        } else if content[end..].starts_with('\n') {
+            end + 1
+        } else {
+            end
+        };
+        let remaining = format!("{}{}", &content[..start], &content[end..]);
+
+        if is_scaffold_only(&remaining) {
+            fs::remove_file(&file_path)
+                .with_context(|| format!("Failed to remove {}", filename))?;
+            if !quiet {
+                println!("✓ Removed {} (aiki-scaffolded only)", filename);
+            }
+        } else {
+            fs::write(&file_path, &remaining)
+                .with_context(|| format!("Failed to update {}", filename))?;
+            if !quiet {
+                println!("✓ Removed <aiki> block from {}", filename);
+            }
+        }
     }
 
     Ok(())
@@ -470,5 +590,80 @@ mod tests {
         // Files should be unchanged — no <aiki> block injected through symlinks
         let agents = fs::read_to_string(dir.path().join("ext_agents")).unwrap();
         assert!(!agents.contains("<aiki version="));
+    }
+
+    #[test]
+    fn remove_aiki_block_preserves_user_content() {
+        let dir = tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD);
+        fs::write(&agents, "# My instructions\n\nDo the thing.\n").unwrap();
+        // Inject a real block via ensure, then strip it.
+        ensure_aiki_block(dir.path(), AGENTS_MD, true).unwrap();
+        assert!(fs::read_to_string(&agents).unwrap().contains("<aiki version="));
+
+        remove_aiki_block(dir.path(), true).unwrap();
+
+        let after = fs::read_to_string(&agents).unwrap();
+        assert!(!after.contains("<aiki version="), "block should be gone");
+        assert!(after.contains("# My instructions"), "user content preserved");
+        assert!(after.contains("Do the thing."));
+    }
+
+    #[test]
+    fn remove_aiki_block_deletes_scaffold_only_file() {
+        let dir = tempdir().unwrap();
+        // ensure_instruction_files on an empty repo scaffolds AGENTS.md + block.
+        ensure_instruction_files(dir.path(), true).unwrap();
+        let agents = dir.path().join(AGENTS_MD);
+        assert!(agents.exists());
+
+        remove_aiki_block(dir.path(), true).unwrap();
+
+        assert!(!agents.exists(), "scaffold-only file should be deleted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_aiki_block_leaves_symlinks_untouched() {
+        let dir = tempdir().unwrap();
+        ensure_instruction_files(dir.path(), true).unwrap();
+        // Missing repo scaffolds AGENTS.md (real) + CLAUDE.md (symlink → AGENTS.md).
+        let claude = dir.path().join(CLAUDE_MD);
+        assert!(claude.symlink_metadata().unwrap().file_type().is_symlink());
+
+        remove_aiki_block(dir.path(), true).unwrap();
+
+        // The symlink itself is not removed by remove_aiki_block (that's the
+        // command's job, gated on ownership). It may now dangle since AGENTS.md
+        // was scaffold-only and got deleted — the point is we didn't write
+        // through it.
+        assert!(claude.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn remove_aiki_block_no_op_without_block() {
+        let dir = tempdir().unwrap();
+        let agents = dir.path().join(AGENTS_MD);
+        fs::write(&agents, "# Just user content\n").unwrap();
+
+        remove_aiki_block(dir.path(), true).unwrap();
+
+        assert_eq!(fs::read_to_string(&agents).unwrap(), "# Just user content\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_symlink_records_ownership() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join(".aiki")).unwrap();
+        fs::write(dir.path().join(AGENTS_MD), "agents").unwrap();
+
+        ensure_symlink(dir.path(), AGENTS_MD, CLAUDE_MD, true).unwrap();
+
+        assert_eq!(
+            aiki_created_symlink(dir.path()).as_deref(),
+            Some(CLAUDE_MD),
+            "aiki should record the symlink it created",
+        );
     }
 }

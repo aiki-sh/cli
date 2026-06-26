@@ -17,7 +17,33 @@ fn test_complete_workflow_init_to_provenance_tracking() {
     }
 
     let temp_dir = tempdir().unwrap();
-    let repo_path = temp_dir.path();
+    // Canonicalize so the marker `aiki init` keys by its resolved getcwd
+    // (`/private/var/...` on macOS) matches the gate's lookup from the hook
+    // payload's `cwd` — otherwise the /var symlink alias keys two markers.
+    let repo_path_buf = temp_dir.path().canonicalize().unwrap();
+    let repo_path = repo_path_buf.as_path();
+
+    // One stable hermetic home shared by EVERY aiki invocation in this test.
+    // `aiki init` writes the per-user marker under AIKI_HOME, and the init-v2
+    // gate later looks it up there when the hook fires — so init and the hook
+    // must agree on AIKI_HOME (the per-call `hermetic_env_assert` would not).
+    let hermetic = tempdir().unwrap();
+    let hermetic_aiki_home = hermetic.path().join("aiki");
+    let hermetic_home = hermetic.path().join("home");
+    fs::create_dir_all(&hermetic_aiki_home).unwrap();
+    fs::create_dir_all(hermetic_home.join(".config")).unwrap();
+    fs::write(
+        hermetic_home.join(".gitconfig"),
+        "[user]\n\tname = Aiki Test\n\temail = test@example.com\n",
+    )
+    .unwrap();
+    let shared_env: Vec<(&str, std::ffi::OsString)> = vec![
+        ("AIKI_HOME", hermetic_aiki_home.clone().into_os_string()),
+        ("HOME", hermetic_home.clone().into_os_string()),
+        ("XDG_CONFIG_HOME", hermetic_home.join(".config").into_os_string()),
+        ("JJ_USER", "Aiki Test".into()),
+        ("JJ_EMAIL", "test@example.com".into()),
+    ];
 
     // Step 1: Initialize Git repository
     init_git_repo(repo_path);
@@ -28,7 +54,9 @@ fn test_complete_workflow_init_to_provenance_tracking() {
 
     // Step 2: Run aiki init (no plugin copying needed - using global hooks)
     let mut cmd = Command::cargo_bin("aiki").unwrap();
-    common::hermetic_env_assert(&mut cmd);
+    for (k, v) in &shared_env {
+        cmd.env(k, v);
+    }
     cmd.current_dir(repo_path).arg("init");
 
     cmd.assert()
@@ -103,6 +131,9 @@ fn test_complete_workflow_init_to_provenance_tracking() {
     // Measure hook performance
     let start = Instant::now();
     let mut hooks_cmd = Command::cargo_bin("aiki").unwrap();
+    for (k, v) in &shared_env {
+        hooks_cmd.env(k, v);
+    }
     let output = hooks_cmd
         .arg("hooks")
         .arg("stdin")

@@ -35,6 +35,8 @@ This sets up Aiki in your repository and configures editor integrations:
 
 Hooks are global, so one restart after first init is usually enough.
 
+> **Non-destructive:** `aiki init` appends its hook entries to these files without overwriting hooks you (or another tool) already configured, and re-running it never creates duplicates. If duplicate Aiki entries ever appear, `aiki doctor --fix` removes them.
+
 > **Note:** If you run into setup issues, you can run `aiki doctor` to diagnose common problems with your environment, dependencies, and configuration.
 
 ## 3) First workflow: Chat mode with task tracking

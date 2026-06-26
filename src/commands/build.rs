@@ -131,9 +131,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
         };
     }
 
+    // Emit workflow.started/completed lifecycle events so plugins (e.g. herdr)
+    // can observe this command. Neutral — no integration-specific code here.
+    let mut wf = crate::commands::lifecycle::WorkflowGuard::start("build");
+
     let opts = BuildOpts::from_args(&args, agent)?;
     build::run(&cwd, &opts)?;
 
+    wf.succeeded();
     Ok(())
 }
 

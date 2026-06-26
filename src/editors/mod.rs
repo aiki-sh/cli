@@ -53,6 +53,44 @@ impl HookCommandOutput {
     }
 }
 
+/// Why aiki is signalling "not active" on a SessionStart event.
+///
+/// Drives the agent-facing context text. The user-facing banner is the same
+/// nudge in both cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotActiveReason {
+    /// The repo declares aiki (`.aiki/` present) but this user has not opted in.
+    NotEnabled,
+    /// No `.aiki/` here at all (direct invocation in a non-aiki tree).
+    NotInstalled,
+}
+
+impl NotActiveReason {
+    /// Agent-visible context. Instructs the agent that aiki is dormant and that
+    /// it must NOT auto-run `aiki init` — the user opts in explicitly.
+    #[must_use]
+    pub fn agent_context(self) -> &'static str {
+        match self {
+            NotActiveReason::NotEnabled => {
+                "Aiki is installed but not active in this repo. The user can run `aiki init` to \
+                 enable Aiki here. Do not invoke `aiki init` or other `aiki` commands unless the \
+                 user explicitly requests it. You may suggest activation if relevant, but the user \
+                 must opt in."
+            }
+            NotActiveReason::NotInstalled => {
+                "Aiki is not active in this repo. The user can run `aiki init` to enable it. Do not \
+                 invoke `aiki init` or other `aiki` commands unless the user explicitly requests it."
+            }
+        }
+    }
+
+    /// User-visible banner text (no leading glyph). Kept free of em-dashes.
+    #[must_use]
+    pub fn banner(self) -> &'static str {
+        "aiki not active. Run `aiki init` to enable"
+    }
+}
+
 /// Read and parse JSON from stdin
 ///
 /// Shared utility for all editor handlers to read hook payload data.

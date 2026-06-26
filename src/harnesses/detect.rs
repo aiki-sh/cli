@@ -7,6 +7,35 @@ use super::definition::HarnessDefinition;
 use super::runtime::RuntimeKind;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
+/// Detect the parent harness from environment variables (fast — no process-tree
+/// walk). Used by the CLI gate to pick agent-facing vs user-facing wording.
+///
+/// Env signatures:
+/// - Claude Code: `CLAUDECODE=1` / `CLAUDE_CODE_ENTRYPOINT`
+/// - Cursor: `CURSOR_TRACE_ID`
+/// - Codex: `CODEX_HOME` set AND stdout non-TTY (an interactive human in a
+///   Codex-configured shell still has a TTY)
+///
+/// Returns `None` for a plain human terminal (the TTY backstop covers harnesses
+/// we haven't enumerated).
+pub fn detect_parent_harness() -> Option<crate::agents::AgentType> {
+    use crate::agents::AgentType;
+    use std::io::IsTerminal;
+
+    if std::env::var_os("CLAUDECODE").is_some()
+        || std::env::var_os("CLAUDE_CODE_ENTRYPOINT").is_some()
+    {
+        return Some(AgentType::ClaudeCode);
+    }
+    if std::env::var_os("CURSOR_TRACE_ID").is_some() {
+        return Some(AgentType::Cursor);
+    }
+    if std::env::var_os("CODEX_HOME").is_some() && !std::io::stdout().is_terminal() {
+        return Some(AgentType::Codex);
+    }
+    None
+}
+
 /// Detect the current harness by walking up the process tree.
 ///
 /// Inspects parent processes looking for known harness signatures. Only

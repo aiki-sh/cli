@@ -6,12 +6,36 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::LazyLock;
 use tempfile::TempDir;
+
+/// One hermetic `AIKI_HOME` for this whole test binary, holding the per-user
+/// markers that the init-v2 CLI gate looks up. Leaked so it outlives the
+/// spawned `aiki` processes.
+static TEST_AIKI_HOME: LazyLock<PathBuf> = LazyLock::new(|| {
+    let dir = TempDir::new().expect("create test aiki home");
+    let home = dir.path().join("aiki");
+    fs::create_dir_all(&home).expect("create aiki home");
+    std::mem::forget(dir);
+    home
+});
+
+/// Mark `repo_path` Active for the CLI gate: ensure a `.aiki/` directory and a
+/// per-user enable marker under [`TEST_AIKI_HOME`] keyed by the resolved path.
+fn enable_repo_for_gate(repo_path: &std::path::Path) {
+    fs::create_dir_all(repo_path.join(".aiki")).expect("create .aiki");
+    let stripped = repo_path.strip_prefix("/").unwrap_or(repo_path);
+    let marker = TEST_AIKI_HOME.join(".init/repos").join(stripped).join("enabled");
+    fs::create_dir_all(marker.parent().unwrap()).expect("create marker dir");
+    fs::write(&marker, "").expect("write marker");
+}
 
 /// Helper to create a temporary JJ repository for testing
 fn setup_test_repo() -> (TempDir, PathBuf) {
     let temp_dir = TempDir::new().unwrap();
-    let repo_path = temp_dir.path().to_path_buf();
+    // Canonicalize so the marker we write (keyed by the resolved path) matches
+    // the gate's lookup from the spawned aiki's getcwd (/private/var on macOS).
+    let repo_path = temp_dir.path().canonicalize().unwrap();
 
     // Initialize JJ repo (non-colocated)
     let output = Command::new("jj")
@@ -26,12 +50,17 @@ fn setup_test_repo() -> (TempDir, PathBuf) {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    // These tests hand-craft [aiki] provenance via `jj describe` rather than a
+    // full `aiki init`, so make the repo Active for the CLI gate explicitly.
+    enable_repo_for_gate(&repo_path);
+
     (temp_dir, repo_path)
 }
 
 /// Helper to run aiki command
 fn run_aiki(args: &[&str], cwd: &PathBuf) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_aiki"))
+        .env("AIKI_HOME", &*TEST_AIKI_HOME)
         .args(args)
         .current_dir(cwd)
         .output()
