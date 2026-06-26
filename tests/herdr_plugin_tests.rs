@@ -1,5 +1,5 @@
 //! Consumer-path integration tests for the staged `plugins/herdr/hooks.yaml`
-//! plugin (`aiki-sh/herdr`).
+//! plugin (`aiki-sh/aiki-plugin-herdr`).
 //!
 //! These tests drive the plugin through the REAL binary-stdin consumer path —
 //! `aiki hooks stdin --agent <a> --event <E>` with a JSON payload piped on
@@ -7,7 +7,7 @@
 //! recorders: the event flows through `event_bus::dispatch` →
 //! `handle_session_started`/`handle_session_resumed` → the `HookComposer`,
 //! which loads the project's `.aiki/hooks.yml`, expands its
-//! `include: [aiki-sh/herdr]`, and runs the plugin's
+//! `include: [aiki-sh/aiki-plugin-herdr]`, and runs the plugin's
 //! `session.started`/`session.resumed` shell action.
 //!
 //! The plugin is exercised via the EXACT staged file (`include_str!` of
@@ -141,7 +141,7 @@ impl HerdrFixture {
             .aiki_home
             .join("plugins")
             .join("aiki-sh")
-            .join("herdr");
+            .join("aiki-plugin-herdr");
         fs::create_dir_all(&plugin_dir).expect("create plugin dir");
         fs::write(plugin_dir.join("hooks.yaml"), STAGED_HERDR_PLUGIN).expect("install plugin");
 
@@ -150,7 +150,7 @@ impl HerdrFixture {
         fs::create_dir_all(&aiki_dir).expect("create .aiki dir");
         fs::write(
             aiki_dir.join("hooks.yml"),
-            "include:\n  - aiki-sh/herdr\n",
+            "include:\n  - aiki-sh/aiki-plugin-herdr\n",
         )
         .expect("write .aiki/hooks.yml");
 

@@ -102,7 +102,7 @@ include:
 #
 # Emitted by aiki's own orchestration commands (build, fix, loop, review),
 # not the editor. Neutral signals: plugins map them to external surfaces (the
-# aiki-sh/herdr plugin shows a running workflow as an agent row).
+# aiki-sh/aiki-plugin-herdr plugin shows a running workflow as an agent row).
 #
 # workflow.started:
 #   # Fires when an aiki workflow command begins (brackets the whole run)

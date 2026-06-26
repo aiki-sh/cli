@@ -95,7 +95,7 @@ Events fire at specific points in the AI agent lifecycle. Each event can have ha
 
 ### Workflow Lifecycle
 
-Emitted by Aiki's own orchestration commands (`build`, `fix`, `loop`, `review`), not by the editor. They are neutral lifecycle signals: plugins map them to external surfaces (for example, the `aiki-sh/herdr` plugin shows a running workflow as an agent row in herdr's sidebar).
+Emitted by Aiki's own orchestration commands (`build`, `fix`, `loop`, `review`), not by the editor. They are neutral lifecycle signals: plugins map them to external surfaces (for example, the `aiki-sh/aiki-plugin-herdr` plugin shows a running workflow as an agent row in herdr's sidebar).
 
 | Event | When it fires |
 |-------|--------------|

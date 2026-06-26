@@ -856,11 +856,11 @@ mod tests {
         let aiki_dir = tmp.path().join(".aiki");
         fs::create_dir_all(&aiki_dir).unwrap();
 
-        let plugin: PluginRef = "aiki-sh/herdr".parse().unwrap();
+        let plugin: PluginRef = "aiki-sh/aiki-plugin-herdr".parse().unwrap();
         add_to_hooks_yml(&aiki_dir, &plugin);
 
         let result = fs::read_to_string(aiki_dir.join("hooks.yml")).unwrap();
-        assert_eq!(result, "include:\n  - aiki-sh/herdr\n");
+        assert_eq!(result, "include:\n  - aiki-sh/aiki-plugin-herdr\n");
     }
 
     #[test]
@@ -873,7 +873,7 @@ mod tests {
         let original = "# project hooks\ninclude:\n  - aiki/way  # the way\nbefore:\n  commit:\n    - eslint/standard\n";
         fs::write(aiki_dir.join("hooks.yml"), original).unwrap();
 
-        let plugin: PluginRef = "aiki-sh/herdr".parse().unwrap();
+        let plugin: PluginRef = "aiki-sh/aiki-plugin-herdr".parse().unwrap();
         add_to_hooks_yml(&aiki_dir, &plugin);
 
         let result = fs::read_to_string(aiki_dir.join("hooks.yml")).unwrap();
@@ -883,9 +883,9 @@ mod tests {
         assert!(result.contains("before:"));
         assert!(result.contains("    - eslint/standard"));
         // New plugin appended into the include block (2-space indent matching existing item).
-        assert!(result.contains("  - aiki-sh/herdr"));
+        assert!(result.contains("  - aiki-sh/aiki-plugin-herdr"));
         // The new item lands inside the include block, before the `before:` key.
-        let new_idx = result.find("- aiki-sh/herdr").unwrap();
+        let new_idx = result.find("- aiki-sh/aiki-plugin-herdr").unwrap();
         let before_idx = result.find("before:").unwrap();
         assert!(new_idx < before_idx);
     }
@@ -896,7 +896,7 @@ mod tests {
         let aiki_dir = tmp.path().join(".aiki");
         fs::create_dir_all(&aiki_dir).unwrap();
 
-        let plugin: PluginRef = "aiki-sh/herdr".parse().unwrap();
+        let plugin: PluginRef = "aiki-sh/aiki-plugin-herdr".parse().unwrap();
         add_to_hooks_yml(&aiki_dir, &plugin);
         let after_first = fs::read_to_string(aiki_dir.join("hooks.yml")).unwrap();
 
@@ -905,7 +905,7 @@ mod tests {
         let after_second = fs::read_to_string(aiki_dir.join("hooks.yml")).unwrap();
 
         assert_eq!(after_first, after_second);
-        assert_eq!(after_second.matches("aiki-sh/herdr").count(), 1);
+        assert_eq!(after_second.matches("aiki-sh/aiki-plugin-herdr").count(), 1);
     }
 
     #[test]
@@ -917,14 +917,14 @@ mod tests {
         let original = "before:\n  commit:\n    - eslint/standard\n";
         fs::write(aiki_dir.join("hooks.yml"), original).unwrap();
 
-        let plugin: PluginRef = "aiki-sh/herdr".parse().unwrap();
+        let plugin: PluginRef = "aiki-sh/aiki-plugin-herdr".parse().unwrap();
         add_to_hooks_yml(&aiki_dir, &plugin);
 
         let result = fs::read_to_string(aiki_dir.join("hooks.yml")).unwrap();
         assert!(result.contains("before:"));
         assert!(result.contains("    - eslint/standard"));
         assert!(result.contains("include:"));
-        assert!(result.contains("- aiki-sh/herdr"));
+        assert!(result.contains("- aiki-sh/aiki-plugin-herdr"));
     }
 
     #[test]
@@ -936,7 +936,7 @@ mod tests {
         let original = "include:\n  - aiki/way\n";
         fs::write(aiki_dir.join("hooks.yml"), original).unwrap();
 
-        let plugin: PluginRef = "aiki-sh/herdr".parse().unwrap();
+        let plugin: PluginRef = "aiki-sh/aiki-plugin-herdr".parse().unwrap();
         add_to_hooks_yml(&aiki_dir, &plugin);
         remove_from_hooks_yml(&aiki_dir, &plugin);
 
