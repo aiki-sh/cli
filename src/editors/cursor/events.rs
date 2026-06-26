@@ -183,13 +183,6 @@ struct SessionEndPayload {
 // Event Building
 // ============================================================================
 
-/// Build AikiEvent from Cursor event read from stdin
-pub fn build_aiki_event_from_stdin() -> Result<AikiEvent> {
-    // Parse event - serde discriminates by eventName
-    let event: CursorEvent = super::super::read_stdin_json()?;
-    Ok(cursor_event_to_aiki(event))
-}
-
 /// Convert a parsed `CursorEvent` into an `AikiEvent`.
 ///
 /// Split out from the stdin read so the deserialize-and-dispatch path can be
@@ -207,6 +200,19 @@ fn cursor_event_to_aiki(event: CursorEvent) -> AikiEvent {
         CursorEvent::Stop { payload } => build_turn_completed_event(payload),
         CursorEvent::SessionEnd { payload } => build_session_ended_event(payload),
     }
+}
+
+/// Build AikiEvent from Cursor event read from stdin
+pub fn build_aiki_event_from_stdin() -> Result<AikiEvent> {
+    // Parse event - serde discriminates by eventName
+    let event: CursorEvent = super::super::read_stdin_json()?;
+    Ok(cursor_event_to_aiki(event))
+}
+
+/// Build AikiEvent from a pre-read Cursor payload buffer (the stdin-once path).
+pub fn build_aiki_event_from_json(payload: &[u8]) -> Result<AikiEvent> {
+    let event: CursorEvent = serde_json::from_slice(payload).map_err(anyhow::Error::from)?;
+    Ok(cursor_event_to_aiki(event))
 }
 
 /// Build turn.started event from beforeSubmitPrompt payload

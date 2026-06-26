@@ -66,6 +66,57 @@ pub fn configure_zed() -> Result<()> {
     Ok(())
 }
 
+/// Remove aiki's `agent_servers` entries from Zed settings (the inverse of
+/// [`configure_zed`]). Only removes entries whose `command == "aiki"`, leaving
+/// any the user configured for other tools. Drops `agent_servers` entirely if it
+/// becomes empty. Best-effort; returns false (no change) if absent. Like
+/// `configure_zed`, this strips `//` comments on rewrite (Zed JSONC is lossy here).
+pub fn remove_zed_config() -> Result<bool> {
+    let home = dirs::home_dir().context("Could not find home directory")?;
+    let zed_settings = home.join(".config/zed/settings.json");
+    if !zed_settings.exists() {
+        return Ok(false);
+    }
+
+    let content = fs::read_to_string(&zed_settings).context("Failed to read Zed settings.json")?;
+    let stripped: String = content
+        .lines()
+        .filter(|line| !line.trim().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut settings: Value =
+        serde_json::from_str(&stripped).context("Failed to parse Zed settings.json")?;
+
+    let Some(servers) = settings
+        .get_mut("agent_servers")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return Ok(false);
+    };
+
+    let aiki_keys: Vec<String> = servers
+        .iter()
+        .filter(|(_, v)| v.get("command").and_then(|c| c.as_str()) == Some("aiki"))
+        .map(|(k, _)| k.clone())
+        .collect();
+    if aiki_keys.is_empty() {
+        return Ok(false);
+    }
+    for key in &aiki_keys {
+        servers.remove(key);
+    }
+    if servers.is_empty() {
+        if let Some(obj) = settings.as_object_mut() {
+            obj.remove("agent_servers");
+        }
+    }
+
+    let pretty =
+        serde_json::to_string_pretty(&settings).context("Failed to serialize Zed settings")?;
+    fs::write(&zed_settings, pretty).context("Failed to write Zed settings.json")?;
+    Ok(true)
+}
+
 /// Check if Zed is configured to use aiki hooks acp proxy
 pub fn is_zed_configured() -> Result<bool> {
     let home = dirs::home_dir().context("Could not find home directory")?;

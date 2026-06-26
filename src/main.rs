@@ -57,6 +57,7 @@ const HELP_TEMPLATE: &str = "\
 
 Setup:
   init        Initialize Aiki in the current repository
+  remove      Remove Aiki from a repo, or disable it for you
   doctor      Diagnose and fix configuration issues
   plugin      Manage plugins (install, update, list, remove)
   config      Manage config settings (get, set, unset, file)
@@ -95,6 +96,21 @@ enum Commands {
         /// Only print error and warning messages (suppress normal output)
         #[arg(short, long)]
         quiet: bool,
+    },
+    /// Remove aiki from this repo (or just disable it for you)
+    Remove {
+        /// Also tear down the checked-in repo integration (.aiki/, the <aiki>
+        /// block, the instruction symlink, git config). Working-tree changes;
+        /// committing them affects teammates.
+        #[arg(long, alias = "repo")]
+        shared: bool,
+        /// Machine-wide teardown: editor hooks, the OTel receiver, and ~/.aiki
+        /// (which removes every per-user marker). Leaves checked-in .aiki/ alone.
+        #[arg(long)]
+        global: bool,
+        /// Skip confirmation prompts. Required for non-interactive --shared/--global.
+        #[arg(long)]
+        force: bool,
     },
     /// Diagnose and fix configuration issues
     Doctor {
@@ -332,6 +348,67 @@ fn main() {
     }
 }
 
+/// Commands that always run, regardless of init state. `--version`/`--help`
+/// (and `<sub> --help`) are handled by clap during `parse()` and never reach
+/// here. `hooks` is gated separately inside `run_stdin`.
+fn is_gate_allowlisted(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Init { .. }
+            | Commands::Remove { .. }
+            | Commands::Doctor { .. }
+            | Commands::Hooks { .. }
+    )
+}
+
+/// Hard-enforcement CLI gate: every non-allowlisted subcommand requires aiki to
+/// be Active in the current directory. Soft SessionStart signals are the
+/// proactive layer; this is the safety net for agents that drift onto `aiki`
+/// commands in a repo where aiki is installed but not enabled.
+fn enforce_cli_gate(command: &Commands) -> Result<()> {
+    use repos::InitState;
+
+    if is_gate_allowlisted(command) {
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    match repos::init_state(&cwd)? {
+        InitState::Active { .. } => Ok(()),
+        InitState::OrphanedMarker { root } => {
+            // CLI is not a hot path — opportunistically reap the stale marker
+            // (a teammate ran `aiki remove --shared` and pushed the removal).
+            let _ = std::fs::remove_file(repos::marker_path(&root));
+            Err(gate_refusal(&InitState::NotAikiRepo))
+        }
+        state => Err(gate_refusal(&state)),
+    }
+}
+
+/// Build the gate refusal error, worded for the detected audience: an agent
+/// harness is coached to ask the user and never auto-init; a human at a terminal
+/// gets the terse nudge.
+fn gate_refusal(state: &repos::InitState) -> error::AikiError {
+    use repos::InitState;
+    let under_harness = harnesses::detect_parent_harness().is_some();
+    let dormant = matches!(state, InitState::Dormant { .. });
+
+    let msg = match (under_harness, dormant) {
+        (true, true) => "This repo declares aiki but it is not enabled for this account. \
+            Ask the user to run `aiki init` if they want aiki here. Do NOT run `aiki init` or \
+            other `aiki` commands yourself unless the user explicitly requests it."
+            .to_string(),
+        (true, false) => "Aiki is not active in this repo. Ask the user whether they want to \
+            run `aiki init`. Do NOT run it yourself unless the user explicitly requests it."
+            .to_string(),
+        (false, true) => {
+            "This repo declares aiki. Run `aiki init` to opt in for your account.".to_string()
+        }
+        (false, false) => "aiki not active here. Run `aiki init` to enable.".to_string(),
+    };
+    error::AikiError::Other(anyhow::anyhow!(msg))
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -339,8 +416,12 @@ fn run() -> Result<()> {
         std::env::set_var("AIKI_DEBUG", "1");
     }
 
+    // Hard-enforcement gate (allowlist bypasses; `hooks` self-gates in run_stdin).
+    enforce_cli_gate(&cli.command)?;
+
     match cli.command {
         Commands::Init { quiet } => commands::init::run(quiet),
+        Commands::Remove { shared, global, force } => commands::remove::run(shared, global, force),
         Commands::Doctor { fix } => commands::doctor::run(fix),
         Commands::Plugin { command } => commands::plugin::run(command),
         Commands::Hooks { command } => match command {

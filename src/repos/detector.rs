@@ -60,31 +60,18 @@ impl RepoDetector {
 
     /// Find the aiki project root by walking up from `current_dir` looking for `.aiki/`.
     ///
-    /// Stops at the filesystem root or home directory.
+    /// Delegates to the free function [`crate::repos::find_aiki_root`] (the
+    /// single walk implementation), mapping its `Ok(None)` to the legacy "Not
+    /// in an aiki project" error so existing callers are untouched. The free
+    /// function skips aiki's own global home and walks to the filesystem root,
+    /// which also fixes the old ordering bug where this method checked `.aiki`
+    /// before its `$HOME` boundary and so returned `$HOME` as a phantom root.
     pub fn find_aiki_root(&self) -> Result<PathBuf> {
-        let home_dir = dirs::home_dir();
-        let mut current = self.current_dir.clone();
-
-        loop {
-            if current.join(".aiki").is_dir() {
-                return Ok(current);
-            }
-
-            // Stop at home directory
-            if let Some(ref home) = home_dir {
-                if current == *home {
-                    return Err(anyhow!(
-                        "Not in an aiki project\n\nRun 'aiki init' first to initialize this repository."
-                    ));
-                }
-            }
-
-            if !current.pop() {
-                return Err(anyhow!(
-                    "Not in an aiki project\n\nRun 'aiki init' first to initialize this repository."
-                ));
-            }
-        }
+        crate::repos::find_aiki_root(&self.current_dir)?.ok_or_else(|| {
+            anyhow!(
+                "Not in an aiki project\n\nRun 'aiki init' first to initialize this repository."
+            )
+        })
     }
 
     /// Check if a JJ repository exists at the given path

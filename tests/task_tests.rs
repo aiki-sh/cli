@@ -4609,6 +4609,17 @@ fn test_close_confidence_gate_fires_for_owned_session() {
     let gate_home_str = gate_home.path().to_str().unwrap().to_owned();
     let envs: &[(&str, &str)] = &[("AIKI_HOME", &gate_home_str)];
 
+    // The CLI gate looks up the per-user marker under the *active* AIKI_HOME, so
+    // enable the repo under this dedicated gate home (init_aiki_repo only wrote
+    // the marker under the shared per-binary home).
+    common::aiki_cmd()
+        .current_dir(temp_dir.path())
+        .env("AIKI_HOME", gate_home.path())
+        .arg("init")
+        .arg("--quiet")
+        .output()
+        .expect("enable repo under gate home");
+
     // Stage a live session owned by this test process.
     let session_id = "aiki-gate-test-session";
     fs::write(

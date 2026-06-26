@@ -384,6 +384,36 @@ pub fn parse_permission_request(msg: &JsonRpcMessage) -> Option<PermissionReques
 }
 
 // ============================================================================
+// Per-session recording gate
+// ============================================================================
+
+/// Per-session init-state gate for the ACP recording path.
+///
+/// Returns `true` only when the ACP-reported session `cwd` resolves to
+/// [`crate::repos::InitState::Active`] — `.aiki/` present AND this user has
+/// opted in via the per-user enable marker. For any other state (`Dormant`,
+/// `OrphanedMarker`, `NotAikiRepo`) or an absent cwd, recording is skipped while
+/// traffic keeps flowing unchanged.
+///
+/// The long-lived `aiki hooks acp` proxy runs with the IDE's process cwd, not
+/// the repo root, so the top-level CLI gate exempts all of `Commands::Hooks`.
+/// The repo cwd is only learned per-session from ACP `session/new`/`session/load`,
+/// which is why this gate must run per-session at each recording site (the
+/// `hooks stdin` path self-gates the same way via `init_state`).
+///
+/// Read-only by contract: it classifies, never creating or reaping markers
+/// (mirrors `cli/src/commands/hooks.rs`).
+pub(crate) fn acp_recording_enabled(cwd: &Option<PathBuf>) -> bool {
+    match cwd {
+        Some(p) => matches!(
+            crate::repos::init_state(p),
+            Ok(crate::repos::InitState::Active { .. })
+        ),
+        None => false,
+    }
+}
+
+// ============================================================================
 // Session update handling
 // ============================================================================
 
@@ -399,6 +429,11 @@ pub fn handle_session_update(
     cwd: &Option<PathBuf>,
     tool_call_contexts: &mut HashMap<ToolCallId, ToolCallContext>,
 ) -> Result<()> {
+    // Skip provenance recording unless this session's repo is Active.
+    if !acp_recording_enabled(cwd) {
+        return Ok(());
+    }
+
     // Parse session/update params
     let params = msg
         .params
@@ -637,6 +672,11 @@ pub fn fire_session_start_event(
     cwd: &Option<PathBuf>,
     agent_pid: Option<u32>,
 ) -> Result<()> {
+    // Skip provenance recording unless this session's repo is Active.
+    if !acp_recording_enabled(cwd) {
+        return Ok(());
+    }
+
     // Get working directory (required)
     let working_dir = cwd
         .as_ref()
@@ -680,6 +720,11 @@ pub fn fire_pre_file_change_event(
     kind: ToolKind,
     file_paths: Vec<String>,
 ) -> Result<()> {
+    // Skip provenance recording unless this session's repo is Active.
+    if !acp_recording_enabled(cwd) {
+        return Ok(());
+    }
+
     // Get working directory (required)
     let working_dir = cwd
         .as_ref()
@@ -980,6 +1025,11 @@ pub fn handle_session_end(
     autoreply_tx: &mpsc::Sender<AutoreplyMessage>,
     prompt_requests: &mut HashMap<JsonRpcId, SessionId>,
 ) -> Result<()> {
+    // Skip provenance recording unless this session's repo is Active.
+    if !acp_recording_enabled(cwd) {
+        return Ok(());
+    }
+
     // Get working directory with fallback
     let working_dir = cwd
         .as_ref()
@@ -1179,5 +1229,87 @@ mod tests {
         assert_eq!(summed.output, 50);
         assert_eq!(summed.cache_read, 30);
         assert_eq!(summed.cache_created, 5);
+    }
+
+    use std::fs;
+    use std::path::Path;
+
+    /// Run `f` with `AIKI_HOME` pointed at `home`, serialized against other
+    /// tests that touch the env var. Mirrors the harness in
+    /// `cli/src/repos/init_state.rs`.
+    fn with_aiki_home<F: FnOnce() -> R, R>(home: &Path, f: F) -> R {
+        let _lock = crate::global::AIKI_HOME_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let original = std::env::var(crate::global::AIKI_HOME_ENV).ok();
+        std::env::set_var(crate::global::AIKI_HOME_ENV, home);
+        let result = f();
+        match original {
+            Some(v) => std::env::set_var(crate::global::AIKI_HOME_ENV, v),
+            None => std::env::remove_var(crate::global::AIKI_HOME_ENV),
+        }
+        result
+    }
+
+    /// Create the per-user enable marker for `repo_root` under the active global
+    /// home, reusing the real `marker_path` so the layout matches `init_state`.
+    fn write_marker(repo_root: &Path) {
+        let path = crate::repos::marker_path(repo_root);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "").unwrap();
+    }
+
+    /// `.aiki/` present AND enable marker present → `Active` → records.
+    #[test]
+    fn gate_active_records() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir(repo.path().join(".aiki")).unwrap();
+        with_aiki_home(home.path(), || {
+            write_marker(repo.path());
+            assert!(acp_recording_enabled(&Some(repo.path().to_path_buf())));
+        });
+    }
+
+    /// `.aiki/` present but no marker → `Dormant` → skips.
+    #[test]
+    fn gate_dormant_skips() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir(repo.path().join(".aiki")).unwrap();
+        with_aiki_home(home.path(), || {
+            assert!(!acp_recording_enabled(&Some(repo.path().to_path_buf())));
+        });
+    }
+
+    /// Neither `.aiki/` nor marker → `NotAikiRepo` → skips.
+    #[test]
+    fn gate_not_aiki_repo_skips() {
+        let home = tempfile::tempdir().unwrap();
+        let plain = tempfile::tempdir().unwrap();
+        with_aiki_home(home.path(), || {
+            assert!(!acp_recording_enabled(&Some(plain.path().to_path_buf())));
+        });
+    }
+
+    /// Marker present but no `.aiki/` → `OrphanedMarker` → skips.
+    #[test]
+    fn gate_orphaned_marker_skips() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        // Note: no `.aiki/` created — only the marker survives.
+        with_aiki_home(home.path(), || {
+            write_marker(repo.path());
+            assert!(!acp_recording_enabled(&Some(repo.path().to_path_buf())));
+        });
+    }
+
+    /// `cwd == None` → skips (no repo to classify).
+    #[test]
+    fn gate_none_cwd_skips() {
+        let home = tempfile::tempdir().unwrap();
+        with_aiki_home(home.path(), || {
+            assert!(!acp_recording_enabled(&None));
+        });
     }
 }

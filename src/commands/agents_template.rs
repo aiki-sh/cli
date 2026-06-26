@@ -42,6 +42,14 @@ const fn const_fnv1a(s: &str) -> u64 {
 /// Template body (everything after the opening tag)
 const AIKI_BLOCK_INNER: &str = r#"
 
+## Activation Status
+
+**These instructions are ACTIVE only when this session's `SessionStart` context says "Aiki is active."** If a `SessionStart` notice instead says aiki is not active (installed but not enabled in this repo), treat this entire block as DORMANT: do not run `aiki` commands, do not use `aiki task` or `aiki run`, and follow your harness's native workflow instead. The user can run `aiki init` to enable aiki here; do not run it for them unless they explicitly ask.
+
+If no `SessionStart` context mentions aiki at all (for example the `aiki` binary is missing, or this block was left behind after aiki was removed from the repo), also treat it as dormant.
+
+When aiki is active, follow everything below.
+
 ## ⛔ STOP - Read This First
 
 **Before doing ANY work, you MUST run:**

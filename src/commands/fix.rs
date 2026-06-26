@@ -97,8 +97,14 @@ pub fn run(mut args: FixArgs) -> Result<()> {
     )?;
     // resolve_ref_list guarantees non-empty Vec (returns Err otherwise)
     let review_id = refs.into_iter().next().ok_or_else(|| AikiError::InvalidArgument("No task reference provided".to_string()))?.0;
+    // Emit workflow.started/completed lifecycle events so plugins (e.g. herdr)
+    // can observe this command. Neutral — no integration-specific code here.
+    let mut wf = crate::commands::lifecycle::WorkflowGuard::start("fix");
+
     let opts = FixOpts::from_args(&args, review_id)?;
     fix::run(&cwd, &opts)?;
+
+    wf.succeeded();
     Ok(())
 }
 

@@ -429,6 +429,53 @@ feature.started:
         }
     }
 
+    /// The staged herdr plugin must parse and define the workflow lifecycle
+    /// handlers (plus keep the session identity handlers). It shows just the
+    /// workflow name, so it deliberately does NOT subscribe to step.started.
+    /// Baked in at compile time so it exercises the real plugin, not a copy.
+    #[test]
+    fn staged_herdr_plugin_defines_workflow_handlers() {
+        const PLUGIN: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../plugins/herdr/hooks.yaml"
+        ));
+
+        let hook = HookParser::parse_str(PLUGIN).expect("staged herdr plugin parses");
+        let after = hook
+            .after
+            .first()
+            .expect("plugin composes via a single `after:` block");
+        let h = &after.handlers;
+
+        // Workflow-command lifecycle handlers (workflow name only — no per-step).
+        assert_eq!(h.workflow_started.len(), 1, "workflow.started handler");
+        assert_eq!(h.workflow_completed.len(), 1, "workflow.completed handler");
+        assert_eq!(
+            h.step_started.len(),
+            0,
+            "plugin shows the workflow name only, so it must NOT subscribe to step.started"
+        );
+
+        // No regression: identity handlers still present.
+        assert_eq!(h.session_started.len(), 1, "session.started handler");
+        assert_eq!(h.session_resumed.len(), 1, "session.resumed handler");
+
+        // The handlers invoke the expected herdr verbs (catches flag/command drift).
+        let started = format!("{:?}", h.workflow_started[0]);
+        assert!(started.contains("report-agent"), "workflow.started reports an agent");
+        assert!(started.contains("--state working"), "workflow.started is working");
+        assert!(
+            started.contains("--display-agent"),
+            "workflow.started labels the row with the workflow name"
+        );
+        let completed = format!("{:?}", h.workflow_completed[0]);
+        assert!(completed.contains("release-agent"), "workflow.completed releases");
+        assert!(
+            completed.contains("--clear-display-agent") && completed.contains("--clear-custom-status"),
+            "workflow.completed clears metadata so no stale label lingers"
+        );
+    }
+
     #[test]
     fn test_parse_multiple_sugar_patterns_same_base() {
         use super::super::types::HookStatement;

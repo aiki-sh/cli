@@ -8,6 +8,7 @@ mod detect;
 pub mod runtime;
 
 pub use detect::detect_harness_from_process_tree;
+pub use detect::detect_parent_harness;
 
 use crate::agents::AgentType;
 use definition::HarnessDefinition;

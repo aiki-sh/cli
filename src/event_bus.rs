@@ -56,6 +56,11 @@ pub fn dispatch(event: AikiEvent) -> Result<HookResult> {
             // Task lifecycle
             AikiEvent::TaskStarted(_) => "task.started",
             AikiEvent::TaskClosed(_) => "task.closed",
+            // Workflow command lifecycle
+            AikiEvent::WorkflowStarted(_) => "workflow.started",
+            AikiEvent::WorkflowCompleted(_) => "workflow.completed",
+            AikiEvent::StepStarted(_) => "step.started",
+            AikiEvent::StepCompleted(_) => "step.completed",
             // Fallback
             AikiEvent::Unsupported => "unsupported",
         };
@@ -144,6 +149,12 @@ pub fn dispatch(event: AikiEvent) -> Result<HookResult> {
         // Task lifecycle
         AikiEvent::TaskStarted(e) => events::handle_task_started(e),
         AikiEvent::TaskClosed(e) => events::handle_task_closed(e),
+
+        // Workflow command lifecycle
+        AikiEvent::WorkflowStarted(e) => events::handle_workflow_started(e),
+        AikiEvent::WorkflowCompleted(e) => events::handle_workflow_completed(e),
+        AikiEvent::StepStarted(e) => events::handle_step_started(e),
+        AikiEvent::StepCompleted(e) => events::handle_step_completed(e),
 
         // Fallback
         AikiEvent::Unsupported => return Ok(HookResult::success()),

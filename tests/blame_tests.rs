@@ -10,9 +10,32 @@ use tempfile::TempDir;
 /// Test that records a change and then runs blame to verify attribution
 #[test]
 fn test_blame_shows_recorded_change() {
-    // Create a temporary directory
+    // Create a temporary directory. Canonicalize so the marker `aiki init` keys
+    // by its resolved getcwd matches the gate's lookup from the hook payload cwd.
     let temp_dir = TempDir::new().unwrap();
-    let repo_path = temp_dir.path();
+    let repo_path_buf = temp_dir.path().canonicalize().unwrap();
+    let repo_path = repo_path_buf.as_path();
+
+    // One stable hermetic home shared by every aiki invocation here: init writes
+    // the per-user marker under AIKI_HOME, and the init-v2 gate looks it up there
+    // for the hook and blame calls (all non-allowlisted, so all gated).
+    let hermetic = TempDir::new().unwrap();
+    let hermetic_aiki_home = hermetic.path().join("aiki");
+    let hermetic_home = hermetic.path().join("home");
+    fs::create_dir_all(&hermetic_aiki_home).unwrap();
+    fs::create_dir_all(hermetic_home.join(".config")).unwrap();
+    fs::write(
+        hermetic_home.join(".gitconfig"),
+        "[user]\n\tname = Aiki Test\n\temail = test@example.com\n",
+    )
+    .unwrap();
+    let shared_env: Vec<(&str, std::ffi::OsString)> = vec![
+        ("AIKI_HOME", hermetic_aiki_home.clone().into_os_string()),
+        ("HOME", hermetic_home.clone().into_os_string()),
+        ("XDG_CONFIG_HOME", hermetic_home.join(".config").into_os_string()),
+        ("JJ_USER", "Aiki Test".into()),
+        ("JJ_EMAIL", "test@example.com".into()),
+    ];
 
     // Initialize git repository
     Command::new("git")
@@ -53,7 +76,9 @@ fn test_blame_shows_recorded_change() {
     // Initialize aiki (this will also do git import)
     let aiki_bin = get_aiki_binary_path();
     let mut cmd = Command::new(&aiki_bin);
-    common::hermetic_env(&mut cmd);
+    for (k, v) in &shared_env {
+        cmd.env(k, v);
+    }
     let output = cmd
         .arg("init")
         .current_dir(repo_path)
@@ -100,7 +125,11 @@ fn test_blame_shows_recorded_change() {
             &format!(r#""file_path": "{}""#, test_file.display()),
         );
 
-    let output = Command::new(&aiki_bin)
+    let mut hook_cmd = Command::new(&aiki_bin);
+    for (k, v) in &shared_env {
+        hook_cmd.env(k, v);
+    }
+    let output = hook_cmd
         .arg("hooks")
         .arg("stdin")
         .arg("--agent")
@@ -195,7 +224,11 @@ fn test_blame_shows_recorded_change() {
     );
 
     // Run blame on the file
-    let output = Command::new(&aiki_bin)
+    let mut blame_cmd = Command::new(&aiki_bin);
+    for (k, v) in &shared_env {
+        blame_cmd.env(k, v);
+    }
+    let output = blame_cmd
         .args(["blame", "test.txt"])
         .current_dir(repo_path)
         .output()

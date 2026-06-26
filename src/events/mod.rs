@@ -269,6 +269,22 @@ pub enum AikiEvent {
     TaskClosed(AikiTaskClosedPayload),
 
     // ========================================================================
+    // Workflow command lifecycle (synthetic — emitted by aiki itself, not a harness)
+    // ========================================================================
+    /// Workflow command started (build/fix/loop/review) - brackets the run
+    #[serde(rename = "workflow.started")]
+    WorkflowStarted(AikiWorkflowStartedPayload),
+    /// Workflow command completed - brackets the run
+    #[serde(rename = "workflow.completed")]
+    WorkflowCompleted(AikiWorkflowCompletedPayload),
+    /// A single step within a workflow started (granular detail)
+    #[serde(rename = "step.started")]
+    StepStarted(AikiStepStartedPayload),
+    /// A single step within a workflow completed
+    #[serde(rename = "step.completed")]
+    StepCompleted(AikiStepCompletedPayload),
+
+    // ========================================================================
     // Fallback
     // ========================================================================
     /// Unsupported event (unknown events or non-file tools that don't require processing)
@@ -315,8 +331,52 @@ impl AikiEvent {
             // Task lifecycle
             Self::TaskStarted(e) => &e.cwd,
             Self::TaskClosed(e) => &e.cwd,
+            // Workflow command lifecycle
+            Self::WorkflowStarted(e) => &e.cwd,
+            Self::WorkflowCompleted(e) => &e.cwd,
+            Self::StepStarted(e) => &e.cwd,
+            Self::StepCompleted(e) => &e.cwd,
             // Fallback
             Self::Unsupported => Path::new("."),
+        }
+    }
+
+    /// The event's timestamp. Every event carries one except `Unsupported`.
+    ///
+    /// Exposed to flows as `event.timestamp` (RFC 3339) and `event.timestamp_ns`
+    /// (integer nanoseconds since the Unix epoch), so handlers can derive any
+    /// time format they need — e.g. a herdr `--seq` — without shelling out.
+    #[must_use]
+    pub fn timestamp(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Self::SessionStarted(e) => Some(e.timestamp),
+            Self::SessionResumed(e) => Some(e.timestamp),
+            Self::SessionWillCompact(e) => Some(e.timestamp),
+            Self::SessionCompacted(e) => Some(e.timestamp),
+            Self::SessionCleared(e) => Some(e.timestamp),
+            Self::SessionEnded(e) => Some(e.timestamp),
+            Self::TurnStarted(e) => Some(e.timestamp),
+            Self::TurnCompleted(e) => Some(e.timestamp),
+            Self::ReadPermissionAsked(e) => Some(e.timestamp),
+            Self::ReadCompleted(e) => Some(e.timestamp),
+            Self::ChangePermissionAsked(e) => Some(e.timestamp),
+            Self::ChangeCompleted(e) => Some(e.timestamp),
+            Self::ShellPermissionAsked(e) => Some(e.timestamp),
+            Self::ShellCompleted(e) => Some(e.timestamp),
+            Self::WebPermissionAsked(e) => Some(e.timestamp),
+            Self::WebCompleted(e) => Some(e.timestamp),
+            Self::McpPermissionAsked(e) => Some(e.timestamp),
+            Self::McpCompleted(e) => Some(e.timestamp),
+            Self::CommitMessageStarted(e) => Some(e.timestamp),
+            Self::ModelChanged(e) => Some(e.timestamp),
+            Self::RepoChanged(e) => Some(e.timestamp),
+            Self::TaskStarted(e) => Some(e.timestamp),
+            Self::TaskClosed(e) => Some(e.timestamp),
+            Self::WorkflowStarted(e) => Some(e.timestamp),
+            Self::WorkflowCompleted(e) => Some(e.timestamp),
+            Self::StepStarted(e) => Some(e.timestamp),
+            Self::StepCompleted(e) => Some(e.timestamp),
+            Self::Unsupported => None,
         }
     }
 
@@ -358,6 +418,11 @@ impl AikiEvent {
             // Task lifecycle (tasks don't have a session, so use Unknown)
             Self::TaskStarted(_) => AgentType::Unknown,
             Self::TaskClosed(_) => AgentType::Unknown,
+            // Workflow command lifecycle (aiki itself, no agent session)
+            Self::WorkflowStarted(_) => AgentType::Unknown,
+            Self::WorkflowCompleted(_) => AgentType::Unknown,
+            Self::StepStarted(_) => AgentType::Unknown,
+            Self::StepCompleted(_) => AgentType::Unknown,
             // Fallback
             Self::Unsupported => AgentType::Unknown,
         }
@@ -414,6 +479,12 @@ mod commit_message_started;
 mod task_closed;
 mod task_started;
 
+// Workflow command lifecycle (synthetic, emitted by aiki itself)
+mod step_completed;
+mod step_started;
+mod workflow_completed;
+mod workflow_started;
+
 // ============================================================================
 // Re-exports
 // ============================================================================
@@ -468,6 +539,12 @@ pub use commit_message_started::*;
 // Task lifecycle
 pub use task_closed::*;
 pub use task_started::*;
+
+// Workflow command lifecycle (synthetic, emitted by aiki itself)
+pub use step_completed::*;
+pub use step_started::*;
+pub use workflow_completed::*;
+pub use workflow_started::*;
 
 // ============================================================================
 // From Trait Implementations (enables vendor .into() pattern)
@@ -610,6 +687,30 @@ impl From<AikiTaskStartedPayload> for AikiEvent {
 impl From<AikiTaskClosedPayload> for AikiEvent {
     fn from(payload: AikiTaskClosedPayload) -> Self {
         AikiEvent::TaskClosed(payload)
+    }
+}
+
+impl From<AikiWorkflowStartedPayload> for AikiEvent {
+    fn from(payload: AikiWorkflowStartedPayload) -> Self {
+        AikiEvent::WorkflowStarted(payload)
+    }
+}
+
+impl From<AikiWorkflowCompletedPayload> for AikiEvent {
+    fn from(payload: AikiWorkflowCompletedPayload) -> Self {
+        AikiEvent::WorkflowCompleted(payload)
+    }
+}
+
+impl From<AikiStepStartedPayload> for AikiEvent {
+    fn from(payload: AikiStepStartedPayload) -> Self {
+        AikiEvent::StepStarted(payload)
+    }
+}
+
+impl From<AikiStepCompletedPayload> for AikiEvent {
+    fn from(payload: AikiStepCompletedPayload) -> Self {
+        AikiEvent::StepCompleted(payload)
     }
 }
 

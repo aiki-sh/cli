@@ -22,6 +22,25 @@ pub fn build_command_output(response: HookResult, event_type: &str) -> HookComma
     }
 }
 
+/// Build the "aiki not active" SessionStart output for Claude Code.
+///
+/// Sets both channels (per `cli/src/editors/claude_code/output.rs`):
+/// - `systemMessage`: the user-visible banner under the startup splash.
+/// - `hookSpecificOutput.additionalContext`: the agent-visible dormancy notice.
+///
+/// Lives next to [`build_session_start_output`] so the banner formatting (ANSI
+/// codes, kanji glyph) stays alongside its active-state sibling.
+pub fn build_not_active_output(reason: crate::editors::NotActiveReason) -> HookCommandOutput {
+    let json_value = json!({
+        "systemMessage": format!("\x1b[38;2;204;85;0m合\x1b[0m {}", reason.banner()),
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": reason.agent_context()
+        }
+    });
+    HookCommandOutput::new(Some(json_value), 0)
+}
+
 /// Build SessionStart command output for Claude Code
 fn build_session_start_output(response: &HookResult) -> HookCommandOutput {
     let combined = response.combined_output();

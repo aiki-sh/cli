@@ -24,6 +24,15 @@ pub fn run(fix: bool) -> Result<()> {
         println!("Checking Aiki health...\n");
     }
 
+    // Lazy reaper: clean per-user markers whose repos no longer exist. Read-only
+    // for the rest of doctor — this is the one place (besides `aiki init`) that
+    // removes stale markers. It NEVER creates a marker (that is reserved for
+    // `aiki init`, so legacy auto-init repos are not silently re-enrolled).
+    let reaped = crate::repos::reap_stale_markers();
+    if reaped > 0 {
+        println!("✓ Reaped {reaped} stale aiki marker(s)\n");
+    }
+
     // Check prerequisites
     println!("Prerequisites:");
 
@@ -230,6 +239,13 @@ pub fn run(fix: bool) -> Result<()> {
             issues_found += 1;
         }
     }
+
+    // Detect duplicate aiki-owned hook entries. The append-and-filter installers
+    // never create duplicates, but a historical clobber bug or future detection
+    // drift could; --fix dedupes, keeping the first aiki entry per event.
+    issues_found += check_duplicate_aiki_hooks(&claude_settings, "Claude Code settings.json", fix);
+    issues_found += check_duplicate_aiki_hooks(&cursor_hooks_path, "Cursor hooks.json", fix);
+    issues_found += check_duplicate_aiki_hooks(&codex_hooks_path, "Codex hooks.json", fix);
 
     // Check Codex OTel receiver socket (non-blocking connection test)
     let otel_receiver_ok = check_otel_receiver();
@@ -1556,6 +1572,133 @@ fn edit_distance(a: &str, b: &str) -> usize {
     }
 
     prev[n]
+}
+
+/// Returns true if a hook entry is aiki-owned. Handles both the Cursor flat
+/// shape (`{ "command": "..." }`) and the Claude/Codex nested shape
+/// (`{ "hooks": [{ "command": "..." }] }`).
+fn entry_is_aiki_owned(entry: &serde_json::Value) -> bool {
+    // Cursor: command lives directly on the entry.
+    if let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) {
+        if crate::config::command_invokes_aiki_hook(cmd) {
+            return true;
+        }
+    }
+    // Claude Code / Codex: command lives in a nested `hooks` array.
+    entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .map(|hooks| {
+            hooks.iter().any(|h| {
+                h.get("command")
+                    .and_then(|c| c.as_str())
+                    .map(crate::config::command_invokes_aiki_hook)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Count aiki-owned hook entries beyond the first within each event array under
+/// the top-level `hooks` map. Zero means no duplicates.
+fn count_duplicate_aiki_hook_entries(root: &serde_json::Value) -> usize {
+    let Some(hooks) = root.get("hooks").and_then(|v| v.as_object()) else {
+        return 0;
+    };
+    let mut dupes = 0;
+    for arr in hooks.values() {
+        if let Some(arr) = arr.as_array() {
+            let aiki_count = arr.iter().filter(|e| entry_is_aiki_owned(e)).count();
+            if aiki_count > 1 {
+                dupes += aiki_count - 1;
+            }
+        }
+    }
+    dupes
+}
+
+/// Remove duplicate aiki-owned entries, keeping the first per event. Returns the
+/// number removed.
+fn dedupe_aiki_hook_entries(root: &mut serde_json::Value) -> usize {
+    let Some(hooks) = root.get_mut("hooks").and_then(|v| v.as_object_mut()) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for arr in hooks.values_mut() {
+        if let Some(arr) = arr.as_array_mut() {
+            let mut seen = false;
+            arr.retain(|entry| {
+                if entry_is_aiki_owned(entry) {
+                    if seen {
+                        removed += 1;
+                        false
+                    } else {
+                        seen = true;
+                        true
+                    }
+                } else {
+                    true
+                }
+            });
+        }
+    }
+    removed
+}
+
+/// Report duplicate aiki hook entries in a JSON hook config and, under `--fix`,
+/// dedupe in place (keeping the first aiki entry per event). Returns the number
+/// of unresolved issues (1 when duplicates exist and `--fix` is off, else 0).
+///
+/// Missing or malformed files are skipped silently — the per-editor checks above
+/// already diagnose those.
+fn check_duplicate_aiki_hooks(path: &std::path::Path, label: &str, fix: bool) -> usize {
+    if !path.exists() {
+        return 0;
+    }
+    let Ok(content) = fs::read_to_string(path) else {
+        return 0;
+    };
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return 0;
+    };
+
+    let dupes = count_duplicate_aiki_hook_entries(&json);
+    if dupes == 0 {
+        return 0;
+    }
+
+    println!(
+        "  ⚠ {} has {} duplicate aiki hook entr{}",
+        label,
+        dupes,
+        if dupes == 1 { "y" } else { "ies" }
+    );
+
+    if !fix {
+        println!("    → Run: aiki doctor --fix");
+        return 1;
+    }
+
+    let removed = dedupe_aiki_hook_entries(&mut json);
+    let write_result = serde_json::to_string_pretty(&json)
+        .context("Failed to serialize hook config")
+        .and_then(|out| {
+            fs::write(path, out).with_context(|| format!("Failed to write {}", path.display()))
+        });
+    match write_result {
+        Ok(()) => {
+            println!(
+                "    ✓ Removed {} duplicate entr{}",
+                removed,
+                if removed == 1 { "y" } else { "ies" }
+            );
+            0
+        }
+        Err(e) => {
+            println!("    ✗ Failed to dedupe: {}", e);
+            1
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2988,5 +3131,139 @@ protocol = "binary"
         let status = check_cursor_hooks(file.path());
         assert!(status.all_present);
         assert!(!status.has_old_format);
+    }
+
+    // --- Duplicate aiki hook detection / dedupe ---
+
+    #[test]
+    fn entry_is_aiki_owned_recognizes_both_shapes() {
+        // Cursor flat shape.
+        assert!(entry_is_aiki_owned(
+            &serde_json::json!({ "command": "aiki hooks stdin --cursor stop" })
+        ));
+        // Claude/Codex nested shape.
+        assert!(entry_is_aiki_owned(&serde_json::json!({
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "aiki hooks stdin --claude Stop" }]
+        })));
+        // Foreign entries in both shapes.
+        assert!(!entry_is_aiki_owned(
+            &serde_json::json!({ "command": "other-tool run" })
+        ));
+        assert!(!entry_is_aiki_owned(&serde_json::json!({
+            "hooks": [{ "type": "command", "command": "other-tool run" }]
+        })));
+    }
+
+    #[test]
+    fn count_duplicate_aiki_hook_entries_counts_extras_per_event() {
+        let config = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [{ "command": "aiki hooks stdin --claude SessionStart" }] },
+                    { "hooks": [{ "command": "aiki hooks stdin --claude SessionStart" }] },
+                    { "hooks": [{ "command": "other-tool blah" }] }
+                ],
+                "Stop": [
+                    { "hooks": [{ "command": "aiki hooks stdin --claude Stop" }] }
+                ]
+            }
+        });
+        // SessionStart: 2 aiki entries → 1 duplicate. Stop: 1 → none.
+        assert_eq!(count_duplicate_aiki_hook_entries(&config), 1);
+    }
+
+    #[test]
+    fn count_duplicate_aiki_hook_entries_zero_when_clean() {
+        let config = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [{ "command": "aiki hooks stdin --claude SessionStart" }] },
+                    { "hooks": [{ "command": "other-tool blah" }] }
+                ]
+            }
+        });
+        assert_eq!(count_duplicate_aiki_hook_entries(&config), 0);
+    }
+
+    #[test]
+    fn dedupe_aiki_hook_entries_keeps_first_and_preserves_foreign() {
+        let mut config = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [{ "command": "other-tool first" }] },
+                    { "hooks": [{ "command": "aiki hooks stdin --claude SessionStart" }] },
+                    { "hooks": [{ "command": "aiki hooks stdin --claude SessionStart" }] },
+                    { "hooks": [{ "command": "other-tool last" }] }
+                ]
+            }
+        });
+
+        let removed = dedupe_aiki_hook_entries(&mut config);
+
+        assert_eq!(removed, 1, "one duplicate aiki entry removed");
+        let arr = config["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(arr.len(), 3, "two foreign + one aiki remain");
+        assert_eq!(
+            arr[0]["hooks"][0]["command"].as_str(),
+            Some("other-tool first"),
+            "foreign entries keep their order"
+        );
+        assert_eq!(arr[2]["hooks"][0]["command"].as_str(), Some("other-tool last"));
+        assert_eq!(
+            arr.iter().filter(|e| entry_is_aiki_owned(e)).count(),
+            1,
+            "exactly one aiki entry remains"
+        );
+        // Idempotent: a second dedupe removes nothing.
+        assert_eq!(dedupe_aiki_hook_entries(&mut config), 0);
+    }
+
+    #[test]
+    fn dedupe_handles_cursor_flat_shape() {
+        let mut config = serde_json::json!({
+            "hooks": {
+                "stop": [
+                    { "command": "aiki hooks stdin --cursor stop" },
+                    { "command": "aiki hooks stdin --cursor stop" }
+                ]
+            }
+        });
+        assert_eq!(dedupe_aiki_hook_entries(&mut config), 1);
+        assert_eq!(config["hooks"]["stop"].as_array().unwrap().len(), 1);
+    }
+
+    // --- Windows `.exe`-form detection (review issues #2 & #3) ---
+    //
+    // `aiki.exe hooks stdin ...` lacks the literal `aiki hooks stdin`
+    // substring, so the old check failed to recognize/dedupe it. Detection now
+    // shares config::command_invokes_aiki_hook, which tokenizes the command.
+
+    #[test]
+    fn entry_is_aiki_owned_recognizes_exe_form() {
+        // Claude/Codex nested shape, Windows .exe binary.
+        assert!(entry_is_aiki_owned(&serde_json::json!({
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": "aiki.exe hooks stdin --claude SessionStart" }]
+        })));
+        // Cursor flat shape, Windows .exe binary.
+        assert!(entry_is_aiki_owned(
+            &serde_json::json!({ "command": "aiki.exe hooks stdin --cursor stop" })
+        ));
+    }
+
+    #[test]
+    fn count_duplicate_aiki_hook_entries_counts_exe_form() {
+        // Two .exe-form aiki entries in one event used to count as 0 duplicates
+        // (the substring check missed them); they now count as 1.
+        let config = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [{ "command": "aiki.exe hooks stdin --claude SessionStart" }] },
+                    { "hooks": [{ "command": "aiki.exe hooks stdin --claude SessionStart" }] }
+                ]
+            }
+        });
+        assert_eq!(count_duplicate_aiki_hook_entries(&config), 1);
     }
 }

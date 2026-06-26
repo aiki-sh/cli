@@ -130,8 +130,9 @@
 use crate::cache::debug_log;
 use crate::commands::zed_detection;
 use crate::editors::acp::handlers::{
-    create_session, fire_pre_file_change_event, fire_session_start_event, handle_session_end,
-    handle_session_prompt, handle_session_update, parse_acp_meta, parse_permission_request,
+    acp_recording_enabled, create_session, fire_pre_file_change_event, fire_session_start_event,
+    handle_session_end, handle_session_prompt, handle_session_update, parse_acp_meta,
+    parse_permission_request,
     ToolCallContext,
 };
 use crate::editors::acp::protocol::{
@@ -951,20 +952,25 @@ pub fn run(agent: String, bin: Option<String>, agent_args: Vec<String>) -> Resul
         .cloned()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
 
-    for (_request_id, session_id) in prompt_requests.drain() {
-        let session = create_session(validated_agent_type, session_id.to_string(), None::<&str>);
-        // Use whatever per-chunk usage was streamed before the agent
-        // disconnected (there is no final PromptResponse on this path).
-        let tokens = token_accumulator.remove(&session_id);
-        let event = AikiEvent::SessionEnded(AikiSessionEndedPayload {
-            session,
-            cwd: working_dir.clone(),
-            timestamp: chrono::Utc::now(),
-            reason: "connection_close".to_string(),
-            tokens,
-        });
-        if let Err(e) = event_bus::dispatch(event) {
-            debug_log(|| format!("[acp] Failed to fire session.ended on close: {}", e));
+    // Skip provenance recording unless this session's repo is Active (mirrors
+    // the per-session gate applied at every handler recording site).
+    if acp_recording_enabled(&cwd) {
+        for (_request_id, session_id) in prompt_requests.drain() {
+            let session =
+                create_session(validated_agent_type, session_id.to_string(), None::<&str>);
+            // Use whatever per-chunk usage was streamed before the agent
+            // disconnected (there is no final PromptResponse on this path).
+            let tokens = token_accumulator.remove(&session_id);
+            let event = AikiEvent::SessionEnded(AikiSessionEndedPayload {
+                session,
+                cwd: working_dir.clone(),
+                timestamp: chrono::Utc::now(),
+                reason: "connection_close".to_string(),
+                tokens,
+            });
+            if let Err(e) = event_bus::dispatch(event) {
+                debug_log(|| format!("[acp] Failed to fire session.ended on close: {}", e));
+            }
         }
     }
 

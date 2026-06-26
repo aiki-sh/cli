@@ -71,7 +71,13 @@ fn run_install(reference: Option<String>) -> Result<()> {
             let report = install(&plugin, &plugins_base, project_root.as_deref(), None)?;
             print_install_report(&report, &plugin);
 
-            if !report.failed.is_empty() {
+            if report.failed.is_empty() {
+                // Wire the include line into the project's hooks.yml so install
+                // is symmetric with remove. No-op when not inside a project.
+                if let Some(aiki_dir) = find_aiki_dir_optional(&cwd) {
+                    add_to_hooks_yml(&aiki_dir, &plugin);
+                }
+            } else {
                 Err(anyhow::anyhow!("Some plugins failed to install"))?;
             }
         }
@@ -615,6 +621,97 @@ fn remove_from_hooks_yml(aiki_dir: &Path, plugin: &PluginRef) {
     }
 }
 
+/// Add a plugin reference to the top-level `include:` list in the project's
+/// `hooks.yml`. Symmetric with [`remove_from_hooks_yml`] and idempotent.
+///
+/// Behavior:
+/// - If `hooks.yml` does not exist, create it with a top-level `include:` block
+///   containing the plugin.
+/// - If it already lists the plugin (as any `- <plugin>` list item), do nothing.
+/// - Otherwise, insert `- <plugin>` into the existing top-level `include:` block,
+///   preserving existing entries and comments. If there is no `include:` block,
+///   append one at the end.
+///
+/// Operates on raw lines to preserve formatting/comments, mirroring
+/// `remove_from_hooks_yml`.
+fn add_to_hooks_yml(aiki_dir: &Path, plugin: &PluginRef) {
+    let hooks_path = aiki_dir.join("hooks.yml");
+    let plugin_str = plugin.to_string();
+
+    // No file yet — create a fresh top-level include block.
+    if !hooks_path.is_file() {
+        let content = format!("include:\n  - {}\n", plugin_str);
+        if let Err(e) = fs::write(&hooks_path, content) {
+            eprintln!("Warning: failed to create hooks.yml: {}", e);
+        }
+        return;
+    }
+
+    let content = match fs::read_to_string(&hooks_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Idempotency: if the plugin is already listed as a `- <plugin>` item
+    // anywhere, this is a no-op. Matches remove_from_hooks_yml's line matching.
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("- ") {
+            let value = rest.split('#').next().unwrap_or(rest).trim();
+            if value == plugin_str {
+                return;
+            }
+        }
+    }
+
+    let leading_ws_len = |s: &str| s.len() - s.trim_start().len();
+
+    let had_trailing_newline = content.ends_with('\n');
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+
+    // Locate a top-level (unindented) `include:` block header.
+    let include_idx = lines
+        .iter()
+        .position(|l| leading_ws_len(l) == 0 && l.trim_end() == "include:");
+
+    match include_idx {
+        Some(idx) => {
+            // Scan the block body (lines more indented than the header) to find
+            // where to insert and what indentation existing items use.
+            let header_indent = leading_ws_len(&lines[idx]);
+            let mut insert_at = idx + 1;
+            let mut item_indent: Option<String> = None;
+            let mut j = idx + 1;
+            while j < lines.len() {
+                let line = &lines[j];
+                if line.trim().is_empty() || leading_ws_len(line) <= header_indent {
+                    break; // blank line or a sibling/parent key ends the block
+                }
+                if item_indent.is_none() && line.trim_start().starts_with("- ") {
+                    item_indent = Some(line[..leading_ws_len(line)].to_string());
+                }
+                insert_at = j + 1;
+                j += 1;
+            }
+            let indent = item_indent.unwrap_or_else(|| " ".repeat(header_indent + 2));
+            lines.insert(insert_at, format!("{}- {}", indent, plugin_str));
+        }
+        None => {
+            // No include block — append one, preserving existing content.
+            lines.push("include:".to_string());
+            lines.push(format!("  - {}", plugin_str));
+        }
+    }
+
+    let mut new_content = lines.join("\n");
+    if had_trailing_newline && !new_content.ends_with('\n') {
+        new_content.push('\n');
+    }
+    if let Err(e) = fs::write(&hooks_path, new_content) {
+        eprintln!("Warning: failed to update hooks.yml: {}", e);
+    }
+}
+
 
 /// Find project-level template overrides of plugin templates.
 fn find_overrides(templates_dir: &Path, project_refs: &[PluginRef]) -> Vec<(String, String)> {
@@ -751,6 +848,100 @@ mod tests {
         let result = fs::read_to_string(aiki_dir.join("hooks.yml")).unwrap();
         assert!(!result.contains("eslint/standard"));
         assert!(result.contains("aiki/way"));
+    }
+
+    #[test]
+    fn test_add_to_hooks_yml_creates_file_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        let aiki_dir = tmp.path().join(".aiki");
+        fs::create_dir_all(&aiki_dir).unwrap();
+
+        let plugin: PluginRef = "aiki-sh/herdr".parse().unwrap();
+        add_to_hooks_yml(&aiki_dir, &plugin);
+
+        let result = fs::read_to_string(aiki_dir.join("hooks.yml")).unwrap();
+        assert_eq!(result, "include:\n  - aiki-sh/herdr\n");
+    }
+
+    #[test]
+    fn test_add_to_hooks_yml_appends_to_existing_block_preserving_content() {
+        let tmp = TempDir::new().unwrap();
+        let aiki_dir = tmp.path().join(".aiki");
+        fs::create_dir_all(&aiki_dir).unwrap();
+
+        // Existing content with an include block (comment), plus an unrelated key.
+        let original = "# project hooks\ninclude:\n  - aiki/way  # the way\nbefore:\n  commit:\n    - eslint/standard\n";
+        fs::write(aiki_dir.join("hooks.yml"), original).unwrap();
+
+        let plugin: PluginRef = "aiki-sh/herdr".parse().unwrap();
+        add_to_hooks_yml(&aiki_dir, &plugin);
+
+        let result = fs::read_to_string(aiki_dir.join("hooks.yml")).unwrap();
+        // Existing entries and comments are preserved.
+        assert!(result.contains("# project hooks"));
+        assert!(result.contains("- aiki/way  # the way"));
+        assert!(result.contains("before:"));
+        assert!(result.contains("    - eslint/standard"));
+        // New plugin appended into the include block (2-space indent matching existing item).
+        assert!(result.contains("  - aiki-sh/herdr"));
+        // The new item lands inside the include block, before the `before:` key.
+        let new_idx = result.find("- aiki-sh/herdr").unwrap();
+        let before_idx = result.find("before:").unwrap();
+        assert!(new_idx < before_idx);
+    }
+
+    #[test]
+    fn test_add_to_hooks_yml_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let aiki_dir = tmp.path().join(".aiki");
+        fs::create_dir_all(&aiki_dir).unwrap();
+
+        let plugin: PluginRef = "aiki-sh/herdr".parse().unwrap();
+        add_to_hooks_yml(&aiki_dir, &plugin);
+        let after_first = fs::read_to_string(aiki_dir.join("hooks.yml")).unwrap();
+
+        // Second call must not duplicate the line.
+        add_to_hooks_yml(&aiki_dir, &plugin);
+        let after_second = fs::read_to_string(aiki_dir.join("hooks.yml")).unwrap();
+
+        assert_eq!(after_first, after_second);
+        assert_eq!(after_second.matches("aiki-sh/herdr").count(), 1);
+    }
+
+    #[test]
+    fn test_add_to_hooks_yml_no_include_block_appends_one() {
+        let tmp = TempDir::new().unwrap();
+        let aiki_dir = tmp.path().join(".aiki");
+        fs::create_dir_all(&aiki_dir).unwrap();
+
+        let original = "before:\n  commit:\n    - eslint/standard\n";
+        fs::write(aiki_dir.join("hooks.yml"), original).unwrap();
+
+        let plugin: PluginRef = "aiki-sh/herdr".parse().unwrap();
+        add_to_hooks_yml(&aiki_dir, &plugin);
+
+        let result = fs::read_to_string(aiki_dir.join("hooks.yml")).unwrap();
+        assert!(result.contains("before:"));
+        assert!(result.contains("    - eslint/standard"));
+        assert!(result.contains("include:"));
+        assert!(result.contains("- aiki-sh/herdr"));
+    }
+
+    #[test]
+    fn test_add_then_remove_round_trip_restores_content() {
+        let tmp = TempDir::new().unwrap();
+        let aiki_dir = tmp.path().join(".aiki");
+        fs::create_dir_all(&aiki_dir).unwrap();
+
+        let original = "include:\n  - aiki/way\n";
+        fs::write(aiki_dir.join("hooks.yml"), original).unwrap();
+
+        let plugin: PluginRef = "aiki-sh/herdr".parse().unwrap();
+        add_to_hooks_yml(&aiki_dir, &plugin);
+        remove_from_hooks_yml(&aiki_dir, &plugin);
+
+        let result = fs::read_to_string(aiki_dir.join("hooks.yml")).unwrap();
+        assert_eq!(result, original);
     }
 
     /// Helper: create a fake installed plugin with optional deps declared via hooks.yaml.
