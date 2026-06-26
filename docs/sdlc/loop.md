@@ -45,6 +45,14 @@ aiki loop <parent-task-id> -o id
    the orchestrator can exit before closing the loop task. Bounded polling keeps
    each command short so the agent stays in control until every lane completes.
 
+   **Auto-replacement.** If the orchestrator does exit before the loop task is
+   closed, `aiki` automatically spawns a replacement orchestrator to keep
+   driving the remaining lanes — it does not immediately report the loop as
+   failed. Between restarts it waits for lane activity (a thread finishing, or
+   lanes still running) so a fast-exiting orchestrator doesn't hot-loop agent
+   spawns. The loop is reported as failed only after several consecutive
+   restarts find no lane running and none finishing.
+
 ## Lanes
 
 Lanes are the execution units derived from the subtask dependency graph. They are computed at query time from `depends-on` and `needs-context` links — nothing is persisted.

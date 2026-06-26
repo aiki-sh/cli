@@ -4,6 +4,7 @@ use std::env;
 use std::path::Path;
 #[cfg(test)]
 use std::process::Command;
+use std::time::Duration;
 
 use super::StepResult;
 use super::WorkflowChange;
@@ -12,7 +13,7 @@ use crate::agents::AgentType;
 use crate::error::{AikiError, Result};
 use crate::tasks::md::MdBuilder;
 use crate::tasks::runner::{
-    handle_session_result, task_run, task_run_async, task_run_on_session, TaskRunOptions,
+    finalize_agent_run, handle_session_result, task_run_async, task_run_on_session, TaskRunOptions,
 };
 use crate::tasks::{
     find_task, get_subtasks, materialize_graph, read_events, start_task_core, TaskStatus,
@@ -139,32 +140,264 @@ pub fn run_loop(
         emit_loop_async(output_ctx, &loop_task_id, &parent_id);
     } else if let Some(ctx) = ctx {
         if ctx.notify_rx.is_some() {
+            // Event-channel path: drain subtask lifecycle in real time, and
+            // auto-replace the orchestrator if it exits before closing the
+            // loop task (common in headless mode — see `drive_orchestrator`).
             let output = ctx.output;
-            let mut handler = LoopDrainHandler {
-                task_names: &mut ctx.task_names,
-                parent_id: parent_id.clone(),
-                output,
+            let loop_id = loop_task_id.clone();
+            let opts = task_run_options;
+            let handler_parent = parent_id.clone();
+            let spawn_once = || -> Result<()> {
+                let mut handler = LoopDrainHandler {
+                    task_names: &mut ctx.task_names,
+                    parent_id: handler_parent.clone(),
+                    output,
+                };
+                super::spawn_drain(
+                    cwd,
+                    &loop_id,
+                    &opts,
+                    ctx.notify_rx.as_ref(),
+                    output,
+                    &mut handler,
+                )
             };
-            super::spawn_drain_finalize(
+            drive_orchestrator(
                 cwd,
-                &loop_task_id,
-                &task_run_options,
-                ctx.notify_rx.as_ref(),
+                &loop_id,
+                &parent_id,
                 output,
-                &mut handler,
+                &ReplacePolicy::production(),
+                spawn_once,
             )?;
         } else {
-            emit_loop_started(output_ctx, &loop_task_id, &parent_id);
-            task_run(cwd, &loop_task_id, task_run_options.quiet())?;
-            emit_loop_completed(output_ctx, &loop_task_id, &parent_id);
+            run_plain_with_replacement(
+                cwd,
+                &loop_task_id,
+                &parent_id,
+                output_ctx,
+                task_run_options,
+            )?;
         }
     } else {
-        emit_loop_started(output_ctx, &loop_task_id, &parent_id);
-        task_run(cwd, &loop_task_id, task_run_options.quiet())?;
-        emit_loop_completed(output_ctx, &loop_task_id, &parent_id);
+        run_plain_with_replacement(cwd, &loop_task_id, &parent_id, output_ctx, task_run_options)?;
     }
 
     Ok(loop_task_id)
+}
+
+/// Maximum consecutive orchestrator restarts that make no progress before the
+/// loop is declared failed. In headless mode the orchestrator agent ends its
+/// turn (and its process exits) every cycle while async subtask lanes keep
+/// running, so a single early exit is normal — we only give up once several
+/// restarts in a row neither close a subtask nor leave any lane running.
+const LOOP_MAX_NO_PROGRESS_RETRIES: u32 = 3;
+
+/// Tunables for orchestrator auto-replacement. Held in a struct so tests can
+/// shrink the timing; production values come from [`ReplacePolicy::production`].
+struct ReplacePolicy {
+    /// Consecutive no-progress restarts tolerated before giving up.
+    max_no_progress: u32,
+    /// How often to re-check lane state while waiting between restarts.
+    poll_interval: Duration,
+    /// Cap on a single between-restart wait; if lanes are still running when it
+    /// elapses we relaunch the orchestrator anyway (cheap periodic re-check).
+    max_wait_per_cycle: Duration,
+}
+
+impl ReplacePolicy {
+    fn production() -> Self {
+        Self {
+            max_no_progress: LOOP_MAX_NO_PROGRESS_RETRIES,
+            poll_interval: Duration::from_secs(5),
+            max_wait_per_cycle: Duration::from_secs(300),
+        }
+    }
+}
+
+/// Count `parent_id`'s subtasks that are (closed, currently running).
+fn subtask_progress_counts(cwd: &Path, parent_id: &str) -> (usize, usize) {
+    let Ok(events) = read_events(cwd) else {
+        return (0, 0);
+    };
+    let graph = materialize_graph(&events);
+    let subtasks = get_subtasks(&graph, parent_id);
+    let closed = subtasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Closed)
+        .count();
+    let running = subtasks
+        .iter()
+        .filter(|t| matches!(t.status, TaskStatus::InProgress | TaskStatus::Reserved))
+        .count();
+    (closed, running)
+}
+
+/// Current status of the loop task itself (Open if it can't be read).
+fn loop_task_status(cwd: &Path, loop_task_id: &str) -> TaskStatus {
+    read_events(cwd)
+        .ok()
+        .map(|events| materialize_graph(&events))
+        .and_then(|graph| find_task(&graph.tasks, loop_task_id).ok().map(|t| t.status))
+        .unwrap_or(TaskStatus::Open)
+}
+
+/// Outcome of waiting between orchestrator restarts.
+#[derive(Debug, PartialEq, Eq)]
+enum WaitOutcome {
+    /// A subtask finished — relaunch promptly to schedule any newly-ready lanes.
+    Progressed,
+    /// No subtask is running and none finished — nothing is happening.
+    Idle,
+    /// Lanes are still running but the per-cycle wait cap elapsed.
+    StillRunning,
+}
+
+/// Pure classification of a single lane-state poll. Returns `None` while we
+/// should keep waiting (lanes still running, none finished yet).
+fn classify_poll(baseline_closed: usize, closed: usize, running: usize) -> Option<WaitOutcome> {
+    if closed > baseline_closed {
+        Some(WaitOutcome::Progressed)
+    } else if running == 0 {
+        Some(WaitOutcome::Idle)
+    } else {
+        None
+    }
+}
+
+/// Block until a subtask of `parent_id` finishes, all lanes go quiet, or the
+/// per-cycle cap elapses. Polling here (instead of relaunching immediately)
+/// keeps a fast-exiting orchestrator from hot-looping expensive agent spawns
+/// while async lanes are still executing.
+fn wait_for_lane_activity(
+    cwd: &Path,
+    parent_id: &str,
+    baseline_closed: usize,
+    policy: &ReplacePolicy,
+) -> WaitOutcome {
+    let start = std::time::Instant::now();
+    loop {
+        let (closed, running) = subtask_progress_counts(cwd, parent_id);
+        if let Some(outcome) = classify_poll(baseline_closed, closed, running) {
+            return outcome;
+        }
+        if start.elapsed() >= policy.max_wait_per_cycle {
+            return WaitOutcome::StillRunning;
+        }
+        std::thread::sleep(policy.poll_interval);
+    }
+}
+
+/// Pure retry decision made after each orchestrator spawn. Returns whether to
+/// spawn a replacement and the updated consecutive-no-progress counter.
+///
+/// - loop task done (Closed/Stopped) → stop.
+/// - a lane finished, or lanes still running → retry, reset the counter.
+/// - nothing running and nothing finished → count it; give up at the cap.
+fn should_retry(
+    loop_done: bool,
+    outcome: &WaitOutcome,
+    no_progress: u32,
+    max_no_progress: u32,
+) -> (bool, u32) {
+    if loop_done {
+        return (false, no_progress);
+    }
+    match outcome {
+        WaitOutcome::Progressed | WaitOutcome::StillRunning => (true, 0),
+        WaitOutcome::Idle => {
+            let n = no_progress + 1;
+            (n < max_no_progress, n)
+        }
+    }
+}
+
+/// Drive the loop orchestrator, auto-replacing it when it exits before closing
+/// the loop task.
+///
+/// `spawn_once` performs a single non-finalizing spawn of the loop task (it
+/// returns when the orchestrator process exits). After each spawn:
+///   - if the loop task is Closed/Stopped, we're done;
+///   - otherwise the orchestrator exited early. We wait for lane activity and,
+///     as long as a subtask is finishing or still running, spawn a replacement;
+///   - if several restarts in a row find no lane running and none finishing, we
+///     give up.
+///
+/// The terminal finalize runs exactly once, here: a Closed loop task records
+/// completion (Ok), while a still-incomplete one emits Stopped + cascade-closes
+/// subtasks and returns the failure error (the original terminal behavior, just
+/// deferred until replacements are exhausted).
+fn drive_orchestrator(
+    cwd: &Path,
+    loop_task_id: &str,
+    parent_id: &str,
+    output: WorkflowOutput,
+    policy: &ReplacePolicy,
+    mut spawn_once: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let mut no_progress = 0u32;
+    loop {
+        let (closed_before, _) = subtask_progress_counts(cwd, parent_id);
+
+        // A spawn error (e.g. the agent binary failed to launch) is itself a
+        // non-progress outcome; fall through to the state check so the
+        // no-progress cap bounds retries instead of erroring immediately.
+        let _ = spawn_once();
+
+        // Orchestrator finished its job, or was explicitly stopped — respect
+        // either and stop replacing. Only wait on lanes when it exited early.
+        let loop_done = matches!(
+            loop_task_status(cwd, loop_task_id),
+            TaskStatus::Closed | TaskStatus::Stopped
+        );
+        let outcome = if loop_done {
+            WaitOutcome::Idle // ignored when loop_done
+        } else {
+            wait_for_lane_activity(cwd, parent_id, closed_before, policy)
+        };
+
+        let was_idle = !loop_done && outcome == WaitOutcome::Idle;
+        let (retry, n) = should_retry(loop_done, &outcome, no_progress, policy.max_no_progress);
+        no_progress = n;
+        if !retry {
+            break;
+        }
+        if was_idle {
+            output.emit(&format!(
+                "  \u{21bb} orchestrator exited with no lanes running; spawning replacement ({}/{})",
+                no_progress, policy.max_no_progress
+            ));
+        }
+    }
+
+    finalize_agent_run(cwd, loop_task_id)
+}
+
+/// Plain (no event channel) orchestrator run with auto-replacement. Mirrors the
+/// drain path but uses a blocking `task_run_on_session` spawn and no live
+/// subtask display.
+fn run_plain_with_replacement(
+    cwd: &Path,
+    loop_task_id: &str,
+    parent_id: &str,
+    output: WorkflowOutput,
+    run_options: TaskRunOptions,
+) -> Result<()> {
+    emit_loop_started(output, loop_task_id, parent_id);
+    let opts = run_options.quiet();
+    let spawn_once = || -> Result<()> {
+        task_run_on_session(cwd, loop_task_id, opts.clone(), false).map(|_| ())
+    };
+    drive_orchestrator(
+        cwd,
+        loop_task_id,
+        parent_id,
+        output,
+        &ReplacePolicy::production(),
+        spawn_once,
+    )?;
+    emit_loop_completed(output, loop_task_id, parent_id);
+    Ok(())
 }
 
 /// Drain handler for the loop step: displays task lifecycle events
@@ -697,5 +930,49 @@ mod tests {
             }
             other => panic!("unknown loop drain probe case: {other}"),
         }
+    }
+
+    // --- orchestrator auto-replacement decision logic ---
+
+    #[test]
+    fn classify_poll_reports_progress_on_new_close() {
+        // A subtask closed since the baseline → progress, regardless of running.
+        assert_eq!(classify_poll(0, 1, 2), Some(WaitOutcome::Progressed));
+        assert_eq!(classify_poll(3, 5, 0), Some(WaitOutcome::Progressed));
+    }
+
+    #[test]
+    fn classify_poll_reports_idle_when_nothing_runs_or_closes() {
+        assert_eq!(classify_poll(2, 2, 0), Some(WaitOutcome::Idle));
+        assert_eq!(classify_poll(0, 0, 0), Some(WaitOutcome::Idle));
+    }
+
+    #[test]
+    fn classify_poll_keeps_waiting_while_lanes_run() {
+        // Lanes still running and none finished yet → keep waiting (None).
+        assert_eq!(classify_poll(2, 2, 3), None);
+        assert_eq!(classify_poll(0, 0, 1), None);
+    }
+
+    #[test]
+    fn should_retry_stops_when_loop_task_done() {
+        // A closed/stopped loop task short-circuits regardless of outcome.
+        assert_eq!(should_retry(true, &WaitOutcome::Idle, 0, 3), (false, 0));
+        assert_eq!(should_retry(true, &WaitOutcome::Progressed, 2, 3), (false, 2));
+    }
+
+    #[test]
+    fn should_retry_keeps_going_and_resets_on_activity() {
+        // A lane finished, or lanes still running → replace and reset counter.
+        assert_eq!(should_retry(false, &WaitOutcome::Progressed, 2, 3), (true, 0));
+        assert_eq!(should_retry(false, &WaitOutcome::StillRunning, 2, 3), (true, 0));
+    }
+
+    #[test]
+    fn should_retry_counts_idle_and_gives_up_at_cap() {
+        // Consecutive idle restarts accumulate; the cap (3) ends the loop.
+        assert_eq!(should_retry(false, &WaitOutcome::Idle, 0, 3), (true, 1));
+        assert_eq!(should_retry(false, &WaitOutcome::Idle, 1, 3), (true, 2));
+        assert_eq!(should_retry(false, &WaitOutcome::Idle, 2, 3), (false, 3));
     }
 }

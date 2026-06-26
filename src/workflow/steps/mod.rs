@@ -229,11 +229,15 @@ pub(crate) trait DrainHandler {
     fn finish(&mut self) {}
 }
 
-/// Shared spawn-drain-finalize loop.
+/// Shared spawn-and-drain loop, WITHOUT the terminal finalize.
 ///
 /// Spawns a monitored agent process, waits for FIFO notifications via
 /// `recv_timeout` while the agent runs, then re-reads events fresh from JJ
-/// on each cycle and computes a `GraphDelta` for the handler.
+/// on each cycle and computes a `GraphDelta` for the handler. Unlike
+/// [`spawn_drain_finalize`], it does NOT call `finalize_agent_run` afterwards,
+/// so it never emits a Stopped event or cascade-closes subtasks. Callers that
+/// may re-spawn a replacement agent (e.g. the loop orchestrator) use this and
+/// finalize exactly once at the end; everyone else uses `spawn_drain_finalize`.
 ///
 /// Flow per cycle:
 /// 1. `recv_timeout(100ms)` — blocks until notification or timeout (doubles
@@ -243,7 +247,7 @@ pub(crate) trait DrainHandler {
 /// 3. `read_events(cwd)` → `materialize_graph` → `compute_delta` →
 ///    `handler.on_change()`.
 /// 4. After agent exits: 200ms silence window for final events.
-pub(crate) fn spawn_drain_finalize(
+pub(crate) fn spawn_drain(
     cwd: &Path,
     task_id: &str,
     run_options: &TaskRunOptions,
@@ -251,6 +255,7 @@ pub(crate) fn spawn_drain_finalize(
     output: WorkflowOutput,
     handler: &mut dyn DrainHandler,
 ) -> crate::error::Result<()> {
+    let _ = output;
     let prepared = prepare_task_run(cwd, task_id, run_options, |_| {})?;
 
     let mut agent_handle = match prepared.runtime.spawn_monitored(&prepared.spawn_options) {
@@ -346,9 +351,23 @@ pub(crate) fn spawn_drain_finalize(
     // their entire TUI output to stderr, which is noise in workflow context.
     // Task success/failure is determined by JJ state in finalize_agent_run.
 
-    finalize_agent_run(cwd, task_id)?;
-
     Ok(())
+}
+
+/// `spawn_drain` followed by `finalize_agent_run`: spawn the agent, drain
+/// events, wait for exit, then finalize the task (emit Stopped + cascade-close
+/// on failure, record completion on success). This is the common path for
+/// single-shot workflow steps that do not re-spawn.
+pub(crate) fn spawn_drain_finalize(
+    cwd: &Path,
+    task_id: &str,
+    run_options: &TaskRunOptions,
+    notify_rx: Option<&Receiver<String>>,
+    output: WorkflowOutput,
+    handler: &mut dyn DrainHandler,
+) -> crate::error::Result<()> {
+    spawn_drain(cwd, task_id, run_options, notify_rx, output, handler)?;
+    finalize_agent_run(cwd, task_id)
 }
 
 /// Drain handler for steps that track subtask creation under a parent task.
