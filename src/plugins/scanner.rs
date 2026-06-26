@@ -498,16 +498,21 @@ after:
     }
 
     #[test]
-    fn test_scan_yaml_include_ignores_non_plugin_strings() {
+    fn test_scan_yaml_include_accepts_bare_rejects_malformed() {
         let yaml = r#"
 include:
   - aiki/default
-  - not-a-plugin
+  - herdr
   - too/many/parts/here
 "#;
         let refs = scan_yaml_for_refs(yaml);
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].to_string(), "aiki/default");
+        let names: Vec<String> = refs.iter().map(|r| r.to_string()).collect();
+        // `aiki/default` (built-in) and the bare `herdr` (which defaults to the
+        // first-party `aiki` namespace) are valid references; a path with more
+        // than two segments is not.
+        assert_eq!(refs.len(), 2, "got {names:?}");
+        assert!(names.contains(&"aiki/default".to_string()));
+        assert!(names.contains(&"aiki/herdr".to_string()));
     }
 
     #[test]

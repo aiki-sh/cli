@@ -30,6 +30,17 @@ pub fn load_builtin_plugin(name: &str) -> Option<Result<Hook>> {
         .map(|yaml| HookParser::parse_str(yaml))
 }
 
+/// Returns `true` if `name` (an `ns/name` include path, e.g. `aiki/default`)
+/// names a built-in plugin.
+///
+/// First-party reference ergonomics use this so that built-ins — which are
+/// bundled, not GitHub repos following the `aiki-plugin-` convention — are
+/// never rewritten with the boilerplate prefix.
+#[must_use]
+pub fn is_builtin(name: &str) -> bool {
+    BUILTIN_PLUGINS.contains_key(name)
+}
+
 /// Load the core system hook (uncached).
 ///
 /// The core hook is embedded in the binary and handles all event types.

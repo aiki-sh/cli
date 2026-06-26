@@ -966,72 +966,72 @@ mod tests {
     #[test]
     fn test_remove_no_dependents_succeeds() {
         let tmp = TempDir::new().unwrap();
-        create_fake_plugin(tmp.path(), "aiki", "alpha", &[]);
+        create_fake_plugin(tmp.path(), "acme", "alpha", &[]);
 
         // Should succeed: no dependents, plugin gets removed
-        remove_plugin_from("aiki/alpha", false, tmp.path()).unwrap();
-        assert!(!tmp.path().join("aiki").join("alpha").exists());
+        remove_plugin_from("acme/alpha", false, tmp.path()).unwrap();
+        assert!(!tmp.path().join("acme").join("alpha").exists());
     }
 
     #[test]
     fn test_remove_blocked_by_direct_dependent() {
         let tmp = TempDir::new().unwrap();
-        create_fake_plugin(tmp.path(), "aiki", "alpha", &[]);
-        create_fake_plugin(tmp.path(), "aiki", "beta", &["aiki/alpha/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "alpha", &[]);
+        create_fake_plugin(tmp.path(), "acme", "beta", &["acme/alpha/tmpl"]);
 
         // Should fail: beta depends on alpha
-        let err = remove_plugin_from("aiki/alpha", false, tmp.path()).unwrap_err();
+        let err = remove_plugin_from("acme/alpha", false, tmp.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("aiki/beta"), "error should name the dependent: {msg}");
+        assert!(msg.contains("acme/beta"), "error should name the dependent: {msg}");
         // Plugin should NOT have been removed
-        assert!(tmp.path().join("aiki").join("alpha").exists());
+        assert!(tmp.path().join("acme").join("alpha").exists());
     }
 
     #[test]
     fn test_remove_unrelated_plugin_not_blocked() {
         let tmp = TempDir::new().unwrap();
-        create_fake_plugin(tmp.path(), "aiki", "alpha", &[]);
-        create_fake_plugin(tmp.path(), "aiki", "beta", &["aiki/gamma/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "gamma", &[]);
+        create_fake_plugin(tmp.path(), "acme", "alpha", &[]);
+        create_fake_plugin(tmp.path(), "acme", "beta", &["acme/gamma/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "gamma", &[]);
 
         // alpha has no dependents — removal should succeed
-        remove_plugin_from("aiki/alpha", false, tmp.path()).unwrap();
-        assert!(!tmp.path().join("aiki").join("alpha").exists());
+        remove_plugin_from("acme/alpha", false, tmp.path()).unwrap();
+        assert!(!tmp.path().join("acme").join("alpha").exists());
     }
 
     #[test]
     fn test_remove_blocked_by_multiple_dependents() {
         let tmp = TempDir::new().unwrap();
-        create_fake_plugin(tmp.path(), "aiki", "alpha", &[]);
-        create_fake_plugin(tmp.path(), "aiki", "beta", &["aiki/alpha/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "gamma", &["aiki/alpha/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "alpha", &[]);
+        create_fake_plugin(tmp.path(), "acme", "beta", &["acme/alpha/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "gamma", &["acme/alpha/tmpl"]);
 
-        let err = remove_plugin_from("aiki/alpha", false, tmp.path()).unwrap_err();
+        let err = remove_plugin_from("acme/alpha", false, tmp.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("aiki/beta"), "error should name beta: {msg}");
-        assert!(msg.contains("aiki/gamma"), "error should name gamma: {msg}");
+        assert!(msg.contains("acme/beta"), "error should name beta: {msg}");
+        assert!(msg.contains("acme/gamma"), "error should name gamma: {msg}");
     }
 
     #[test]
     fn test_remove_only_blocked_by_direct_dependents() {
         let tmp = TempDir::new().unwrap();
         // A depends on B, B depends on C
-        create_fake_plugin(tmp.path(), "aiki", "a", &["aiki/b/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "b", &["aiki/c/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "c", &[]);
+        create_fake_plugin(tmp.path(), "acme", "a", &["acme/b/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "b", &["acme/c/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "c", &[]);
 
         // Removing C should be blocked by B (direct dependent), not A (transitive)
-        let err = remove_plugin_from("aiki/c", false, tmp.path()).unwrap_err();
+        let err = remove_plugin_from("acme/c", false, tmp.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("aiki/b"), "error should name direct dependent b: {msg}");
-        assert!(!msg.contains("aiki/a"), "error should NOT name transitive dependent a: {msg}");
+        assert!(msg.contains("acme/b"), "error should name direct dependent b: {msg}");
+        assert!(!msg.contains("acme/a"), "error should NOT name transitive dependent a: {msg}");
     }
 
     #[test]
     fn test_remove_nonexistent_plugin_fails() {
         let tmp = TempDir::new().unwrap();
         // No plugins installed — remove should fail at the removal step (not installed)
-        let err = remove_plugin_from("aiki/nonexistent", false, tmp.path()).unwrap_err();
+        let err = remove_plugin_from("acme/nonexistent", false, tmp.path()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not installed") || msg.contains("nonexistent"), "expected not-installed error: {msg}");
     }
@@ -1039,11 +1039,11 @@ mod tests {
     #[test]
     fn test_remove_force_bypasses_dependent_check() {
         let tmp = TempDir::new().unwrap();
-        create_fake_plugin(tmp.path(), "aiki", "alpha", &[]);
-        create_fake_plugin(tmp.path(), "aiki", "beta", &["aiki/alpha/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "alpha", &[]);
+        create_fake_plugin(tmp.path(), "acme", "beta", &["acme/alpha/tmpl"]);
 
         // With force=true, removal should succeed despite dependents
-        remove_plugin_from("aiki/alpha", true, tmp.path()).unwrap();
-        assert!(!tmp.path().join("aiki").join("alpha").exists());
+        remove_plugin_from("acme/alpha", true, tmp.path()).unwrap();
+        assert!(!tmp.path().join("acme").join("alpha").exists());
     }
 }

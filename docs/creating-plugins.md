@@ -55,7 +55,18 @@ When referencing plugin templates, use three-part paths: `namespace/name/templat
 
 ## The `aiki` Namespace
 
-The `aiki` namespace is reserved and maps to the `glasner` GitHub organization. Don't use it for your own plugins. Built-in flows like `aiki/core` and `aiki/default` use this namespace.
+The `aiki` namespace is reserved and maps to the `aiki-sh` GitHub organization. Don't use it for your own plugins. Built-in flows like `aiki/core` and `aiki/default` use this namespace.
+
+First-party plugins are published as `aiki-sh/aiki-plugin-<name>`, and you can reference them with or without that boilerplate. These forms are equivalent:
+
+```yaml
+include:
+  - herdr                    # bare name — defaults to the aiki namespace
+  - aiki/herdr               # short — the aiki-plugin- prefix is implied
+  - aiki/aiki-plugin-herdr   # the full repository name
+```
+
+All three resolve to `aiki-sh/aiki-plugin-herdr`, and the same shorthand works on the command line (`aiki plugin install herdr`). Built-in flows (`aiki/default`, `aiki/core`) and local flows under `.aiki/hooks/aiki/` keep their literal names — the boilerplate is only applied when a reference resolves to a first-party plugin **repository**.
 
 ## Creating a Hooks Plugin
 

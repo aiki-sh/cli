@@ -309,10 +309,10 @@ mod tests {
     #[test]
     fn single_plugin_no_deps() {
         let tmp = TempDir::new().unwrap();
-        create_fake_plugin(tmp.path(), "aiki", "solo", &[]);
+        create_fake_plugin(tmp.path(), "acme", "solo", &[]);
 
         let graph = PluginGraph::build(tmp.path());
-        let solo = ref_("aiki/solo");
+        let solo = ref_("acme/solo");
 
         assert_eq!(graph.all_plugins().len(), 1);
         assert!(graph.dependents(&solo).is_empty());
@@ -324,22 +324,22 @@ mod tests {
     #[test]
     fn linear_chain_dependents() {
         let tmp = TempDir::new().unwrap();
-        create_fake_plugin(tmp.path(), "aiki", "a", &["aiki/b/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "b", &["aiki/c/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "c", &[]);
+        create_fake_plugin(tmp.path(), "acme", "a", &["acme/b/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "b", &["acme/c/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "c", &[]);
 
         let graph = PluginGraph::build(tmp.path());
-        let c = ref_("aiki/c");
+        let c = ref_("acme/c");
 
         // Direct dependents of C = [B]
         let direct = names(&graph.dependents(&c));
-        assert_eq!(direct, HashSet::from(["aiki/b".to_string()]));
+        assert_eq!(direct, HashSet::from(["acme/b".to_string()]));
 
         // Transitive dependents of C = [B, A]
         let transitive = names(&graph.transitive_dependents(&c));
         assert_eq!(
             transitive,
-            HashSet::from(["aiki/a".to_string(), "aiki/b".to_string()])
+            HashSet::from(["acme/a".to_string(), "acme/b".to_string()])
         );
     }
 
@@ -348,19 +348,19 @@ mod tests {
     #[test]
     fn diamond_dependents() {
         let tmp = TempDir::new().unwrap();
-        create_fake_plugin(tmp.path(), "aiki", "a", &["aiki/b/tmpl", "aiki/c/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "b", &["aiki/d/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "c", &["aiki/d/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "d", &[]);
+        create_fake_plugin(tmp.path(), "acme", "a", &["acme/b/tmpl", "acme/c/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "b", &["acme/d/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "c", &["acme/d/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "d", &[]);
 
         let graph = PluginGraph::build(tmp.path());
-        let d = ref_("aiki/d");
+        let d = ref_("acme/d");
 
         // Direct dependents of D = [B, C]
         let direct = names(&graph.dependents(&d));
         assert_eq!(
             direct,
-            HashSet::from(["aiki/b".to_string(), "aiki/c".to_string()])
+            HashSet::from(["acme/b".to_string(), "acme/c".to_string()])
         );
 
         // Transitive dependents of D = [A, B, C]
@@ -368,9 +368,9 @@ mod tests {
         assert_eq!(
             transitive,
             HashSet::from([
-                "aiki/a".to_string(),
-                "aiki/b".to_string(),
-                "aiki/c".to_string(),
+                "acme/a".to_string(),
+                "acme/b".to_string(),
+                "acme/c".to_string(),
             ])
         );
     }
@@ -380,8 +380,8 @@ mod tests {
     #[test]
     fn cycle_detection() {
         let tmp = TempDir::new().unwrap();
-        create_fake_plugin(tmp.path(), "aiki", "a", &["aiki/b/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "b", &["aiki/a/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "a", &["acme/b/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "b", &["acme/a/tmpl"]);
 
         let graph = PluginGraph::build(tmp.path());
         let cycles = graph.cycles();
@@ -392,8 +392,8 @@ mod tests {
             .iter()
             .flat_map(|cycle| cycle.iter().map(|r| r.to_string()))
             .collect();
-        assert!(all_in_cycles.contains("aiki/a"));
-        assert!(all_in_cycles.contains("aiki/b"));
+        assert!(all_in_cycles.contains("acme/a"));
+        assert!(all_in_cycles.contains("acme/b"));
     }
 
     // --- Test 12: Missing dependency ---
@@ -402,13 +402,13 @@ mod tests {
     fn missing_dependency() {
         let tmp = TempDir::new().unwrap();
         // A references B, but B is not installed
-        create_fake_plugin(tmp.path(), "aiki", "a", &["aiki/b/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "a", &["acme/b/tmpl"]);
 
         let graph = PluginGraph::build(tmp.path());
         let missing = graph.missing_dependencies();
 
         let missing_names: HashSet<String> = missing.iter().map(|r| r.to_string()).collect();
-        assert!(missing_names.contains("aiki/b"));
+        assert!(missing_names.contains("acme/b"));
     }
 
     // --- Test 13: Orphan detection ---
@@ -417,23 +417,23 @@ mod tests {
     fn orphan_detection() {
         let tmp = TempDir::new().unwrap();
         // A→B installed, D installed but nothing depends on it
-        create_fake_plugin(tmp.path(), "aiki", "a", &["aiki/b/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "b", &[]);
-        create_fake_plugin(tmp.path(), "aiki", "d", &[]);
+        create_fake_plugin(tmp.path(), "acme", "a", &["acme/b/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "b", &[]);
+        create_fake_plugin(tmp.path(), "acme", "d", &[]);
 
         let graph = PluginGraph::build(tmp.path());
         let hooks_yml_refs: HashSet<crate::plugins::PluginRef> = HashSet::new();
 
         let orphans = names(&graph.orphaned(&hooks_yml_refs));
-        assert!(orphans.contains("aiki/d"), "D should be orphaned");
+        assert!(orphans.contains("acme/d"), "D should be orphaned");
         // A is a root (nothing depends on it either, but it depends on B — roots aren't orphans
         // if they have dependents or are referenced). However, A has no dependents AND is not
         // in hooks_yml_refs, so it would also be orphaned. The key distinction is:
         // orphaned = no dependents AND not in hooks_yml_refs.
         // Both A and D have no dependents and are not in hooks_yml_refs, so both are orphans.
-        assert!(orphans.contains("aiki/a"), "A should also be orphaned (no dependents, not in hooks.yml)");
+        assert!(orphans.contains("acme/a"), "A should also be orphaned (no dependents, not in hooks.yml)");
         // B is NOT orphaned because A depends on it
-        assert!(!orphans.contains("aiki/b"), "B should not be orphaned (A depends on it)");
+        assert!(!orphans.contains("acme/b"), "B should not be orphaned (A depends on it)");
     }
 
     // --- Test 14: Not orphaned if in hooks.yml ---
@@ -441,11 +441,11 @@ mod tests {
     #[test]
     fn not_orphaned_if_in_hooks_yml() {
         let tmp = TempDir::new().unwrap();
-        create_fake_plugin(tmp.path(), "aiki", "d", &[]);
+        create_fake_plugin(tmp.path(), "acme", "d", &[]);
 
         let graph = PluginGraph::build(tmp.path());
         let mut hooks_yml_refs: HashSet<crate::plugins::PluginRef> = HashSet::new();
-        hooks_yml_refs.insert(ref_("aiki/d"));
+        hooks_yml_refs.insert(ref_("acme/d"));
 
         let orphans = graph.orphaned(&hooks_yml_refs);
         assert!(

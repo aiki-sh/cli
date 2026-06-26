@@ -299,9 +299,9 @@ mod tests {
     #[test]
     fn test_resolve_deps_no_deps() {
         let tmp = TempDir::new().unwrap();
-        create_fake_plugin(tmp.path(), "aiki", "way", &[]);
+        create_fake_plugin(tmp.path(), "acme", "way", &[]);
 
-        let root: PluginRef = "aiki/way".parse().unwrap();
+        let root: PluginRef = "acme/way".parse().unwrap();
         let deps = resolve_deps(&root, tmp.path());
         assert!(deps.is_empty());
     }
@@ -310,16 +310,16 @@ mod tests {
     fn test_resolve_deps_chain() {
         let tmp = TempDir::new().unwrap();
         // A depends on B, B depends on C
-        create_fake_plugin(tmp.path(), "aiki", "a", &["aiki/b/template"]);
-        create_fake_plugin(tmp.path(), "aiki", "b", &["aiki/c/template"]);
-        create_fake_plugin(tmp.path(), "aiki", "c", &[]);
+        create_fake_plugin(tmp.path(), "acme", "a", &["acme/b/template"]);
+        create_fake_plugin(tmp.path(), "acme", "b", &["acme/c/template"]);
+        create_fake_plugin(tmp.path(), "acme", "c", &[]);
 
-        let root: PluginRef = "aiki/a".parse().unwrap();
+        let root: PluginRef = "acme/a".parse().unwrap();
         let deps = resolve_deps(&root, tmp.path());
 
         let dep_names: Vec<String> = deps.iter().map(|d| d.to_string()).collect();
-        assert!(dep_names.contains(&"aiki/b".to_string()));
-        assert!(dep_names.contains(&"aiki/c".to_string()));
+        assert!(dep_names.contains(&"acme/b".to_string()));
+        assert!(dep_names.contains(&"acme/c".to_string()));
         assert_eq!(deps.len(), 2);
     }
 
@@ -327,50 +327,50 @@ mod tests {
     fn test_resolve_deps_diamond() {
         let tmp = TempDir::new().unwrap();
         // A→B, A→C, B→D, C→D (diamond at D)
-        create_fake_plugin(tmp.path(), "aiki", "a", &["aiki/b/tmpl", "aiki/c/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "b", &["aiki/d/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "c", &["aiki/d/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "d", &[]);
+        create_fake_plugin(tmp.path(), "acme", "a", &["acme/b/tmpl", "acme/c/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "b", &["acme/d/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "c", &["acme/d/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "d", &[]);
 
-        let root: PluginRef = "aiki/a".parse().unwrap();
+        let root: PluginRef = "acme/a".parse().unwrap();
         let deps = resolve_deps(&root, tmp.path());
 
         let dep_names: Vec<String> = deps.iter().map(|d| d.to_string()).collect();
-        assert!(dep_names.contains(&"aiki/b".to_string()));
-        assert!(dep_names.contains(&"aiki/c".to_string()));
-        assert!(dep_names.contains(&"aiki/d".to_string()));
+        assert!(dep_names.contains(&"acme/b".to_string()));
+        assert!(dep_names.contains(&"acme/c".to_string()));
+        assert!(dep_names.contains(&"acme/d".to_string()));
         // D should appear exactly once
-        assert_eq!(dep_names.iter().filter(|n| *n == "aiki/d").count(), 1);
+        assert_eq!(dep_names.iter().filter(|n| *n == "acme/d").count(), 1);
     }
 
     #[test]
     fn test_resolve_deps_cycle() {
         let tmp = TempDir::new().unwrap();
         // A→B→A (cycle)
-        create_fake_plugin(tmp.path(), "aiki", "a", &["aiki/b/tmpl"]);
-        create_fake_plugin(tmp.path(), "aiki", "b", &["aiki/a/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "a", &["acme/b/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "b", &["acme/a/tmpl"]);
 
-        let root: PluginRef = "aiki/a".parse().unwrap();
+        let root: PluginRef = "acme/a".parse().unwrap();
         let deps = resolve_deps(&root, tmp.path());
 
         // Should find B as a dep, skip A (cycle), no infinite loop
         assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].to_string(), "aiki/b");
+        assert_eq!(deps[0].to_string(), "acme/b");
     }
 
     #[test]
     fn test_resolve_deps_not_installed() {
         let tmp = TempDir::new().unwrap();
         // A references B but B is not installed
-        create_fake_plugin(tmp.path(), "aiki", "a", &["aiki/b/tmpl"]);
+        create_fake_plugin(tmp.path(), "acme", "a", &["acme/b/tmpl"]);
         // B is NOT created
 
-        let root: PluginRef = "aiki/a".parse().unwrap();
+        let root: PluginRef = "acme/a".parse().unwrap();
         let deps = resolve_deps(&root, tmp.path());
 
         // B is listed as a dep (discovered) but its own deps can't be resolved (not installed)
         assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].to_string(), "aiki/b");
+        assert_eq!(deps[0].to_string(), "acme/b");
     }
 
     // -----------------------------------------------------------------------

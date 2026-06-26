@@ -23,8 +23,42 @@ use crate::error::{AikiError, Result};
 use crate::plugins::manifest::resolve_display_name;
 
 /// Reserved namespace that maps to the `aiki-sh` GitHub owner.
-const AIKI_NAMESPACE: &str = "aiki";
+pub const AIKI_NAMESPACE: &str = "aiki";
 const AIKI_GITHUB_OWNER: &str = "aiki-sh";
+/// Boilerplate repo prefix for first-party plugins (`aiki-sh/aiki-plugin-<name>`).
+const AIKI_PLUGIN_PREFIX: &str = "aiki-plugin-";
+
+/// Returns `true` if `namespace` refers to the first-party `aiki-sh` org
+/// (either the reserved `aiki` alias or the literal `aiki-sh` owner).
+#[must_use]
+fn is_first_party(namespace: &str) -> bool {
+    namespace == AIKI_NAMESPACE || namespace == AIKI_GITHUB_OWNER
+}
+
+/// Resolve a reference's GitHub **repository** name, applying the first-party
+/// `aiki-plugin-` boilerplate so it can be written or omitted interchangeably.
+///
+/// In the first-party namespace, a single-segment name gains the
+/// `aiki-plugin-` prefix unless it already starts with `aiki-` or names a
+/// built-in plugin. So `herdr`, `aiki/herdr`, and `aiki/aiki-plugin-herdr`
+/// all map to the repo `aiki-plugin-herdr`. Non-first-party namespaces,
+/// nested names, and built-ins (e.g. `aiki/default`) are returned unchanged.
+///
+/// This only affects how a reference maps to a *repo / install directory*; the
+/// reference itself (and local-flow resolution under `.aiki/hooks/`) stays
+/// literal, so overloaded `aiki/...` flow names are never rewritten.
+#[must_use]
+pub fn canonical_name(namespace: &str, name: &str) -> String {
+    if is_first_party(namespace)
+        && !name.contains('/')
+        && !name.starts_with("aiki-")
+        && !crate::flows::bundled::is_builtin(&format!("{namespace}/{name}"))
+    {
+        format!("{AIKI_PLUGIN_PREFIX}{name}")
+    } else {
+        name.to_string()
+    }
+}
 
 /// A validated plugin reference in `namespace/name` format.
 ///
@@ -47,15 +81,25 @@ impl PluginRef {
         } else {
             &self.namespace
         };
-        format!("https://github.com/{}/{}.git", owner, self.name)
+        format!("https://github.com/{}/{}.git", owner, self.repo_name())
+    }
+
+    /// The GitHub repository name, with the first-party `aiki-plugin-`
+    /// boilerplate applied so a short reference (`aiki/herdr`) maps to its repo
+    /// (`aiki-plugin-herdr`). See [`canonical_name`].
+    #[must_use]
+    fn repo_name(&self) -> String {
+        canonical_name(&self.namespace, &self.name)
     }
 
     /// Returns the installation directory for this plugin under the given base.
     ///
-    /// Always uses the original namespace (not the resolved GitHub owner).
+    /// Uses the original namespace (not the resolved GitHub owner) and the
+    /// canonical repo name, so short and boilerplate references install to the
+    /// same directory.
     #[must_use]
     pub fn install_dir(&self, plugins_base: &Path) -> PathBuf {
-        plugins_base.join(&self.namespace).join(&self.name)
+        plugins_base.join(&self.namespace).join(self.repo_name())
     }
 
     /// Returns a human-readable display name for this plugin.
@@ -84,15 +128,19 @@ impl FromStr for PluginRef {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let parts: Vec<&str> = s.split('/').collect();
 
-        if parts.len() != 2 {
-            return Err(AikiError::InvalidPluginRef {
-                reference: s.to_string(),
-                reason: "Plugin reference must be in 'namespace/name' format".to_string(),
-            });
-        }
-
-        let namespace = parts[0];
-        let name = parts[1];
+        // Accept `namespace/name` or a bare `name` (which defaults to the
+        // first-party `aiki` namespace). Reject deeper nesting.
+        let (namespace, name) = match parts.as_slice() {
+            [name] => (AIKI_NAMESPACE, *name),
+            [namespace, name] => (*namespace, *name),
+            _ => {
+                return Err(AikiError::InvalidPluginRef {
+                    reference: s.to_string(),
+                    reason: "Plugin reference must be in 'namespace/name' or 'name' format"
+                        .to_string(),
+                });
+            }
+        };
 
         if namespace.is_empty() || name.is_empty() {
             return Err(AikiError::InvalidPluginRef {
@@ -297,9 +345,13 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_single_segment() {
-        let err = "onlyone".parse::<PluginRef>().unwrap_err();
-        assert!(err.to_string().contains("namespace/name"));
+    fn test_parse_bare_name_defaults_to_aiki() {
+        // A bare reference (no namespace) defaults to the first-party `aiki`
+        // namespace and stays literal; the boilerplate is applied at the repo
+        // layer, not on the reference itself.
+        let r: PluginRef = "herdr".parse().unwrap();
+        assert_eq!(r.namespace, "aiki");
+        assert_eq!(r.name, "herdr");
     }
 
     #[test]
@@ -328,8 +380,12 @@ mod tests {
 
     #[test]
     fn test_github_url_aiki_namespace() {
+        // First-party short names gain the `aiki-plugin-` repo boilerplate.
         let r: PluginRef = "aiki/way".parse().unwrap();
-        assert_eq!(r.github_url(), "https://github.com/aiki-sh/way.git");
+        assert_eq!(
+            r.github_url(),
+            "https://github.com/aiki-sh/aiki-plugin-way.git"
+        );
     }
 
     #[test]
@@ -344,7 +400,7 @@ mod tests {
         let base = Path::new("/home/user/.aiki/plugins");
         assert_eq!(
             r.install_dir(base),
-            PathBuf::from("/home/user/.aiki/plugins/aiki/way")
+            PathBuf::from("/home/user/.aiki/plugins/aiki/aiki-plugin-way")
         );
     }
 
@@ -352,6 +408,68 @@ mod tests {
     fn test_display() {
         let r: PluginRef = "aiki/way".parse().unwrap();
         assert_eq!(r.to_string(), "aiki/way");
+    }
+
+    #[test]
+    fn test_first_party_boilerplate_equivalence() {
+        // Short, bare, and full repo references all map to the same repo and
+        // install directory (`aiki-sh/aiki-plugin-herdr`).
+        let base = Path::new("/base");
+        let url = "https://github.com/aiki-sh/aiki-plugin-herdr.git";
+        let dir = PathBuf::from("/base/aiki/aiki-plugin-herdr");
+        for reference in ["aiki/herdr", "herdr", "aiki/aiki-plugin-herdr"] {
+            let r: PluginRef = reference.parse().unwrap();
+            assert_eq!(r.github_url(), url, "github_url for {reference}");
+            assert_eq!(r.install_dir(base), dir, "install_dir for {reference}");
+        }
+    }
+
+    #[test]
+    fn test_first_party_reference_stays_literal() {
+        // The reference is preserved verbatim (so overloaded local-flow names
+        // like `aiki/core` are never rewritten); only the repo layer applies
+        // the boilerplate.
+        let r: PluginRef = "aiki/herdr".parse().unwrap();
+        assert_eq!(r.namespace, "aiki");
+        assert_eq!(r.name, "herdr");
+        assert_eq!(r.to_string(), "aiki/herdr");
+    }
+
+    #[test]
+    fn test_aiki_sh_namespace_gets_boilerplate() {
+        let r: PluginRef = "aiki-sh/herdr".parse().unwrap();
+        assert_eq!(
+            r.github_url(),
+            "https://github.com/aiki-sh/aiki-plugin-herdr.git"
+        );
+    }
+
+    #[test]
+    fn test_explicit_aiki_prefix_not_doubled() {
+        // An explicit `aiki-` repo prefix (e.g. an integration) is left alone.
+        let r: PluginRef = "aiki/aiki-integration-herdr".parse().unwrap();
+        assert_eq!(
+            r.github_url(),
+            "https://github.com/aiki-sh/aiki-integration-herdr.git"
+        );
+    }
+
+    #[test]
+    fn test_builtin_not_rewritten() {
+        // Built-ins stay literal — they are bundled, not GitHub repos.
+        let r: PluginRef = "aiki/default".parse().unwrap();
+        assert_eq!(r.github_url(), "https://github.com/aiki-sh/default.git");
+        assert_eq!(canonical_name("aiki", "git-coauthors"), "git-coauthors");
+    }
+
+    #[test]
+    fn test_non_first_party_no_boilerplate() {
+        let r: PluginRef = "somecorp/herdr".parse().unwrap();
+        assert_eq!(r.github_url(), "https://github.com/somecorp/herdr.git");
+        assert_eq!(
+            r.install_dir(Path::new("/base")),
+            PathBuf::from("/base/somecorp/herdr")
+        );
     }
 
     #[test]

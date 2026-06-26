@@ -382,7 +382,9 @@ fn test_plugin_remove_invalid_ref() {
     use std::process::Command;
 
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("aiki"));
-    cmd.args(["plugin", "remove", "not-a-valid-ref"]);
+    // A bare single segment is now a valid reference (defaults to the `aiki`
+    // namespace); more than two segments is still malformed.
+    cmd.args(["plugin", "remove", "way/too/many/segments"]);
 
     cmd.assert()
         .failure()
@@ -796,8 +798,9 @@ fn test_install_dir_preserves_aiki_namespace() {
     let base = Path::new("/fake/plugins");
     let dir = plugin.install_dir(base);
 
-    // install_dir uses the original namespace, not the resolved GitHub owner
-    assert_eq!(dir, Path::new("/fake/plugins/aiki/way"));
+    // install_dir uses the original namespace (not the resolved GitHub owner)
+    // and the canonical repo name (first-party `aiki-plugin-` boilerplate).
+    assert_eq!(dir, Path::new("/fake/plugins/aiki/aiki-plugin-way"));
 }
 
 // ---------------------------------------------------------------------------

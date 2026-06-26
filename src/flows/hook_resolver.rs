@@ -104,20 +104,23 @@ impl HookResolver {
             });
         }
 
-        // Only support namespaced flows: {namespace}/{name}
-        // Extract namespace and name
-        let parts: Vec<&str> = path.splitn(2, '/').collect();
-        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-            return Err(AikiError::InvalidHookPath {
-                path: path.to_string(),
-                reason:
-                    "Flow path must be in format {namespace}/{name} with non-empty namespace and name"
-                        .to_string(),
-            });
-        }
-
-        let namespace = parts[0];
-        let name = parts[1];
+        // Accept `{namespace}/{name}` or a bare `{name}` (which defaults to the
+        // first-party `aiki` namespace). `name` may itself contain slashes for
+        // nested flows (e.g. `aiki/sdlc/loop`).
+        let (namespace, name) = match path.split_once('/') {
+            Some((ns, name)) => {
+                if ns.is_empty() || name.is_empty() {
+                    return Err(AikiError::InvalidHookPath {
+                        path: path.to_string(),
+                        reason:
+                            "Flow path must be in format {namespace}/{name} with non-empty namespace and name"
+                                .to_string(),
+                    });
+                }
+                (ns, name)
+            }
+            None => (plugins::AIKI_NAMESPACE, path),
+        };
         let resolved = self.resolve_namespaced_flow(namespace, name)?;
 
         // CRITICAL: Canonicalize path for reliable cycle detection
@@ -171,11 +174,14 @@ impl HookResolver {
             return Ok(user_path);
         }
 
-        // 3. Installed plugin: $AIKI_HOME/plugins/{ns}/{name}/hooks.yaml
+        // 3. Installed plugin: $AIKI_HOME/plugins/{ns}/{repo}/hooks.yaml
+        //    `repo` applies the first-party `aiki-plugin-` boilerplate so a
+        //    short reference resolves to its installed repo directory.
+        let repo_name = plugins::canonical_name(namespace, name);
         let installed_plugin_path = crate::global::global_aiki_dir()
             .join("plugins")
             .join(namespace)
-            .join(name)
+            .join(&repo_name)
             .join("hooks.yaml");
 
         if installed_plugin_path.exists() {
@@ -225,10 +231,7 @@ impl HookResolver {
             Ok(_) => {}
         }
 
-        let installed_path = plugins_base
-            .join(namespace)
-            .join(name)
-            .join("hooks.yaml");
+        let installed_path = plugin_ref.install_dir(&plugins_base).join("hooks.yaml");
 
         if installed_path.exists() {
             return Ok(installed_path);
@@ -352,13 +355,30 @@ version: "1"
     }
 
     #[test]
-    fn test_resolve_invalid_format_error() {
+    fn test_resolve_bare_name_and_invalid_paths() {
         let temp_dir = create_test_project();
         let resolver = HookResolver::with_start_dir(temp_dir.path()).unwrap();
 
-        // Path without slash is invalid (must be {namespace}/{name})
-        let result = resolver.resolve("invalid-path-no-slash");
-        assert!(matches!(result, Err(AikiError::InvalidHookPath { .. })));
+        // A bare reference (no slash) is no longer rejected: it defaults to the
+        // first-party `aiki` namespace and resolves through the plugin path
+        // (here failing to fetch — never InvalidHookPath).
+        assert!(matches!(
+            resolver.resolve("not-a-real-plugin"),
+            Err(AikiError::AutoFetchFailed { .. })
+                | Err(AikiError::AutoFetchCached { .. })
+                | Err(AikiError::HookNotFound { .. })
+        ));
+
+        // Empty references, or a slashed path with an empty segment, are still
+        // rejected as malformed.
+        assert!(matches!(
+            resolver.resolve(""),
+            Err(AikiError::InvalidHookPath { .. })
+        ));
+        assert!(matches!(
+            resolver.resolve("ns/"),
+            Err(AikiError::InvalidHookPath { .. })
+        ));
     }
 
     #[test]
@@ -625,6 +645,37 @@ version: "1"
                 "Expected AutoFetchFailed about hooks.yaml, got: {:?}",
                 other
             ),
+        }
+    }
+
+    #[test]
+    fn test_first_party_boilerplate_resolution() {
+        // A plugin installed at its canonical repo dir
+        // (`plugins/aiki/aiki-plugin-foo`) resolves from the short, bare, and
+        // full references alike — network-free, via the installed-plugin step.
+        let temp_dir = create_test_project();
+        let aiki_home = TempDir::new().unwrap();
+
+        let plugin_dir = aiki_home
+            .path()
+            .join("plugins")
+            .join("aiki")
+            .join("aiki-plugin-foo");
+        fs::create_dir_all(plugin_dir.join(".git")).unwrap();
+        let hooks = plugin_dir.join("hooks.yaml");
+        fs::write(&hooks, "name: aiki/aiki-plugin-foo\n").unwrap();
+        let expected = hooks.canonicalize().unwrap();
+
+        for reference in ["aiki/foo", "foo", "aiki/aiki-plugin-foo"] {
+            let resolved = with_temp_aiki_home(aiki_home.path(), || {
+                let resolver = HookResolver::with_start_dir(temp_dir.path()).unwrap();
+                resolver.resolve(reference)
+            });
+            assert_eq!(
+                resolved.unwrap(),
+                expected,
+                "reference `{reference}` should resolve to the installed plugin"
+            );
         }
     }
 }
