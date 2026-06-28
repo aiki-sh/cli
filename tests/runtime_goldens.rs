@@ -218,12 +218,13 @@ fn golden_codex_blocking_no_git_ancestor() {
     );
     assert_eq!(argv[1], "exec");
     assert_eq!(argv[2], "--dangerously-bypass-approvals-and-sandbox");
-    assert_eq!(argv[3], opts.task_prompt(), "prompt precedes the jj flags");
+    assert_eq!(argv[3], "--dangerously-bypass-hook-trust");
+    assert_eq!(argv[4], opts.task_prompt(), "prompt precedes the jj flags");
     assert_eq!(
-        argv[4], "--skip-git-repo-check",
+        argv[5], "--skip-git-repo-check",
         "no .git ancestor: the skip flag is passed, after the prompt"
     );
-    assert_eq!(argv.len(), 5, "no extra arguments: {argv:?}");
+    assert_eq!(argv.len(), 6, "no extra arguments: {argv:?}");
 
     let env = read_env(&dump_dir);
     assert_eq!(env_value(&env, "AIKI_THREAD"), Some("goldencodextask"));
@@ -259,10 +260,11 @@ fn golden_codex_blocking_colocated_git_repo() {
     let argv = read_argv(&dump_dir);
     assert_eq!(argv[1], "exec");
     assert_eq!(argv[2], "--dangerously-bypass-approvals-and-sandbox");
-    assert_eq!(argv[3], opts.task_prompt());
+    assert_eq!(argv[3], "--dangerously-bypass-hook-trust");
+    assert_eq!(argv[4], opts.task_prompt());
     assert_eq!(
         argv.len(),
-        4,
+        5,
         "with .git present and an in-tree jj store there are no jj flags: {argv:?}"
     );
 }
@@ -311,10 +313,11 @@ fn golden_codex_blocking_jj_workspace_external_store() {
     let argv = read_argv(&dump_dir);
     assert_eq!(argv[1], "exec");
     assert_eq!(argv[2], "--dangerously-bypass-approvals-and-sandbox");
-    assert_eq!(argv[3], opts.task_prompt());
-    assert_eq!(argv[4], "--skip-git-repo-check");
-    assert_eq!(argv[5], "--add-dir");
-    let added = PathBuf::from(&argv[6]);
+    assert_eq!(argv[3], "--dangerously-bypass-hook-trust");
+    assert_eq!(argv[4], opts.task_prompt());
+    assert_eq!(argv[5], "--skip-git-repo-check");
+    assert_eq!(argv[6], "--add-dir");
+    let added = PathBuf::from(&argv[7]);
     assert!(
         added.ends_with(".jj"),
         "--add-dir must point at the shared store's .jj dir, got {added:?}"
@@ -323,5 +326,5 @@ fn golden_codex_blocking_jj_workspace_external_store() {
         !added.starts_with(&workspace),
         "--add-dir target lives outside the workspace"
     );
-    assert_eq!(argv.len(), 7, "no extra arguments: {argv:?}");
+    assert_eq!(argv.len(), 8, "no extra arguments: {argv:?}");
 }

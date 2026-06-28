@@ -43,6 +43,22 @@ A review runs through three phases as subtasks:
    ```
    Issues are distinct from regular comments — only issues trigger followup tasks when piped to `aiki fix`.
 
+### If the review agent exits early
+
+In headless mode a review agent sometimes ends its turn (its process exits)
+before closing the review task — for example right after closing the explore
+phase. Rather than failing the whole command with a raw spawn error, Aiki
+**auto-replaces** the agent: it re-spawns the review while each attempt keeps
+closing a review phase, and only gives up after a few consecutive attempts that
+make no progress.
+
+If it still can't finish, the review **degrades gracefully** instead of erroring:
+the review task is marked stopped and the command reports a partial result
+(`incomplete: 1/2 phases done, N issues recorded`) along with whatever issues
+were recorded. Re-run `aiki review` to attempt the remaining phases. (This
+mirrors the loop orchestrator's auto-replacement — see `loop.md` — but a review
+has no async lanes, so it never waits between attempts.)
+
 ## Review Scopes
 
 The target determines what kind of review runs:

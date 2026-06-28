@@ -89,17 +89,21 @@ pub fn handle_turn_completed(mut payload: AikiTurnCompletedPayload) -> Result<Ho
         .map(|graph| crate::tasks::manager::get_task_activity_by_turn(graph, &payload.turn.id))
         .unwrap_or_default();
 
-    // Focused task = most-recently-started in-progress task claimed by this
-    // session (the turn-level attribution unit; see tasks::token_rollup). `None`
-    // when no task is in progress — those tokens belong to the unattributed
-    // "session overhead" bucket and are never rolled onto an arbitrary task.
+    // Focused task = the turn-level attribution unit (see tasks::token_rollup).
+    // Prefers the most-recently-started in-progress task claimed by this
+    // session; falls back to the task this session closed during this same turn
+    // (turn_closed == turn_id). The fallback matters because the agent normally
+    // runs `aiki task close` *before* this hook fires, so by replay time the
+    // task's final/only turn — where the work happened — is already Closed and
+    // would otherwise contribute nothing. `None` when neither exists — those
+    // tokens belong to the unattributed "session overhead" bucket and are never
+    // rolled onto an arbitrary task.
     let focused_task_id = task_graph.as_ref().and_then(|graph| {
-        crate::tasks::manager::get_in_progress_task_ids_for_session(
-            &graph.tasks,
+        crate::tasks::manager::get_focused_task_for_turn(
+            graph,
             payload.session.uuid(),
+            &payload.turn.id,
         )
-        .into_iter()
-        .next()
     });
 
     debug_log(|| {

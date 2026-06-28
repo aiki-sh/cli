@@ -196,7 +196,7 @@ fn test_codex_config_generation() {
     otel_table.insert("log_user_prompt".to_string(), toml::Value::Boolean(true));
     config.insert("otel".to_string(), toml::Value::Table(otel_table));
     let mut features = toml::map::Map::new();
-    features.insert("codex_hooks".to_string(), toml::Value::Boolean(true));
+    features.insert("hooks".to_string(), toml::Value::Boolean(true));
     config.insert("features".to_string(), toml::Value::Table(features));
 
     let content = toml::to_string_pretty(&toml::Value::Table(config)).unwrap();
@@ -235,7 +235,7 @@ fn test_codex_config_generation() {
 
     assert!(parsed.get("notify").is_none());
     assert_eq!(
-        parsed["features"]["codex_hooks"].as_bool(),
+        parsed["features"]["hooks"].as_bool(),
         Some(true)
     );
 

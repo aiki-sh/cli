@@ -113,11 +113,21 @@ pub fn set_task_instructions(repo_path: &Path, task_id: &str, instructions: &str
     );
 }
 
-/// Run `aiki run <task-id>` synchronously, returns (success, stdout, stderr)
-pub fn aiki_run(repo_path: &Path, task_id: &str, timeout: Duration) -> (bool, String, String) {
+/// Run `aiki run <task-id> --agent <agent>` synchronously, returns (success, stdout, stderr).
+///
+/// `--agent` is passed explicitly: in an isolated environment (e.g. a CI container)
+/// there is no parent agent process or active session for `resolve_agent_type` to
+/// fall back on, so the harness must be named. `agent` is an AgentType CLI value
+/// such as "claude-code" or "codex".
+pub fn aiki_run(
+    repo_path: &Path,
+    task_id: &str,
+    agent: &str,
+    timeout: Duration,
+) -> (bool, String, String) {
     let child = common::e2e_aiki_agent(repo_path)
         .current_dir(repo_path)
-        .args(["run", task_id])
+        .args(["run", task_id, "--agent", agent])
         .timeout(timeout)
         .output();
 

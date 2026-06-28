@@ -93,10 +93,14 @@ impl AgentRuntime for CliAgentRuntime {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         match cmd.spawn() {
-            Ok(_child) => Ok(BackgroundHandle {
+            Ok(child) => Ok(BackgroundHandle {
                 thread: options.thread.clone(),
                 session_id: None,
                 agent_type: self.agent_type,
+                // Capture the pid before the Child is dropped (detached). This is
+                // the only handle to an agent that hangs before recording its
+                // session, which the session-file-based kill path cannot reach.
+                pid: Some(child.id()),
             }),
             Err(e) => Err(AikiError::AgentSpawnFailed(format!(
                 "Failed to spawn {} in background: {}",
@@ -355,6 +359,9 @@ mod tests {
         assert_eq!(handle.thread.head, "task123");
         assert_eq!(handle.agent_type, AgentType::Unknown);
         assert!(handle.session_id.is_none());
+        // The pid is captured so an orphaned spawn can be reaped even if its
+        // session never registers.
+        assert!(handle.pid.is_some(), "spawn should report the child pid");
 
         // The child is detached (no Child handle), so prove execution via a
         // marker file with a generous timeout.

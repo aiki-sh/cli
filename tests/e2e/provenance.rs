@@ -30,7 +30,7 @@ fn e2e_claude_provenance_on_trivial_change() {
          Your task ID is shown when you run `aiki task` or `aiki task list`.",
     );
 
-    let (success, stdout, stderr) = aiki_run(repo, &task_id, Duration::from_secs(180));
+    let (success, stdout, stderr) = aiki_run(repo, &task_id, "claude-code", Duration::from_secs(180));
     eprintln!("aiki run stdout: {stdout}");
     eprintln!("aiki run stderr: {stderr}");
     assert!(success, "aiki run failed for Claude");
@@ -80,7 +80,7 @@ fn e2e_codex_provenance_on_trivial_change() {
          Your task ID is shown when you run `aiki task` or `aiki task list`.",
     );
 
-    let (success, stdout, stderr) = aiki_run(repo, &task_id, Duration::from_secs(180));
+    let (success, stdout, stderr) = aiki_run(repo, &task_id, "codex", Duration::from_secs(180));
     eprintln!("aiki run stdout: {stdout}");
     eprintln!("aiki run stderr: {stderr}");
     assert!(success, "aiki run failed for Codex");
@@ -119,7 +119,7 @@ fn run_task_diff_test(agent: &str) {
          Your task ID is shown when you run `aiki task` or `aiki task list`.",
     );
 
-    let (success, _, stderr) = aiki_run(repo, &task_id, Duration::from_secs(180));
+    let (success, _, stderr) = aiki_run(repo, &task_id, agent, Duration::from_secs(180));
     assert!(success, "aiki run failed with {agent}: {stderr}");
     assert!(
         wait_for_task_closed(repo, &task_id, Duration::from_secs(30)),

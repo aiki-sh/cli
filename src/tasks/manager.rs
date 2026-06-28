@@ -76,6 +76,53 @@ pub fn get_in_progress_task_ids_for_session(
     result.into_iter().map(|t| t.id.clone()).collect()
 }
 
+/// Resolve the task that the turn's tokens attribute to.
+///
+/// Prefers the most-recently-started in-progress task claimed by this session;
+/// falls back to the most-recently-closed task whose `turn_closed == turn_id`
+/// (the task this session closed during this same turn — its final/only turn).
+/// Returns `None` when neither exists (genuine session-overhead turn).
+///
+/// The fallback exists because in the normal workflow the agent runs
+/// `aiki task close <id>` *before* the turn-completed hook fires. By then the
+/// Closed event has been replayed, so the task is no longer InProgress and
+/// `get_in_progress_task_ids_for_session` returns nothing — yet that final turn
+/// is where the work happened. `turn_closed == turn_id` is the correct
+/// session-ownership signal here: the turn_id is session-scoped
+/// (`generate_turn_id(session_uuid, turn_number)`), and graph replay clears
+/// `claimed_by_session` on close, so it can no longer be used to attribute.
+#[must_use]
+pub fn get_focused_task_for_turn(
+    graph: &super::graph::TaskGraph,
+    session_id: &str,
+    turn_id: &str,
+) -> Option<String> {
+    // Prefer a live in-progress task claimed by this session (most recently
+    // started wins). This preserves existing precedence and only falls through
+    // when there is no live task — matching the bug ("becomes None").
+    if let Some(id) = get_in_progress_task_ids_for_session(&graph.tasks, session_id)
+        .into_iter()
+        .next()
+    {
+        return Some(id);
+    }
+
+    // Fallback: the task this session closed during this same turn. Pick the
+    // most-recently-closed by closed_at descending (deterministic tiebreak,
+    // falling back to started_at/created_at when closed_at is missing — mirrors
+    // the sort in get_in_progress_task_ids_for_session).
+    graph
+        .tasks
+        .values()
+        .filter(|t| t.turn_closed.as_deref() == Some(turn_id))
+        .max_by(|a, b| {
+            let a_time = a.closed_at.or(a.started_at).unwrap_or(a.created_at);
+            let b_time = b.closed_at.or(b.started_at).unwrap_or(b.created_at);
+            a_time.cmp(&b_time)
+        })
+        .map(|t| t.id.clone())
+}
+
 /// Find a task by ID or prefix
 ///
 /// Accepts full IDs or unique prefixes. Returns the task or an error
@@ -3003,5 +3050,167 @@ mod tests {
                 || !activity.started.is_empty()
                 || !activity.stopped.is_empty()
         );
+    }
+
+    // Tests for get_focused_task_for_turn
+
+    #[test]
+    fn test_focused_in_progress_takes_precedence() {
+        // An in-progress task claimed by this session wins even when another
+        // task was closed during this same turn (precedence preserved).
+        let session = "session-abc";
+        let turn = "turn-xyz";
+        let events = vec![
+            make_created_event("live", "Live task", TaskPriority::P2, 2),
+            make_created_event("done", "Done task", TaskPriority::P2, 2),
+            TaskEvent::Started {
+                task_ids: vec!["done".to_string()],
+                agent_type: "claude-code".to_string(),
+                session_id: Some(session.to_string()),
+                turn_id: Some(turn.to_string()),
+                working_copy: None,
+                instructions: None,
+                timestamp: Utc::now() - chrono::Duration::minutes(10),
+            },
+            TaskEvent::Closed {
+                session_id: Some(session.to_string()),
+                task_ids: vec!["done".to_string()],
+                outcome: TaskOutcome::Done,
+                confidence: None,
+                summary: None,
+                turn_id: Some(turn.to_string()),
+                timestamp: Utc::now() - chrono::Duration::minutes(5),
+            },
+            TaskEvent::Started {
+                task_ids: vec!["live".to_string()],
+                agent_type: "claude-code".to_string(),
+                session_id: Some(session.to_string()),
+                turn_id: Some(turn.to_string()),
+                working_copy: None,
+                instructions: None,
+                timestamp: Utc::now(),
+            },
+        ];
+        let graph = make_graph(&events);
+        assert_eq!(
+            get_focused_task_for_turn(&graph, session, turn),
+            Some("live".to_string())
+        );
+    }
+
+    #[test]
+    fn test_focused_falls_back_to_closed_this_turn() {
+        // THE REGRESSION CASE: the agent ran `aiki task close` before the
+        // turn-completed hook fired, so by replay time the task is Closed (not
+        // InProgress) and claimed_by_session has been cleared. The fallback
+        // must still attribute the turn to it via turn_closed == turn_id.
+        let session = "session-abc";
+        let turn = "turn-xyz";
+        let events = vec![
+            make_created_event("done", "Done task", TaskPriority::P2, 2),
+            TaskEvent::Started {
+                task_ids: vec!["done".to_string()],
+                agent_type: "claude-code".to_string(),
+                session_id: Some(session.to_string()),
+                turn_id: Some(turn.to_string()),
+                working_copy: None,
+                instructions: None,
+                timestamp: Utc::now() - chrono::Duration::minutes(5),
+            },
+            TaskEvent::Closed {
+                session_id: Some(session.to_string()),
+                task_ids: vec!["done".to_string()],
+                outcome: TaskOutcome::Done,
+                confidence: None,
+                summary: None,
+                turn_id: Some(turn.to_string()),
+                timestamp: Utc::now(),
+            },
+        ];
+        let graph = make_graph(&events);
+
+        // Sanity: replay cleared claimed_by_session, so the in-progress lookup
+        // is empty — this is exactly the state that produced the bug.
+        assert!(graph.tasks.get("done").unwrap().claimed_by_session.is_none());
+        assert!(get_in_progress_task_ids_for_session(&graph.tasks, session).is_empty());
+
+        assert_eq!(
+            get_focused_task_for_turn(&graph, session, turn),
+            Some("done".to_string())
+        );
+    }
+
+    #[test]
+    fn test_focused_ignores_close_from_other_turn() {
+        // A task closed in a DIFFERENT turn must not be attributed to this turn.
+        let session = "session-abc";
+        let events = vec![
+            make_created_event("done", "Done task", TaskPriority::P2, 2),
+            TaskEvent::Started {
+                task_ids: vec!["done".to_string()],
+                agent_type: "claude-code".to_string(),
+                session_id: Some(session.to_string()),
+                turn_id: Some("turn-old".to_string()),
+                working_copy: None,
+                instructions: None,
+                timestamp: Utc::now() - chrono::Duration::minutes(5),
+            },
+            TaskEvent::Closed {
+                session_id: Some(session.to_string()),
+                task_ids: vec!["done".to_string()],
+                outcome: TaskOutcome::Done,
+                confidence: None,
+                summary: None,
+                turn_id: Some("turn-old".to_string()),
+                timestamp: Utc::now(),
+            },
+        ];
+        let graph = make_graph(&events);
+        assert_eq!(get_focused_task_for_turn(&graph, session, "turn-new"), None);
+    }
+
+    #[test]
+    fn test_focused_picks_most_recently_closed_this_turn() {
+        // Multiple tasks closed in the same turn: return the one closed last
+        // (by closed_at), deterministically.
+        let session = "session-abc";
+        let turn = "turn-xyz";
+        let events = vec![
+            make_created_event("first", "First", TaskPriority::P2, 3),
+            make_created_event("second", "Second", TaskPriority::P2, 3),
+            TaskEvent::Closed {
+                session_id: Some(session.to_string()),
+                task_ids: vec!["first".to_string()],
+                outcome: TaskOutcome::Done,
+                confidence: None,
+                summary: None,
+                turn_id: Some(turn.to_string()),
+                timestamp: Utc::now() - chrono::Duration::minutes(10),
+            },
+            TaskEvent::Closed {
+                session_id: Some(session.to_string()),
+                task_ids: vec!["second".to_string()],
+                outcome: TaskOutcome::Done,
+                confidence: None,
+                summary: None,
+                turn_id: Some(turn.to_string()),
+                timestamp: Utc::now() - chrono::Duration::minutes(1),
+            },
+        ];
+        let graph = make_graph(&events);
+        assert_eq!(
+            get_focused_task_for_turn(&graph, session, turn),
+            Some("second".to_string())
+        );
+    }
+
+    #[test]
+    fn test_focused_none_when_nothing_in_progress_or_closed_this_turn() {
+        // Nothing in progress and nothing closed this turn → genuine session
+        // overhead; attribute to nobody.
+        let session = "session-abc";
+        let events = vec![make_created_event("open", "Open task", TaskPriority::P2, 1)];
+        let graph = make_graph(&events);
+        assert_eq!(get_focused_task_for_turn(&graph, session, "turn-xyz"), None);
     }
 }

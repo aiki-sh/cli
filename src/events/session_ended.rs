@@ -103,16 +103,26 @@ fn aggregate_session_tokens(payload: &AikiSessionEndedPayload) -> Option<super::
 }
 
 /// Sum the per-turn `Response` token usage for one session, **deduplicated by
-/// turn number** so a turn that was recorded more than once contributes exactly
-/// once.
+/// turn number** for real turns so a turn recorded more than once contributes
+/// exactly once.
 ///
 /// Per-turn token slices are disjoint (the parsers reset their accumulators on
 /// each new turn; see `test_extract_resets_accumulators_on_user_entry`), so
 /// summing distinct turns is correct — but only while each turn is counted
 /// once. Without this guard a `Response` event written twice for the same turn
-/// (e.g. a re-dispatch) would compound into the session total. When a turn
+/// (e.g. a re-dispatch) would compound into the session total. When a real turn
 /// appears more than once the last record wins, matching the most-recent-wins
 /// turn attribution used elsewhere.
+///
+/// **Turn 0 is the exception.** Real turns start at 1 (see
+/// `history::types::ConversationEvent::Response::turn`); `turn == 0` is the
+/// "unknown turn" sentinel recorded when prompt lookup fails
+/// (`turn_completed.rs`). Two responses tagged `turn == 0` are *distinct*
+/// responses that both happened to lose their turn number, not one turn recorded
+/// twice — so they are **summed**, not deduplicated. Collapsing them (the old
+/// `BTreeMap<u32, _>`-only behavior) dropped every unknown-turn response but the
+/// last, undercounting the session. We keep the dedup where it is correct (real
+/// turns) and only relax it for the sentinel.
 ///
 /// Returns `None` when no matching turn carried token data (rather than a zero
 /// total), per the session-aggregate contract.
@@ -123,6 +133,7 @@ fn sum_session_turn_tokens(
     use std::collections::BTreeMap;
 
     let mut by_turn: BTreeMap<u32, super::TokenUsage> = BTreeMap::new();
+    let mut unknown_turn_total: Option<super::TokenUsage> = None;
     for event in events {
         if let history::types::ConversationEvent::Response {
             session_id: sid,
@@ -131,16 +142,31 @@ fn sum_session_turn_tokens(
             ..
         } = event
         {
-            if sid == session_id {
+            if sid != session_id {
+                continue;
+            }
+            if *turn == 0 {
+                // Unknown-turn sentinel: each response is distinct, so accumulate
+                // rather than overwrite.
+                unknown_turn_total =
+                    Some(unknown_turn_total.map_or_else(|| t.clone(), |acc| acc + t.clone()));
+            } else {
+                // Real turn: dedup by turn number (last write wins).
                 by_turn.insert(*turn, t.clone());
             }
         }
     }
 
-    if by_turn.is_empty() {
+    let deduped: Option<super::TokenUsage> = if by_turn.is_empty() {
         None
     } else {
         Some(by_turn.into_values().sum())
+    };
+
+    match (deduped, unknown_turn_total) {
+        (None, None) => None,
+        (Some(total), None) | (None, Some(total)) => Some(total),
+        (Some(deduped), Some(unknown)) => Some(deduped + unknown),
     }
 }
 
@@ -244,6 +270,46 @@ mod tests {
         )
         .expect("target session aggregates");
         assert_eq!(agg.total(), 150);
+    }
+
+    /// Regression: multiple `turn == 0` responses are DISTINCT responses (the
+    /// unknown-turn sentinel, assigned when prompt lookup fails), so they must be
+    /// summed. The old `BTreeMap<u32, _>`-only path collapsed them to the last
+    /// record, undercounting the session.
+    #[test]
+    fn unknown_turn_responses_are_summed_not_collapsed() {
+        let agg = super::sum_session_turn_tokens(
+            "s",
+            &[
+                response("s", 0, Some(tok(100, 50))),
+                response("s", 0, Some(tok(10, 5))),
+                response("s", 0, Some(tok(1, 1))),
+            ],
+        )
+        .expect("unknown-turn responses aggregate");
+        // Summed, not just the last (which would be 1+1=2).
+        assert_eq!(agg.input, 111);
+        assert_eq!(agg.output, 56);
+        assert_eq!(agg.total(), 167);
+    }
+
+    /// Real turns still dedup while unknown-turn (`0`) responses sum, and the two
+    /// combine into the session total.
+    #[test]
+    fn unknown_turns_sum_while_real_turns_dedup() {
+        let agg = super::sum_session_turn_tokens(
+            "s",
+            &[
+                response("s", 0, Some(tok(10, 0))),  // unknown #1
+                response("s", 1, Some(tok(100, 0))), // real turn 1
+                response("s", 1, Some(tok(200, 0))), // real turn 1 re-record -> last wins (200)
+                response("s", 0, Some(tok(5, 0))),   // unknown #2
+            ],
+        )
+        .expect("aggregates");
+        // unknown: 10 + 5 = 15; real turn 1 deduped to 200; total input = 215.
+        assert_eq!(agg.input, 215);
+        assert_eq!(agg.output, 0);
     }
 
     /// No turn carried token data => `None`, not a zero total.

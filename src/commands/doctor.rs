@@ -203,23 +203,42 @@ pub fn run(fix: bool) -> Result<()> {
     let codex_config_path = home_dir.join(".codex/config.toml");
     let codex_hooks_path = home_dir.join(".codex/hooks.json");
     let codex_status = check_codex_hooks(&codex_config_path, &codex_hooks_path);
-    if codex_status.all_present && !codex_status.has_old_format {
+    if codex_status.all_present {
         println!("  ✓ Codex hooks configured");
-    } else if codex_status.all_present && codex_status.has_old_format {
-        println!("  ✓ Codex hooks configured");
-        println!("  ⚠ Codex hooks use deprecated format (--agent/--event → --codex shorthand)");
-        if fix {
-            match migrate_old_format_hooks_in_file(&codex_hooks_path, "codex", "--codex") {
-                Ok(count) if count > 0 => {
-                    println!("    ✓ Migrated {} hook command(s) to new format", count);
+        // Two independent deprecation axes (see check_codex_hooks):
+        // 1. hooks.json command shorthand (--agent/--event → --codex).
+        if codex_status.has_old_format {
+            println!("  ⚠ Codex hooks use deprecated format (--agent/--event → --codex shorthand)");
+            if fix {
+                match migrate_old_format_hooks_in_file(&codex_hooks_path, "codex", "--codex") {
+                    Ok(count) if count > 0 => {
+                        println!("    ✓ Migrated {} hook command(s) to new format", count);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        println!("    ✗ Failed to migrate: {}", e);
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    println!("    ✗ Failed to migrate: {}", e);
-                }
+            } else {
+                println!("    → Run: aiki doctor --fix");
             }
-        } else {
-            println!("    → Run: aiki doctor --fix");
+        }
+        // 2. config.toml [features] flag (codex_hooks → hooks); reinstall rewrites it.
+        if codex_status.has_deprecated_feature_flag {
+            println!("  ⚠ Codex hooks use deprecated feature flag (codex_hooks → hooks)");
+            if fix {
+                match config::install_codex_hooks_global() {
+                    Ok(()) => {
+                        println!("    ✓ Migrated feature flag to [features].hooks");
+                    }
+                    Err(e) => {
+                        println!("    ✗ Failed to migrate feature flag: {}", e);
+                        issues_found += 1;
+                    }
+                }
+            } else {
+                println!("    → Run: aiki doctor --fix");
+            }
         }
     } else {
         println!("  ✗ Codex hooks not configured");
@@ -1245,6 +1264,9 @@ struct CodexHookStatus {
     all_present: bool,
     /// true when at least one hook uses the deprecated `--agent/--event` format.
     has_old_format: bool,
+    /// true when config.toml still carries the deprecated `[features].codex_hooks`
+    /// flag (Codex renamed it to `hooks`); `--fix` rewrites it.
+    has_deprecated_feature_flag: bool,
 }
 
 /// Check if Codex hooks are properly configured
@@ -1254,6 +1276,7 @@ fn check_codex_hooks(config_path: &std::path::Path, hooks_path: &std::path::Path
     let not_configured = CodexHookStatus {
         all_present: false,
         has_old_format: false,
+        has_deprecated_feature_flag: false,
     };
 
     let check_aiki_hook = |arr: &serde_json::Value, agent: &str, event: &str| -> HookFormatMatch {
@@ -1272,7 +1295,7 @@ fn check_codex_hooks(config_path: &std::path::Path, hooks_path: &std::path::Path
             .unwrap_or(HookFormatMatch::NoMatch)
     };
 
-    let config_ok = config_path
+    let (config_ok, has_deprecated_feature_flag) = config_path
         .exists()
         .then(|| fs::read_to_string(config_path).ok())
         .flatten()
@@ -1305,16 +1328,28 @@ fn check_codex_hooks(config_path: &std::path::Path, hooks_path: &std::path::Path
                 })
                 .unwrap_or(false);
 
-            let has_hooks_enabled = config
-                .get("features")
-                .and_then(|v| v.as_table())
+            let features = config.get("features").and_then(|v| v.as_table());
+            let has_new_flag = features
+                .and_then(|t| t.get("hooks"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // Lenient: the legacy `codex_hooks` flag still counts as enabled, so
+            // a working-but-old setup is never reported as "✗ not configured".
+            let has_legacy_flag = features
                 .and_then(|t| t.get("codex_hooks"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let has_hooks_enabled = has_new_flag || has_legacy_flag;
+            let has_deprecated = features
+                .map(|t| t.contains_key("codex_hooks"))
+                .unwrap_or(false);
 
-            has_otel && has_writable_root && has_hooks_enabled
+            (
+                has_otel && has_writable_root && has_hooks_enabled,
+                has_deprecated,
+            )
         })
-        .unwrap_or(false);
+        .unwrap_or((false, false));
 
     if !config_ok {
         return not_configured;
@@ -1360,10 +1395,15 @@ fn check_codex_hooks(config_path: &std::path::Path, hooks_path: &std::path::Path
             Some(CodexHookStatus {
                 all_present,
                 has_old_format,
+                has_deprecated_feature_flag,
             })
         });
 
-    hooks_result.unwrap_or(not_configured)
+    hooks_result.unwrap_or(CodexHookStatus {
+        all_present: false,
+        has_old_format: false,
+        has_deprecated_feature_flag,
+    })
 }
 
 /// Migrate old-format hook commands in a JSON settings file to the new shorthand.
@@ -2402,7 +2442,7 @@ mod tests {
         let config = format!(
             r#"
 [features]
-codex_hooks = true
+hooks = true
 
 [otel]
 log_user_prompt = true
@@ -2430,7 +2470,59 @@ writable_roots = ["{fake_home}"]
 
         let result = check_codex_hooks(config_file.path(), hooks_file.path());
         assert!(result.all_present);
-        assert!(result.has_old_format); // old format
+        assert!(result.has_old_format); // old hooks.json command format
+        assert!(
+            !result.has_deprecated_feature_flag,
+            "the new `hooks` flag is not the deprecated `codex_hooks`"
+        );
+    }
+
+    #[test]
+    fn test_check_codex_hooks_deprecated_feature_flag() {
+        let _lock = crate::global::AIKI_HOME_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fake_home = "/tmp/fake-aiki-home";
+        let _guard = EnvGuard::set("AIKI_HOME", fake_home, &_lock);
+
+        // Legacy feature flag + new-format hooks: a working-but-old install.
+        let mut config_file = NamedTempFile::new().unwrap();
+        let config = format!(
+            r#"
+[features]
+codex_hooks = true
+
+[otel]
+log_user_prompt = true
+
+[otel.exporter.otlp-http]
+endpoint = "http://127.0.0.1:19876/v1/logs"
+protocol = "binary"
+
+[sandbox_workspace_write]
+writable_roots = ["{fake_home}"]
+"#
+        );
+        write!(config_file, "{}", config).unwrap();
+
+        let mut hooks_file = NamedTempFile::new().unwrap();
+        let hooks = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": "aiki hooks stdin --codex sessionStart"}]}],
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "aiki hooks stdin --codex userPromptSubmit"}]}],
+                "PreToolUse": [{"hooks": [{"type": "command", "command": "aiki hooks stdin --codex preToolUse"}]}],
+                "Stop": [{"hooks": [{"type": "command", "command": "aiki hooks stdin --codex stop"}]}]
+            }
+        });
+        write!(hooks_file, "{}", serde_json::to_string_pretty(&hooks).unwrap()).unwrap();
+
+        let result = check_codex_hooks(config_file.path(), hooks_file.path());
+        assert!(result.all_present, "legacy flag still counts as configured");
+        assert!(!result.has_old_format, "hooks use the new --codex shorthand");
+        assert!(
+            result.has_deprecated_feature_flag,
+            "deprecated codex_hooks flag must be flagged for --fix"
+        );
     }
 
     #[test]

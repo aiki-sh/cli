@@ -1,0 +1,78 @@
+# Live-e2e image: aiki compiled for Linux + a harness CLI + jj/git, to run the
+# existing #[ignore] e2e tests (cli/tests/e2e/) against a REAL agent in an
+# isolated container. Unlike the capture Dockerfile, aiki IS in here.
+#
+#   build context = repo root:
+#   container build -t aiki-e2e-claude --build-arg HARNESS=claude -f cli/tests/harness-rig/Dockerfile.e2e .
+#
+# The first build compiles aiki (incl. jj-lib) for linux/arm64 and is slow;
+# switching HARNESS afterward only rebuilds the thin install layer.
+FROM rust:1-bookworm
+
+# Build + runtime deps. jj-lib/git2 need ssl+zlib+cmake; harness CLIs need node.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git jq curl ca-certificates pkg-config libssl-dev zlib1g-dev cmake build-essential \
+ && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/*
+
+# jj CLI: the e2e tests shell out to jj. Pinned release binary, not a source build.
+ARG JJ_VERSION=0.42.0
+# The tarball stores the binary as ./jj (plus LICENSE/README); extract all into
+# /usr/local/bin rather than naming the member, which the container tar wouldn't
+# match against the ./ prefix.
+RUN curl -fsSL "https://github.com/jj-vcs/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-aarch64-unknown-linux-musl.tar.gz" \
+      | tar -xz -C /usr/local/bin \
+ && jj --version
+
+# Non-root `node` user (matches the capture rig; Claude Code refuses
+# --dangerously-skip-permissions as root). Pre-create config dirs so a mounted
+# credential file overlays only the file and the dir stays writable.
+RUN id node >/dev/null 2>&1 || useradd -m -u 1000 node; \
+    mkdir -p /home/node/.claude /home/node/.codex && chown -R node:node /home/node
+ENV HOME=/home/node
+
+# Build aiki + the e2e test binary (cached unless the source changes). Symlink the
+# aiki binary onto PATH so the hooks aiki installs can find it.
+# Context is the cli/ crate dir, so its contents land directly in /src.
+#
+# Strip debuginfo: a full-debuginfo debug build of aiki (jj-lib + gix + ratatui)
+# produces multi-hundred-MB binaries whose link step needs >2GB RAM. The e2e
+# tests only execute the binary, so debug symbols are dead weight here. This both
+# shrinks the link and speeds compilation.
+ENV RUSTFLAGS="-C debuginfo=0"
+WORKDIR /src
+COPY . .
+RUN cargo test --test e2e --no-run --locked \
+ && ln -sf /src/target/debug/aiki /usr/local/bin/aiki \
+ && chown -R node:node /src/target
+
+# Harness CLI (varies by build-arg; only this layer rebuilds when HARNESS changes).
+ARG HARNESS
+RUN bash -lc "source /src/tests/harness-rig/harnesses/${HARNESS}.sh && harness_install"
+
+USER node
+WORKDIR /src
+
+# Wire aiki's GLOBAL agent hooks into /home/node (~/.claude, ~/.codex, ...). The
+# e2e tests drive the REAL hook flow: `aiki run` spawns the agent with cwd = the
+# (test) repo, and the agent's gated SessionStart/PostToolUse hooks must fire so
+# aiki can discover the session UUID and record [aiki] provenance. Those hooks
+# live in ~/.claude/settings.json; without this step the spawned agent has none
+# and `discover_session_id` times out. `aiki init` (run in a throwaway repo) is
+# what installs them. The hook commands are gated on a repo `.aiki/`, which the
+# per-test repo provides at runtime; AIKI_HOME (set per-test) redirects where the
+# hooks read/write, so the build-time enable marker here is irrelevant.
+#
+# `|| true`: offline, `aiki init` also tries to git-clone a default plugin, which
+# fails with no network/credentials. That is unrelated to hook installation
+# (which has already happened by then), so we don't let it fail the build.
+ENV PATH=/usr/local/cargo/bin:$PATH
+RUN mkdir -p /tmp/hookinit && cd /tmp/hookinit \
+ && git init -q && git config user.email e2e@aiki.test && git config user.name e2e \
+ && aiki init --quiet || true
+
+# Non-login shell: a login shell (-l) sources /etc/profile, which on Debian resets
+# PATH and drops the rust image's /usr/local/cargo/bin (so `cargo` vanishes).
+# `-c` preserves the image's ENV PATH, which already includes the cargo bin dir.
+ENTRYPOINT ["/bin/bash", "-c"]

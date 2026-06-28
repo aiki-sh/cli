@@ -381,18 +381,22 @@ pub fn render_summary_line(model: &Model) -> Vec<Line> {
         children.len()
     };
 
-    // Sum tokens from graph children. `None` until some child reports usage so a
-    // run where no harness reported tokens shows "usage unavailable", not "0
-    // tokens". The stored figure is total-billed (all four buckets) and is only
-    // written for nonzero turns, so its absence is exactly the unavailable case.
-    let mut total_tokens: Option<u64> = None;
-    for child in &children {
-        if let Some(tok_str) = child.data.get("tokens") {
-            if let Ok(tok) = tok_str.parse::<u64>() {
-                total_tokens = Some(total_tokens.unwrap_or(0) + tok);
-            }
-        }
-    }
+    // Token total comes from the root task's `data["tokens"]`, which is a
+    // subtree rollup: the root always carries the full run total (task-direct +
+    // sum of every subtask-of descendant; see cli/src/tasks/token_rollup.rs).
+    // Reading the root is correct for single- and multi-task runs alike. Do NOT
+    // reintroduce a children-sum: it omits the root's own direct contribution
+    // and yields `None` for a single-task run that has no children. `None` (key
+    // absent or unparseable) stays distinct from a real zero, so a run where no
+    // harness reported usage shows "usage unavailable", not "0 tokens". The
+    // stored figure is total-billed across all four buckets (see
+    // `TokenUsage::total`) and is only written for nonzero turns.
+    let total_tokens: Option<u64> = model
+        .graph
+        .tasks
+        .get(root_id)
+        .and_then(|root| root.data.get("tokens"))
+        .and_then(|tok_str| tok_str.parse::<u64>().ok());
 
     // Elapsed from earliest entry
     let elapsed = model
@@ -532,6 +536,7 @@ mod tests {
     use crate::tasks::types::{FastHashMap, TaskOutcome, TaskPriority, TaskStatus};
     use chrono::Utc;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn make_task(id: &str, name: &str, status: TaskStatus, task_type: Option<&str>) -> Task {
         Task {
@@ -572,6 +577,29 @@ mod tests {
             edges: EdgeStore::default(),
             slug_index: FastHashMap::default(),
         }
+    }
+
+    /// Build a finished `Screen::TaskRun` Model so tests exercise the real
+    /// consumer path (`render_summary_line(&model)`), not a helper in isolation.
+    fn make_finished_run_model(graph: TaskGraph, task_id: &str) -> Model {
+        Model {
+            graph: Arc::new(graph),
+            screen: Screen::TaskRun {
+                task_id: task_id.to_string(),
+            },
+            window: WindowState::new(80),
+            entries: Vec::new(),
+            finished: true,
+            detached: false,
+        }
+    }
+
+    fn summary_text(model: &Model) -> String {
+        render_summary_line(model)
+            .iter()
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -631,5 +659,80 @@ mod tests {
         assert!(!ids
             .iter()
             .any(|id| ["decomp1", "review1", "fix1", "orch1"].contains(id)));
+    }
+
+    #[test]
+    fn render_summary_reads_root_tokens_for_single_task_run() {
+        // Single-task run: root carries the real total in data["tokens"] but has
+        // no subtask-of children. The old children-sum produced None here, so the
+        // summary wrongly rendered "usage unavailable".
+        let mut graph = make_graph();
+        let mut root = make_task("root", "Single task", TaskStatus::Closed, None);
+        root.data.insert("tokens".to_string(), "1234".to_string());
+        graph.tasks.insert("root".to_string(), root);
+
+        let model = make_finished_run_model(graph, "root");
+        let text = summary_text(&model);
+
+        assert!(
+            text.contains(&format_token_usage(Some(1234))),
+            "expected formatted 1234 token total, got: {text}"
+        );
+        assert!(
+            !text.contains("usage unavailable"),
+            "single-task run with a real total must not show 'usage unavailable': {text}"
+        );
+    }
+
+    #[test]
+    fn render_summary_reads_root_rollup_not_children_sum_for_multi_task_run() {
+        // Multi-task run: the root rollup already equals the subtree total
+        // (1800 = root-direct + children). Reading the root must yield 1800, not
+        // the children-only sum (500 + 300 = 800), confirming Option B reads the
+        // root, not the children.
+        let mut graph = make_graph();
+        let mut root = make_task("root", "Epic", TaskStatus::Closed, None);
+        root.data.insert("tokens".to_string(), "1800".to_string());
+        graph.tasks.insert("root".to_string(), root);
+
+        let mut child1 = make_task("child1", "Sub A", TaskStatus::Closed, None);
+        child1.data.insert("tokens".to_string(), "500".to_string());
+        graph.tasks.insert("child1".to_string(), child1);
+
+        let mut child2 = make_task("child2", "Sub B", TaskStatus::Closed, None);
+        child2.data.insert("tokens".to_string(), "300".to_string());
+        graph.tasks.insert("child2".to_string(), child2);
+
+        graph.edges.add("child1", "root", "subtask-of");
+        graph.edges.add("child2", "root", "subtask-of");
+
+        let model = make_finished_run_model(graph, "root");
+        let text = summary_text(&model);
+
+        assert!(
+            text.contains(&format_token_usage(Some(1800))),
+            "expected root rollup total 1800, got: {text}"
+        );
+        assert!(
+            !text.contains(&format_token_usage(Some(800))),
+            "must not render the children-only sum (800): {text}"
+        );
+    }
+
+    #[test]
+    fn render_summary_renders_unavailable_when_root_has_no_tokens() {
+        // No tokens key on the root => None => "usage unavailable", preserving the
+        // None-vs-0 distinction (a missing key is not a real zero).
+        let mut graph = make_graph();
+        let root = make_task("root", "Single task", TaskStatus::Closed, None);
+        graph.tasks.insert("root".to_string(), root);
+
+        let model = make_finished_run_model(graph, "root");
+        let text = summary_text(&model);
+
+        assert!(
+            text.contains("usage unavailable"),
+            "root with no 'tokens' key must render 'usage unavailable', got: {text}"
+        );
     }
 }

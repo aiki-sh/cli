@@ -136,6 +136,24 @@ include:
 #   # Use for: blocking external requests, domain allowlisting
 "#;
 
+/// Returns a human-readable reason when `repo_root` is a directory aiki must
+/// never turn into a repository (the user's home directory or a filesystem
+/// root), or `None` when it is safe to initialize. Initializing at one of those
+/// makes jj treat the entire tree (including synced `~/Library` dirs) as one
+/// working copy, which breaks snapshots and can swallow unrelated files.
+/// Canonicalizes both paths so a symlinked or relative form still matches.
+fn unsafe_init_root_reason(repo_root: &Path, home_dir: &Path) -> Option<&'static str> {
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let root = canonical(repo_root);
+    if root == canonical(home_dir) {
+        Some("your home directory")
+    } else if root.parent().is_none() {
+        Some("a filesystem root")
+    } else {
+        None
+    }
+}
+
 pub fn run(quiet: bool) -> Result<()> {
     prerequisites::check_prerequisites(quiet)?;
 
@@ -155,6 +173,26 @@ pub fn run(quiet: bool) -> Result<()> {
     // Find the Git repository root
     let repo_root = detector.find_repo_root()?;
 
+    // Never initialize aiki at the home directory or a filesystem root: doing so
+    // makes jj treat the entire tree (including synced ~/Library dirs) as one
+    // working copy, which breaks snapshots and can swallow unrelated files. If we
+    // resolved to one of those, do nothing (return Ok) with a helpful message.
+    let home_dir = dirs::home_dir().context("Could not find home directory")?;
+    if let Some(reason) = unsafe_init_root_reason(&repo_root, &home_dir) {
+        if !quiet {
+            println!(
+                "Skipping aiki init: {} is {reason}.\n\
+                 Initializing here would turn the whole tree into a single jj \
+                 repository, which breaks snapshots and can interfere with synced \
+                 folders (iCloud, Dropbox).\n\
+                 To set up aiki for a project, cd into that project's directory \
+                 and run 'aiki init' there.",
+                repo_root.display()
+            );
+        }
+        return Ok(());
+    }
+
     // Check if already initialized by looking at git config
     let git_hooks_path = std::process::Command::new("git")
         .args(["config", "core.hooksPath"])
@@ -171,8 +209,7 @@ pub fn run(quiet: bool) -> Result<()> {
             }
         });
 
-    // Check if pointing to global hooks
-    let home_dir = dirs::home_dir().context("Could not find home directory")?;
+    // Check if pointing to global hooks (home_dir resolved above)
     let global_hooks = home_dir.join(".aiki/githooks");
 
     if let Some(ref hooks_path) = git_hooks_path {
@@ -662,5 +699,49 @@ mod tests {
                 },
             );
         });
+    }
+
+    #[test]
+    fn unsafe_init_root_reason_flags_home_directory() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            unsafe_init_root_reason(home.path(), home.path()),
+            Some("your home directory"),
+        );
+    }
+
+    #[test]
+    fn unsafe_init_root_reason_flags_filesystem_root() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            unsafe_init_root_reason(Path::new("/"), home.path()),
+            Some("a filesystem root"),
+        );
+    }
+
+    #[test]
+    fn unsafe_init_root_reason_allows_normal_project_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("code").join("myproj");
+        fs::create_dir_all(&project).unwrap();
+        // home is a sibling of the resolved project root, not equal to it.
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        assert_eq!(unsafe_init_root_reason(&project, &home), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_init_root_reason_flags_home_reached_via_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let link = tmp.path().join("link-to-home");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        // A symlinked path to home still canonicalizes to home.
+        assert_eq!(
+            unsafe_init_root_reason(&link, &home),
+            Some("your home directory"),
+        );
     }
 }

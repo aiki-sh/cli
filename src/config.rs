@@ -344,6 +344,12 @@ fn merge_codex_hooks(hooks_json: &mut serde_json::Value) -> Result<usize> {
 
     let mut codex_preserved = 0usize;
     for (event_key, event_arg) in &hook_events {
+        // FROZEN CONTRACT (Codex hook trust): Codex records hook trust as a hash
+        // over the hook command. Changing this command string revokes an
+        // interactive user's one-time `/hooks` approval and re-prompts them.
+        // Treat any edit as a deliberate, re-trust-forcing change, not a
+        // refactor. Pinned by `codex_hook_command_strings_are_frozen`. See
+        // ops/now/codex-hooks-feature-flag-migration.md (Step 6).
         let raw = format!("aiki hooks stdin --codex {}", event_arg);
         let command = if *event_key == "SessionStart" {
             gate_session_start(&raw)
@@ -551,6 +557,24 @@ pub fn install_cursor_hooks_global() -> Result<()> {
 ///
 /// If [otel] already exists with a different exporter endpoint, warns but doesn't overwrite.
 /// log_user_prompt is always safe to set/update regardless of existing config.
+/// Write the Codex hooks feature flag, migrating off the deprecated name.
+///
+/// Codex renamed `[features].codex_hooks` to `[features].hooks`. This inserts the
+/// new flag and removes any legacy one in the same pass, so a re-init silently
+/// migrates existing users and clears Codex's deprecation warning. Idempotent.
+fn enable_codex_hooks_feature(
+    config_table: &mut toml::map::Map<String, toml::Value>,
+) -> Result<()> {
+    let features = config_table
+        .entry("features")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .context("features section is not a table")?;
+    features.insert("hooks".to_string(), toml::Value::Boolean(true));
+    features.remove("codex_hooks"); // migrate off the deprecated flag name
+    Ok(())
+}
+
 pub fn install_codex_hooks_global() -> Result<()> {
     let home_dir = dirs::home_dir().context("Could not find home directory")?;
     let config_path = home_dir.join(".codex/config.toml");
@@ -666,16 +690,9 @@ pub fn install_codex_hooks_global() -> Result<()> {
     // Remove legacy notify config if present
     config_table.remove("notify");
 
-    // Enable hooks feature (disabled by default in Codex)
-    let features_table = config_table
-        .entry("features")
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
-        .as_table_mut()
-        .context("features section is not a table")?;
-    features_table.insert(
-        "codex_hooks".to_string(),
-        toml::Value::Boolean(true),
-    );
+    // Enable the hooks feature (off by default in Codex), migrating off the
+    // deprecated `codex_hooks` flag name.
+    enable_codex_hooks_feature(config_table)?;
 
     // Codex native hooks inherit the session sandbox. Add ~/.aiki so hook
     // handlers can write global session state under workspace-write mode.
@@ -1635,6 +1652,56 @@ mod tests {
             arr.iter().any(entry_has_aiki_command),
             "our SessionStart entry was added"
         );
+    }
+
+    #[test]
+    fn enable_codex_hooks_feature_migrates_legacy_flag() {
+        // Consumer path: install_codex_hooks_global() calls this. A config
+        // carrying the deprecated flag must come out with `hooks = true` and no
+        // `codex_hooks` (which clears Codex's deprecation warning).
+        let mut config: toml::Value =
+            toml::from_str("[features]\ncodex_hooks = true\n").unwrap();
+        enable_codex_hooks_feature(config.as_table_mut().unwrap()).unwrap();
+        let features = config.get("features").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(features.get("hooks").and_then(|v| v.as_bool()), Some(true));
+        assert!(
+            features.get("codex_hooks").is_none(),
+            "legacy codex_hooks flag must be removed"
+        );
+    }
+
+    #[test]
+    fn enable_codex_hooks_feature_on_fresh_config() {
+        let mut config = toml::Value::Table(toml::map::Map::new());
+        enable_codex_hooks_feature(config.as_table_mut().unwrap()).unwrap();
+        assert_eq!(config["features"]["hooks"].as_bool(), Some(true));
+        assert!(config["features"]
+            .as_table()
+            .unwrap()
+            .get("codex_hooks")
+            .is_none());
+    }
+
+    #[test]
+    fn codex_hook_command_strings_are_frozen() {
+        // Step 6 guard: Codex hook trust is hashed over the command string, so
+        // any change silently re-prompts every user. Pin the raw command form.
+        let mut hooks = json!({});
+        merge_codex_hooks(&mut hooks).unwrap();
+        for (event, arg) in [
+            ("SessionStart", "sessionStart"),
+            ("UserPromptSubmit", "userPromptSubmit"),
+            ("PreToolUse", "preToolUse"),
+            ("Stop", "stop"),
+        ] {
+            let cmd = hooks["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing command for {event}"));
+            assert!(
+                cmd.contains(&format!("aiki hooks stdin --codex {arg}")),
+                "{event}: must contain the frozen `aiki hooks stdin --codex {arg}` form; got {cmd}"
+            );
+        }
     }
 
     // --- Malformed ROOT: non-object top-level value must error, not panic ---

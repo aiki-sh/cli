@@ -1,0 +1,7 @@
+# Context for the e2e rig (built with `cli/` as the build context). Exclude the
+# macOS build artifacts and the CLAUDE.md symlink (it points at the repo-root
+# AGENTS.md, outside this context, and the repo root has symlink loops that hang
+# the container build's context scanner).
+target/
+CLAUDE.md
+**/node_modules/

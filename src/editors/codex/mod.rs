@@ -60,6 +60,15 @@ fn dispatch_and_output(codex_event_name: &str, built_events: BuiltCodexEvents) -
     hook_output.print_and_exit();
 }
 
+/// Parse a Codex hook payload JSON string, returning an error if it does not
+/// deserialize into a known `CodexEvent`. Used by the schema golden tests to
+/// assert that documented sample payloads are accepted by the real parser.
+#[allow(dead_code)]
+pub fn parse_hook_payload_json(json: &str) -> Result<()> {
+    let _ = build_aiki_event_from_json(json.as_bytes())?;
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub fn render_hook_output(event_name: &str, response: HookResult) -> HookCommandOutput {
     build_command_output(response, event_name)

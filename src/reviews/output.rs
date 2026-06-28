@@ -18,6 +18,9 @@ pub fn review_summary(cwd: &Path, review_id: &str) -> Result<String> {
     let ic = issue_count(task);
     if ic > 0 {
         Ok(format!("Found {} issues", ic))
+    } else if task.status == TaskStatus::Stopped {
+        // Review agent gave up before completing (see steps::review degrade path).
+        Ok("incomplete".to_string())
     } else if task.status != TaskStatus::Closed {
         Ok("pending".to_string())
     } else {

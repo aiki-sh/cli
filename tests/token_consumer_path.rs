@@ -217,6 +217,33 @@ impl TokenFixture {
         matches[0].clone()
     }
 
+    /// Close a task as the active session (`aiki task close <id> --confidence 4
+    /// --summary ...`), mirroring the agent's normal end-of-work close. This
+    /// stamps `turn_closed` with `current_turn_id` — the same turn_id the Stop
+    /// hook's `handle_turn_completed` computes (both derive it from
+    /// `get_current_turn_info` + `generate_turn_id` on this session).
+    fn close_task(&self, task_id: &str) {
+        let out = self
+            .aiki()
+            .args([
+                "task",
+                "close",
+                task_id,
+                "--confidence",
+                "4",
+                "--summary",
+                "done",
+            ])
+            .output()
+            .expect("run task close");
+        assert!(
+            out.status.success(),
+            "task close failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
     /// The task graph read from the repo's task storage — the same source the
     /// display surfaces read.
     fn task_graph(&self) -> TaskGraph {
@@ -339,5 +366,93 @@ fn claude_transcript_lights_up_displayed_token_total() {
         token_rollup::subtree_total(&graph, &direct, &task_id),
         EXPECTED_TOTAL,
         "subtree rollup (leaf == own direct total) matches the displayed total",
+    );
+}
+
+/// Regression (review kxtxyyo, finding: close-before-turn.completed): in the
+/// normal workflow the agent runs `aiki task close` *before* the Stop hook
+/// fires, so by the time `handle_turn_completed` materializes the graph the task
+/// is Closed (not InProgress) and `claimed_by_session` is cleared. Resolving the
+/// focused task from the in-progress lookup alone yielded `None`, so the task's
+/// final/often-only turn — where the work happened — contributed 0 tokens.
+///
+/// This drives that exact ordering through the real binary (close, then Stop) and
+/// asserts the closed task still receives the turn's tokens via the
+/// closed-this-turn fallback (`turn_closed == turn_id`) in
+/// `get_focused_task_for_turn`. It exercises the consumer path
+/// (`handle_turn_completed`), not the resolver in isolation.
+#[test]
+fn closed_before_stop_still_attributes_turn_tokens() {
+    if !common::jj_available() {
+        eprintln!("skipping: jj not installed");
+        return;
+    }
+
+    let fx = TokenFixture::new();
+    let repo = fx.repo.to_string_lossy().to_string();
+    let session_id = "tok-close-before-stop-session";
+
+    // 1. Session begins so the started task can be claimed by it.
+    fx.fire("SessionStart", &claude_session_start(session_id, &repo));
+
+    // 2. Start, then immediately CLOSE the task — before the Stop hook — exactly
+    //    as the agent does at the end of its work.
+    let task_id = fx.start_task("Wire token display");
+    fx.close_task(&task_id);
+
+    // Precondition: replay set the task Closed and cleared the claim, so the
+    // in-progress focus lookup is now empty — the exact state that produced the
+    // bug. The close must also have stamped a turn_closed for the fallback to
+    // match against the Stop hook's turn_id.
+    {
+        let graph = fx.task_graph();
+        let task = graph.tasks.get(&task_id).expect("task exists after close");
+        assert_eq!(task.status, TaskStatus::Closed, "task is closed before Stop");
+        assert!(
+            task.claimed_by_session.is_none(),
+            "replay cleared claimed_by_session on close",
+        );
+        assert!(
+            task.turn_closed.is_some(),
+            "close stamped a turn_closed for the closed-this-turn fallback",
+        );
+    }
+
+    // 3. Emit the known Claude transcript to the path the Stop hook reads.
+    let transcript = fx.scratch.join("transcript.jsonl");
+    let mut emit = Command::new(fake_agent_path("claude"));
+    scripted_transcript(&mut emit, CLAUDE_FIXTURE, &transcript);
+    assert!(
+        emit.status().expect("run scripted fake agent").success(),
+        "scripted fake agent emits the transcript",
+    );
+    assert!(transcript.exists(), "transcript was written");
+
+    // 4. Stop hook: REAL extraction → record_response → C1 bridge, now with NO
+    //    in-progress task — focus must resolve via the closed-this-turn fallback.
+    fx.fire(
+        "Stop",
+        &claude_stop(session_id, &repo, transcript.to_str().unwrap()),
+    );
+
+    // 5. Consumer path. The displayed per-task total is the extracted total, not
+    //    0 — the turn attributed to the task even though it closed before Stop.
+    let graph = fx.task_graph();
+    let task = graph.tasks.get(&task_id).expect("task exists");
+    assert_eq!(
+        displayed_total(task),
+        Some(EXPECTED_TOTAL),
+        "tokens from the task's final/only turn attribute to it via the \
+         closed-this-turn fallback (was 0 before the fix)",
+    );
+
+    // The task-tagged history Response event agrees: the final turn's response is
+    // tagged with the closed task id, so the direct per-task rollup matches.
+    let history = aiki::history::storage::read_events(&fx.aiki_home).expect("read history");
+    let direct = token_rollup::direct_token_totals(&history);
+    assert_eq!(
+        direct.get(&task_id).copied(),
+        Some(EXPECTED_TOTAL),
+        "the final turn's Response is tagged with the closed task id",
     );
 }

@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use crate::agents::runtime::discover_session_id;
+use crate::agents::runtime::{discover_session_id, BackgroundHandle};
 use crate::agents::AgentType;
 use crate::commands::task::{
     create_from_template, get_blocker_short_ids, parse_data_flags, TemplateTaskParams,
@@ -381,6 +381,60 @@ pub(crate) fn rollback_claim_if_reserved(
     }
 }
 
+/// Read a task's current status, or `None` if it can't be determined (event
+/// read failed or the task is absent).
+fn task_status(cwd: &Path, task_id: &str) -> Option<TaskStatus> {
+    read_events(cwd)
+        .ok()
+        .and_then(|events| materialize_graph(&events).tasks.get(task_id).map(|t| t.status))
+}
+
+/// Whether a discovery-failed spawn left a process that should be reaped.
+///
+/// Only a still-`Reserved` task means the agent never registered its session
+/// (it hung or died at startup). Any progressed status (`InProgress`, `Closed`)
+/// means a live agent owns the work, so the discovery error was transient and
+/// the process must NOT be killed. An unreadable status (`None`) is treated as
+/// "do not kill" — we cannot confirm the process is an orphan.
+fn should_reap_process(status: Option<TaskStatus>) -> bool {
+    status == Some(TaskStatus::Reserved)
+}
+
+/// Best-effort termination of an orphaned agent process: `SIGTERM`, a short
+/// grace period, then `SIGKILL`. `ESRCH` (already exited) is harmless. No-op on
+/// non-Unix targets.
+#[cfg(unix)]
+fn terminate_orphan(pid: u32) {
+    use std::time::Duration;
+    // SAFETY: kill() with a plain signal is always safe to call; an invalid or
+    // already-exited pid simply returns ESRCH.
+    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    std::thread::sleep(Duration::from_millis(500));
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+}
+
+#[cfg(not(unix))]
+fn terminate_orphan(_pid: u32) {}
+
+/// Reap a spawn whose session never registered: terminate the orphaned process
+/// (only when the task is still `Reserved`, to avoid killing a healthy agent
+/// after a transient discovery error) and release the reservation so the task
+/// returns to the ready queue instead of being stranded in `reserved`.
+fn reap_orphan_if_reserved(cwd: &Path, task_id: &str, handle: &BackgroundHandle) {
+    if let Some(pid) = handle.pid {
+        if should_reap_process(task_status(cwd, task_id)) {
+            terminate_orphan(pid);
+        }
+    }
+    // Release the claim (no-op unless still Reserved; conservatively releases
+    // when status is unreadable, matching the spawn-failure rollback).
+    try_rollback_reserved(
+        cwd,
+        task_id,
+        "Agent session never registered within timeout; terminated orphan process and released reservation",
+    );
+}
+
 /// Spawn an agent session, discover the session UUID, and optionally wait.
 fn spawn_and_discover(
     cwd: &Path,
@@ -399,15 +453,26 @@ fn spawn_and_discover(
     // Discover session UUID (works for all agents with native hooks)
     let session_id = match discover_session_id(&handle.thread) {
         Ok(sid) => sid,
-        Err(_) if output_id => {
-            // Session discovery failed — no session ID to output
-            if is_async {
-                return Ok(());
+        Err(e) => {
+            // The agent never registered its session within the timeout: it hung
+            // or died at startup (a healthy agent records `session.started`
+            // within seconds). Reap the orphan — terminate the process and
+            // release the reservation — so we don't leave a zombie plus a task
+            // stranded in `reserved`. Without this, the only recovery is a manual
+            // `aiki run --force` and a manual `kill`.
+            reap_orphan_if_reserved(cwd, task_id, &handle);
+
+            if output_id {
+                // No session ID to output.
+                if is_async {
+                    return Ok(());
+                }
+                // Fall through to a blocking task-based run now that the orphan
+                // is gone and the reservation released.
+                return run_task_with_output(cwd, task_id, TaskRunOptions::new());
             }
-            // Fall through to blocking wait using task-based approach
-            return run_task_with_output(cwd, task_id, TaskRunOptions::new());
+            return Err(e);
         }
-        Err(e) => return Err(e),
     };
 
     if is_async {
@@ -544,5 +609,37 @@ mod tests {
             events.is_empty(),
             "Should not write events when task is absent from graph"
         );
+    }
+
+    #[test]
+    fn reaps_process_only_when_still_reserved() {
+        // A still-Reserved task means the agent never registered — reap it.
+        assert!(should_reap_process(Some(TaskStatus::Reserved)));
+        // A progressed task is owned by a live agent — never kill it.
+        assert!(!should_reap_process(Some(TaskStatus::InProgress)));
+        assert!(!should_reap_process(Some(TaskStatus::Closed)));
+        assert!(!should_reap_process(Some(TaskStatus::Open)));
+        // Unknown status can't be confirmed an orphan — don't kill.
+        assert!(!should_reap_process(None));
+    }
+
+    #[test]
+    fn reap_without_pid_on_bare_dir_is_a_noop_release() {
+        use tempfile::tempdir;
+
+        // No pid -> no kill; a bare dir (no task in graph) -> no Released event.
+        // Exercises that reap is safe to call when the process/task can't be
+        // resolved, without panicking.
+        let dir = tempdir().unwrap();
+        let task_id = "nonexistent-task";
+        let handle = BackgroundHandle {
+            thread: ThreadId::single(task_id.to_string()),
+            session_id: None,
+            agent_type: AgentType::ClaudeCode,
+            pid: None,
+        };
+        reap_orphan_if_reserved(dir.path(), task_id, &handle);
+        let events = read_events(dir.path()).unwrap_or_default();
+        assert!(events.is_empty(), "absent task should produce no events");
     }
 }

@@ -1,0 +1,2 @@
+{"session_id":"9f2de44d-f3b1-4ec8-b7a1-66c6adb97d93","transcript_path":"/home/node/.claude/projects/-work/9f2de44d-f3b1-4ec8-b7a1-66c6adb97d93.jsonl","cwd":"/work","permission_mode":"bypassPermissions","effort":{"level":"high"},"hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{"file_path":"/work/hello.txt","content":"hello\n"},"tool_use_id":"toolu_01KeMXck3QEiYrjRYdwVHfYT"}
+
