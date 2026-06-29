@@ -80,6 +80,13 @@ fn e2e_codex_provenance_on_trivial_change() {
          Your task ID is shown when you run `aiki task` or `aiki task list`.",
     );
 
+    // Codex provenance flows through the OTel receiver (it has no inline change
+    // hook like Claude's PostToolUse): codex exports apply_patch results to
+    // 127.0.0.1:19876 and aiki turns them into change.completed. Stand the receiver
+    // up (socat → `aiki hooks otel`) sharing this test's AIKI_HOME; keep it alive
+    // through the provenance assertions.
+    let _otel = super::start_codex_otel_receiver(repo);
+
     let (success, stdout, stderr) = aiki_run(repo, &task_id, "codex", Duration::from_secs(180));
     eprintln!("aiki run stdout: {stdout}");
     eprintln!("aiki run stderr: {stderr}");
@@ -118,6 +125,10 @@ fn run_task_diff_test(agent: &str) {
          Then run: aiki task close <your-task-id> --confidence 3 --summary 'Created files'\n\
          Your task ID is shown when you run `aiki task` or `aiki task list`.",
     );
+
+    // Codex records changes out-of-band via the OTel receiver; Claude uses inline
+    // hooks. Only stand up the receiver for codex (no-op guard otherwise).
+    let _otel = (agent == "codex").then(|| super::start_codex_otel_receiver(repo));
 
     let (success, _, stderr) = aiki_run(repo, &task_id, agent, Duration::from_secs(180));
     assert!(success, "aiki run failed with {agent}: {stderr}");

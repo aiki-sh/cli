@@ -119,7 +119,39 @@ fn resolve_agent_type(
         return Ok(agent);
     }
 
+    // 5. Sole installed agent. In a single-agent environment there is no
+    //    ambiguity, so default to the only spawnable agent CLI present rather
+    //    than forcing the caller to pass --agent. This keeps --agent required
+    //    only when more than one agent is installed (the genuinely ambiguous
+    //    case), and makes `aiki run <unassigned-task>` "just work" for the
+    //    common single-agent user (and the single-agent e2e containers).
+    if let Some(agent) = sole_available_agent() {
+        return Ok(agent);
+    }
+
     Err(AikiError::TaskNoAssignee(task_id.to_string()))
+}
+
+/// The only spawnable agent installed, or `None` if zero or more than one are
+/// available. "Available" means the harness has a runtime whose binary is on
+/// PATH (so Cursor/Gemini, which have no runtime, never count).
+fn sole_available_agent() -> Option<AgentType> {
+    let available: Vec<AgentType> = crate::harnesses::all_sorted()
+        .into_iter()
+        .filter(|h| h.is_available())
+        .map(|h| h.identity.agent_type)
+        .collect();
+    sole_agent(&available)
+}
+
+/// Pure selection: exactly one element yields it; zero or many yields `None`.
+/// Split out from [`sole_available_agent`] so the "exactly one" rule is testable
+/// without depending on which agent binaries happen to be on the test machine.
+fn sole_agent(available: &[AgentType]) -> Option<AgentType> {
+    match available {
+        [only] => Some(*only),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1491,5 +1523,16 @@ mod tests {
         let graph = materialize_graph(&events);
         let thread = ThreadId { head: "A".to_string(), tail: "GHOST".to_string() };
         assert!(validate_thread_instructions(&graph, &thread).is_ok());
+    }
+
+    #[test]
+    fn sole_agent_returns_single_else_none() {
+        // Zero available → no default (must error / require --agent).
+        assert_eq!(sole_agent(&[]), None);
+        // Exactly one available → use it, unambiguously.
+        assert_eq!(sole_agent(&[AgentType::ClaudeCode]), Some(AgentType::ClaudeCode));
+        assert_eq!(sole_agent(&[AgentType::Codex]), Some(AgentType::Codex));
+        // Two or more available → ambiguous, require an explicit choice.
+        assert_eq!(sole_agent(&[AgentType::ClaudeCode, AgentType::Codex]), None);
     }
 }

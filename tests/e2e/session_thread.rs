@@ -62,6 +62,9 @@ fn e2e_claude_session_detected_with_thread() {
     let output = crate::common::e2e_aiki_agent(repo)
         .current_dir(repo)
         .env("AIKI_THREAD", "test-thread-claude-123")
+        // No --agent on purpose: the single-agent container has only claude, so
+        // `resolve_agent_type` falls back to the sole installed agent. (The codex
+        // sibling passes --agent to cover the explicit-choice path instead.)
         .args(["run", &task_id])
         .timeout(Duration::from_secs(180))
         .output()
@@ -183,6 +186,7 @@ fn e2e_claude_unmatched_thread_does_not_claim_wrong_session() {
         eprintln!("Skipping: claude binary not available");
         return;
     }
+    // No --agent: resolves via the sole-installed-agent default in the container.
     run_unmatched_thread_test(&[]);
 }
 

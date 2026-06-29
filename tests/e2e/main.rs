@@ -18,6 +18,7 @@
 //! `Command::cargo_bin("aiki")` directly here; it would resolve the real
 //! `~/.aiki` and reintroduce that flake.
 
+mod multi_agent;
 mod provenance;
 mod session_thread;
 mod task_lifecycle;
@@ -139,6 +140,49 @@ pub fn aiki_run(
         ),
         Err(e) => (false, String::new(), format!("aiki run failed: {e}")),
     }
+}
+
+/// A running stand-in for the systemd-socket-activated OTel receiver that codex
+/// provenance depends on. Codex (unlike Claude) has no inline change hook: it
+/// exports `apply_patch` results as OTLP logs to 127.0.0.1:19876, and aiki turns
+/// those into `change.completed` (provenance) inside `aiki hooks otel`. In
+/// production a systemd `.socket` (Accept=yes) spawns one receiver per connection;
+/// a container has no systemd, so we run `socat` as the inetd. The receiver shares
+/// the test's AIKI_HOME so it resolves the same session→task map and stamps the
+/// right `task=`. Killed on drop so the listener never outlives the test.
+struct OtelReceiver(process::Child);
+
+impl Drop for OtelReceiver {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Start the codex OTel receiver via `socat`, sharing `repo`'s isolated AIKI_HOME,
+/// and block until it is accepting on :19876. Requires `socat` on PATH.
+fn start_codex_otel_receiver(repo: &Path) -> OtelReceiver {
+    let aiki_bin = env!("CARGO_BIN_EXE_aiki");
+    let aiki_home = common::e2e_aiki_home(repo);
+    let child = process::Command::new("socat")
+        .arg("TCP-LISTEN:19876,reuseaddr,fork")
+        .arg(format!("EXEC:{aiki_bin} hooks otel --agent codex"))
+        .env("AIKI_HOME", &aiki_home)
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .spawn()
+        .expect("spawn socat OTel receiver (is socat installed?)");
+
+    // Wait until the listener is accepting (mirrors config::wait_for_otel_receiver).
+    let addr: std::net::SocketAddr = "127.0.0.1:19876".parse().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            return OtelReceiver(child);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("socat OTel receiver did not start listening on :19876");
 }
 
 /// Query jj for commits with a specific task ID in provenance metadata

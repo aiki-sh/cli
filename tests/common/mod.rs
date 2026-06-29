@@ -178,6 +178,14 @@ fn hermetic_env_vars() -> Vec<(&'static str, std::ffi::OsString)> {
 /// concurrent writes to one shared global conversation repo serialize behind
 /// a single write lock and were timing out session discovery.
 ///
+/// The isolated `AIKI_HOME` an e2e step uses for `repo` (the same value baked into
+/// [`e2e_aiki`] / [`e2e_aiki_agent`]). Exposed so a co-process — e.g. the codex
+/// OTel receiver — can share the test's home and resolve the same session→task map.
+#[must_use]
+pub fn e2e_aiki_home(repo: &Path) -> PathBuf {
+    e2e_home_dirs(repo).0
+}
+
 /// Returns `(aiki_home, home, xdg_config_home)`.
 fn e2e_home_dirs(repo: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let name = repo

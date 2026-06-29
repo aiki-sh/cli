@@ -201,9 +201,12 @@ fn e2e_subtasks_visible_in_ready_queue_when_parent_in_progress() {
 // Subtask completion + parent closure (agent-driven)
 // =============================================================================
 
-/// Shared logic: build a plan, then review the epic.
-/// `reviewer` is passed as `--agent` to `aiki review`.
-fn run_build_and_review(reviewer: &str) {
+/// Shared logic: build a plan with `coder`, then review the epic with `reviewer`.
+/// Single-agent callers pass the same value for both (so it runs in a one-agent
+/// container); the multi-agent rig passes different agents to exercise a genuine
+/// cross-agent handoff (one codes, another reviews). `pub(crate)` so the
+/// multi_agent module can reuse it.
+pub(crate) fn run_build_and_review(coder: &str, reviewer: &str) {
     let temp = tempdir().unwrap();
     let repo = temp.path();
     init_aiki_repo(repo);
@@ -226,10 +229,13 @@ fn run_build_and_review(reviewer: &str) {
     )
     .unwrap();
 
-    // Build the plan — creates an epic with subtasks and implements them
+    // Build the plan — creates an epic with subtasks and implements them, using
+    // `coder` as the build agent. When coder == reviewer this is single-agent and
+    // runs in a one-agent container; when they differ (multi-agent rig) one agent
+    // codes and another reviews.
     let build_output = crate::common::e2e_aiki_agent(repo)
         .current_dir(repo)
-        .args(["build", "ops/now/e2e-greeting.md"])
+        .args(["build", "ops/now/e2e-greeting.md", "--agent", coder])
         .timeout(Duration::from_secs(600))
         .output()
         .expect("Failed to run aiki build");
@@ -318,7 +324,7 @@ fn e2e_codex_review_follows_subtask_workflow() {
         eprintln!("Skipping: codex binary not available");
         return;
     }
-    run_build_and_review("codex");
+    run_build_and_review("codex", "codex");
 }
 
 #[test]
@@ -332,7 +338,7 @@ fn e2e_claude_review_follows_subtask_workflow() {
         eprintln!("Skipping: claude binary not available");
         return;
     }
-    run_build_and_review("claude-code");
+    run_build_and_review("claude-code", "claude-code");
 }
 
 // =============================================================================
@@ -391,6 +397,7 @@ fn e2e_claude_background_session_ends_when_task_closes() {
         eprintln!("Skipping: claude binary not available");
         return;
     }
+    // No --agent: resolves via the sole-installed-agent default in the container.
     run_session_ends_on_close(&[]);
 }
 

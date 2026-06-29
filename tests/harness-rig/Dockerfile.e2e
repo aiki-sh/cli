@@ -10,8 +10,12 @@
 FROM rust:1-bookworm
 
 # Build + runtime deps. jj-lib/git2 need ssl+zlib+cmake; harness CLIs need node.
+# socat is the inetd stand-in for codex provenance: codex exports apply_patch OTLP
+# logs to 127.0.0.1:19876, which in production a systemd socket activates into
+# `aiki hooks otel`. A container has no systemd, so the codex e2e test runs
+# `socat TCP-LISTEN:19876,fork EXEC:"aiki hooks otel --agent codex"` instead.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git jq curl ca-certificates pkg-config libssl-dev zlib1g-dev cmake build-essential \
+      git jq curl ca-certificates pkg-config libssl-dev zlib1g-dev cmake build-essential socat \
  && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*

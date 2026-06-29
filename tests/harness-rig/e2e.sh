@@ -15,26 +15,41 @@ RIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$RIG_DIR/../../.." && pwd)"
 PROFILE="$RIG_DIR/harnesses/$HARNESS.sh"
 RUNTIME="${RUNTIME:-container}"
-TESTFILTER="${TESTFILTER:-e2e_${HARNESS}_provenance}"
+# Default filter: per-harness provenance, or the cross-agent suite for `multi`.
+if [ "$HARNESS" = "multi" ]; then
+  TESTFILTER="${TESTFILTER:-e2e_multi}"
+else
+  TESTFILTER="${TESTFILTER:-e2e_${HARNESS}_provenance}"
+fi
 
 [ -f "$PROFILE" ] || { echo "no profile: $PROFILE"; exit 1; }
 command -v "$RUNTIME" >/dev/null 2>&1 || { echo "'$RUNTIME' not found (install Apple container + 'container system start', or RUNTIME=podman)."; exit 1; }
 # shellcheck disable=SC1090
 source "$PROFILE"
 
-# Auth: prefer an API key env var, else mount the existing credential file.
-case "$HARNESS" in
-  claude) KEYVAR=ANTHROPIC_API_KEY ;;
-  codex)  KEYVAR=OPENAI_API_KEY ;;
-  *)      KEYVAR="" ;;
-esac
+# Auth. The multi rig needs BOTH agents' creds (no single API-key path); each
+# single-agent rig prefers an API key env var, else mounts its credential file.
 AUTH_ARGS=()
-if [ -n "${KEYVAR:-}" ] && [ -n "${!KEYVAR:-}" ]; then
-  AUTH_ARGS=(-e "$KEYVAR=${!KEYVAR}"); echo "auth: $KEYVAR (env var)"
+if [ "$HARNESS" = "multi" ]; then
+  while IFS= read -r cred; do
+    [ -n "$cred" ] || continue
+    host="${cred%%:*}"
+    [ -f "$host" ] || { echo "multi: missing cred $host; aborting"; exit 1; }
+    AUTH_ARGS+=(-v "$cred"); echo "auth: mounting $host (read-only)"
+  done < <(harness_cred_mounts)
 else
-  CRED="$(harness_cred_mount)"; HOST_FILE="${CRED%%:*}"
-  [ -f "$HOST_FILE" ] || { echo "no creds at $HOST_FILE and $KEYVAR unset; aborting"; exit 1; }
-  AUTH_ARGS=(-v "$CRED"); echo "auth: mounting $HOST_FILE (read-only)"
+  case "$HARNESS" in
+    claude) KEYVAR=ANTHROPIC_API_KEY ;;
+    codex)  KEYVAR=OPENAI_API_KEY ;;
+    *)      KEYVAR="" ;;
+  esac
+  if [ -n "${KEYVAR:-}" ] && [ -n "${!KEYVAR:-}" ]; then
+    AUTH_ARGS=(-e "$KEYVAR=${!KEYVAR}"); echo "auth: $KEYVAR (env var)"
+  else
+    CRED="$(harness_cred_mount)"; HOST_FILE="${CRED%%:*}"
+    [ -f "$HOST_FILE" ] || { echo "no creds at $HOST_FILE and $KEYVAR unset; aborting"; exit 1; }
+    AUTH_ARGS=(-v "$CRED"); echo "auth: mounting $HOST_FILE (read-only)"
+  fi
 fi
 
 # Stage a clean copy of cli/ to build from, because Apple `container`:
