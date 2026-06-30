@@ -6,6 +6,12 @@ use crate::agents::AgentType;
 use crate::events::result::{Decision, HookResult};
 use anyhow::Result;
 
+// The harness registry's data model is populated by `inventory` submissions and
+// read incrementally as each harness gets wired into production paths; several
+// fields/variants/methods below are currently exercised only by the registry
+// tests. They are kept (not deleted) because they define the full schema each
+// harness declares.
+#[allow(dead_code)]
 pub struct HarnessDefinition {
     /// Install metadata shown by `aiki doctor` and friends. Lives on the
     /// harness itself (not the runtime config) so harnesses without a runtime
@@ -18,11 +24,13 @@ pub struct HarnessDefinition {
     pub runtime: Option<RuntimeConfig>,
 }
 
+#[allow(dead_code)]
 pub struct Install {
     /// Human-readable install instruction (rendered to the user as-is).
     pub hint: &'static str,
 }
 
+#[allow(dead_code)]
 pub struct Identity {
     pub id: &'static str,
     pub aliases: &'static [&'static str],
@@ -32,12 +40,14 @@ pub struct Identity {
     pub custom_metadata_name: Option<&'static str>,
 }
 
+#[allow(dead_code)]
 pub struct HooksConfig {
     pub kind: HooksKind,
     pub supports_blocking: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub enum HooksKind {
     Sdk,
     Vendor,
@@ -53,6 +63,7 @@ impl HarnessDefinition {
         runtime.is_available_by_default()
     }
 
+    #[allow(dead_code)] // Exercised by registry tests; production metadata path not yet routed here.
     pub fn metadata_name(&self) -> &'static str {
         self.identity.custom_metadata_name.unwrap_or(self.identity.id)
     }
@@ -74,6 +85,7 @@ impl HarnessDefinition {
     /// block, the decision is downgraded to `Allow` and a stderr warning is
     /// emitted. The boolean return reports whether a downgrade happened so
     /// callers with their own warning channel (e.g. SDK output) can record it.
+    #[allow(dead_code)] // Hook-protocol clamp for non-blocking harnesses; not yet routed in production.
     pub fn enforce_blocking_support(&self, result: HookResult) -> (HookResult, bool) {
         if result.decision == Decision::Block && !self.hooks.supports_blocking {
             eprintln!(

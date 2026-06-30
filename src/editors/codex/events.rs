@@ -153,15 +153,10 @@ struct StopPayload {
 // Event Building
 // ============================================================================
 
-/// Build AikiEvent from Codex event read from stdin
+/// Codex's primary event plus any supplemental events to dispatch first.
 pub struct BuiltCodexEvents {
     pub supplemental_events: Vec<AikiEvent>,
     pub primary_event: AikiEvent,
-}
-
-pub fn build_aiki_event_from_stdin() -> Result<BuiltCodexEvents> {
-    let event: CodexEvent = super::super::read_stdin_json()?;
-    build_aiki_event_from_parsed(event)
 }
 
 /// Build Codex events from a pre-read JSON payload buffer (the stdin-once path).

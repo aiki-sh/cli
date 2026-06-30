@@ -44,6 +44,7 @@ pub fn detect_parent_harness() -> Option<crate::agents::AgentType> {
 /// them as agents anyway.
 ///
 /// Returns `None` if no known harness is detected (likely human terminal).
+#[allow(dead_code)] // Process-tree detection; exercised by tests, not yet wired into the CLI gate.
 pub fn detect_harness_from_process_tree() -> Option<&'static HarnessDefinition> {
     let mut system = System::new();
     // Refresh all processes to populate the process tree
@@ -87,6 +88,7 @@ pub fn detect_harness_from_process_tree() -> Option<&'static HarnessDefinition> 
 ///
 /// Iterates all CLI harnesses and returns the first whose binary appears as a
 /// case-insensitive substring in `name` or `exe_path`.
+#[allow(dead_code)] // Helper for detect_harness_from_process_tree (itself not yet wired); used by tests.
 fn match_harness(name: &str, exe_path: &str) -> Option<&'static HarnessDefinition> {
     let name_lower = name.to_lowercase();
     let exe_lower = exe_path.to_lowercase();

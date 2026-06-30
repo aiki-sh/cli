@@ -160,17 +160,7 @@ struct PreCompactPayload {
 // Event Building
 // ============================================================================
 
-/// Build AikiEvent from Claude Code event read from stdin
-pub fn build_aiki_event_from_stdin() -> Result<AikiEvent> {
-    // Parse event - serde discriminates by hook_event_name
-    let event: ClaudeEvent = super::super::read_stdin_json()?;
-    Ok(claude_event_to_aiki(event))
-}
-
 /// Build AikiEvent from a pre-read JSON payload buffer.
-///
-/// Used by the sync fallback path when stdin was already consumed
-/// (e.g. async SessionEnd spawn failed).
 pub fn build_aiki_event_from_json(payload: &[u8]) -> Result<AikiEvent> {
     let event: ClaudeEvent =
         serde_json::from_slice(payload).map_err(|e| anyhow::anyhow!(e))?;

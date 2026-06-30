@@ -222,6 +222,7 @@ pub fn resolve_remote_head(plugin: &PluginRef) -> Result<String> {
 /// Pull latest changes for an installed plugin.
 ///
 /// Returns an error if the plugin is not installed.
+#[allow(dead_code)] // Plugin-management primitive (sibling of clone/remove); tested, not yet wired to a command.
 pub fn pull_plugin(plugin: &PluginRef, plugins_base: &Path) -> Result<()> {
     let install_dir = plugin.install_dir(plugins_base);
 

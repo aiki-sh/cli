@@ -322,6 +322,7 @@ impl TaskEvent {
     }
 
     /// Variant name for deduplication (e.g., "Created", "Started").
+    #[allow(dead_code)] // Helper for dedup_key (cross-workspace dedup not yet wired into the drain loop).
     fn variant_name(&self) -> &'static str {
         match self {
             TaskEvent::Created { .. } => "Created",
@@ -341,6 +342,7 @@ impl TaskEvent {
     }
 
     /// Primary task ID for this event (first task_id from single or batch events).
+    #[allow(dead_code)] // Helper for dedup_key (cross-workspace dedup not yet wired into the drain loop).
     fn primary_task_id(&self) -> &str {
         match self {
             TaskEvent::Created { task_id, .. }
@@ -365,6 +367,7 @@ impl TaskEvent {
     ///
     /// The same logical event read from different JJ workspaces produces the
     /// same key, enabling cross-workspace dedup in the drain loop.
+    #[allow(dead_code)] // Cross-workspace dedup key; not yet consumed by the drain loop.
     pub fn dedup_key(&self) -> (String, &'static str, DateTime<Utc>) {
         (
             self.primary_task_id().to_string(),

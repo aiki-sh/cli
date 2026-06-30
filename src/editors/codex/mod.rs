@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::events::result::HookResult;
 use crate::editors::HookCommandOutput;
 
-use events::{build_aiki_event_from_json, build_aiki_event_from_stdin, BuiltCodexEvents};
+use events::{build_aiki_event_from_json, BuiltCodexEvents};
 use output::build_command_output;
 
 pub use output::build_not_active_output as not_active_output;
@@ -25,21 +25,11 @@ fn normalize_event(codex_event_name: &str) -> &str {
     }
 }
 
-/// Handle a Codex native hook event (stdin-based)
-///
-/// Entry point for `aiki hooks stdin --agent codex --event <event_name>`.
-/// Reads structured JSON from stdin, builds an AikiEvent, dispatches it,
-/// and formats the response for Codex's hook protocol.
+/// Handle a Codex event from a pre-read payload buffer (the stdin-once path).
 ///
 /// For `source: "clear"` on SessionStart, Codex only fires SessionStart
 /// (no preceding SessionEnd), so re-injection is handled directly by the
 /// SessionCleared event handler.
-pub fn handle_stdin(codex_event_name: &str) -> Result<()> {
-    let built_events = build_aiki_event_from_stdin()?;
-    dispatch_and_output(codex_event_name, built_events)
-}
-
-/// Handle a Codex event from a pre-read payload buffer (the stdin-once path).
 pub fn handle_with_payload(codex_event_name: &str, payload: &[u8]) -> Result<()> {
     let built_events = build_aiki_event_from_json(payload)?;
     dispatch_and_output(codex_event_name, built_events)

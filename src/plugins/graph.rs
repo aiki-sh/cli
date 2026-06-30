@@ -72,6 +72,7 @@ impl PluginGraph {
     }
 
     /// All installed plugins in the graph.
+    #[allow(dead_code)] // Graph query API; covered by tests, consumed by doctor/plugin commands incrementally.
     pub fn all_plugins(&self) -> Vec<PluginRef> {
         // Only return plugins that were actually installed (present in deps keys
         // and not in missing).
@@ -99,6 +100,7 @@ impl PluginGraph {
     }
 
     /// Transitive dependents via BFS on reverse edges.
+    #[allow(dead_code)] // Graph query API; covered by tests, consumed by doctor/plugin commands incrementally.
     pub fn transitive_dependents(&self, plugin: &PluginRef) -> Vec<PluginRef> {
         bfs(&self.reverse_deps, plugin)
     }
@@ -112,6 +114,7 @@ impl PluginGraph {
     }
 
     /// Transitive dependencies via BFS on forward edges.
+    #[allow(dead_code)] // Graph query API; covered by tests, consumed by doctor/plugin commands incrementally.
     pub fn transitive_dependencies(&self, plugin: &PluginRef) -> Vec<PluginRef> {
         bfs(&self.deps, plugin)
     }
@@ -154,6 +157,7 @@ impl PluginGraph {
     }
 
     /// Installed plugins that have no dependents and are not in the provided hooks.yml refs.
+    #[allow(dead_code)] // Graph query API; covered by tests, consumed by doctor/plugin commands incrementally.
     pub fn orphaned(&self, hooks_yml_refs: &HashSet<PluginRef>) -> Vec<PluginRef> {
         self.all_plugins()
             .into_iter()
@@ -170,6 +174,7 @@ impl PluginGraph {
 
 /// BFS traversal from `start` over the given adjacency map, returning all
 /// reachable nodes (excluding `start` itself).
+#[allow(dead_code)] // Helper for the transitive_* query API (not yet wired into production).
 fn bfs(
     adj: &HashMap<PluginRef, HashSet<PluginRef>>,
     start: &PluginRef,

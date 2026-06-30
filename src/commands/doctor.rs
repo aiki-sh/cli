@@ -959,7 +959,7 @@ fn check_templates(project_root: &std::path::Path, fix: bool) -> usize {
 /// Check plugin dependency graph health: missing deps, cycles, orphans.
 ///
 /// Returns the number of issues found.
-fn check_plugin_graph(project_root: &std::path::Path) -> usize {
+fn check_plugin_graph(_project_root: &std::path::Path) -> usize {
     let plugins_base = match crate::plugins::plugins_base_dir() {
         Ok(p) => p,
         Err(_) => return 0,

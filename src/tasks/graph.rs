@@ -936,6 +936,8 @@ pub fn find_link_kind(name: &str) -> Option<&'static LinkKind> {
 /// A change in task status between two graph snapshots.
 pub struct StatusChange<'a> {
     pub task: &'a Task,
+    /// Populated by `compute_delta`; not yet read by any delta consumer.
+    #[allow(dead_code)]
     pub prev_status: TaskStatus,
     pub next_status: TaskStatus,
 }
@@ -945,6 +947,8 @@ pub struct StatusChange<'a> {
 /// Produced once per debounce window by the drain loop to determine what
 /// changed between the previous and current materialized graph.
 pub struct GraphDelta<'a> {
+    /// Populated by `compute_delta`; not yet read by any delta consumer.
+    #[allow(dead_code)]
     pub prev: &'a TaskGraph,
     pub next: &'a TaskGraph,
     /// Tasks present in `next` but not in `prev`.

@@ -27,6 +27,7 @@ pub struct BackgroundHandle {
     #[allow(dead_code)]
     pub session_id: Option<String>,
     /// Agent type that was spawned
+    #[allow(dead_code)]
     pub agent_type: AgentType,
     /// OS process id of the detached agent, captured at spawn. Used to reap an
     /// orphan whose session never registers (the recorded-session-file kill path

@@ -7,7 +7,6 @@ pub mod definition;
 mod detect;
 pub mod runtime;
 
-pub use detect::detect_harness_from_process_tree;
 pub use detect::detect_parent_harness;
 
 use crate::agents::AgentType;
@@ -17,6 +16,7 @@ pub fn iter() -> impl Iterator<Item = &'static HarnessDefinition> {
     inventory::iter::<HarnessDefinition>.into_iter()
 }
 
+#[allow(dead_code)] // Registry lookup; exercised by tests, wired into production paths incrementally.
 pub fn lookup(id_or_alias: &str) -> Option<&'static HarnessDefinition> {
     let needle = id_or_alias.to_lowercase();
     iter().find(|d| {

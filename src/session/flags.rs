@@ -25,6 +25,7 @@ pub trait AgentFlags {
     }
 
     /// True when at least one agent flag was provided.
+    #[allow(dead_code)] // Convenience trait helper exercised by tests; no production caller yet.
     fn is_set(&self) -> bool {
         self.agent_type().is_some()
     }
