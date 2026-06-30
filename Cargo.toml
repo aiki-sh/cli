@@ -1,6 +1,6 @@
 [package]
 name = "aiki"
-version = "0.1.0"
+version = "0.2.8"
 edition = "2021"
 license = "MPL-2.0"
 description = "AI-native task tracking and agent orchestration CLI"
