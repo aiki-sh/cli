@@ -1215,7 +1215,7 @@ mod tests {
         (repo_dir, ws_dir)
     }
 
-    /// Regression test for fix-absorbtion-on-multiple-runs.md:
+    /// Regression test for isolation-13-fix-absorbtion-on-multiple-runs.md:
     /// Two sequential absorptions into default@ must both survive on disk.
     #[test]
     fn test_sequential_absorptions_preserve_earlier_changes() {
