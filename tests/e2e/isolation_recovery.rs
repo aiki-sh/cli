@@ -318,36 +318,136 @@ fn run_stale_worker_reaped(agent_args: &[&str]) {
     let repo = temp.path();
     init_aiki_repo(repo);
 
-    let task_id = create_task(repo, "e2e stale: hang in a long sleep");
+    let task_id = create_task(repo, "e2e stale: long multi-step work");
     set_task_instructions(
         repo,
         &task_id,
-        "Run the shell command `sleep 600` in the FOREGROUND and wait for it \
-         to finish — do NOT run it in the background. Do not do anything else \
-         first. After it finishes, close this task.",
+        "Run the shell command `sleep 5`. Repeat it 60 times, one command at a \
+         time, as separate shell invocations. Then close this task.",
     );
 
-    // Blocking run with the watchdog threshold shortened to 25s. The agent
-    // goes silent inside the sleep (no transcript entries while a tool
-    // runs), so the watchdog must kill it and stop the task — without the
-    // guard this command would block for the whole 600s sleep.
-    let mut args = vec!["run", &task_id];
+    // Blocking run with the watchdog threshold shortened to 20s, spawned as
+    // a child so the test can freeze the agent mid-run. The agent is
+    // SIGSTOPped (deterministic — an instruction-driven hang depends on
+    // agent compliance and gets refused by tool guardrails), after which the
+    // transcript goes silent and the watchdog must kill it and stop the
+    // task; without the guard this run would block until the test deadline.
+    let aiki_home = crate::common::e2e_aiki_home(repo);
+    let mut args: Vec<&str> = vec!["run", &task_id];
     args.extend_from_slice(agent_args);
-    let output = crate::common::e2e_aiki_agent(repo)
+    let mut child = process::Command::new(env!("CARGO_BIN_EXE_aiki"))
         .current_dir(repo)
         .args(&args)
-        .env("AIKI_STALE_WORKER_TIMEOUT_SECS", "25")
-        .timeout(Duration::from_secs(300))
-        .output()
-        .expect("aiki run (blocking)");
+        .env("AIKI_HOME", &aiki_home)
+        .env("JJ_USER", "Aiki Test")
+        .env("JJ_EMAIL", "test@example.com")
+        .env("AIKI_STALE_WORKER_TIMEOUT_SECS", "20")
+        .stdout(process::Stdio::piped())
+        .stderr(process::Stdio::piped())
+        .spawn()
+        .expect("spawn blocking aiki run");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!("stale run stdout: {stdout}");
+    // Discover the session (hermetic home → the only session file is ours).
+    let sessions_dir = aiki_home.join("sessions");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let (session_id, agent_pid) = loop {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("agent session never registered");
+        }
+        let found = std::fs::read_dir(&sessions_dir)
+            .ok()
+            .and_then(|entries| {
+                entries.flatten().find_map(|e| {
+                    let path = e.path();
+                    if !path.is_file() {
+                        return None;
+                    }
+                    let sid = path.file_name()?.to_str()?.to_string();
+                    let pid = std::fs::read_to_string(&path)
+                        .ok()?
+                        .lines()
+                        .find_map(|l| l.trim().strip_prefix("parent_pid="))
+                        .and_then(|v| v.parse::<u32>().ok())?;
+                    Some((sid, pid))
+                })
+            });
+        if let Some(pair) = found {
+            break pair;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    eprintln!("stale test: session {session_id} pid {agent_pid}");
+
+    // Wait until the transcript RESOLVES AND HAS CONTENT before freezing:
+    // the watchdog deliberately skips a worker whose transcript is missing
+    // or empty (never kill one that is still initializing), so freezing the
+    // agent before its first transcript entry would make the guard skip
+    // forever. `aiki session transcript -o path` uses the same resolution
+    // path as the watchdog.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = process::Command::new("kill")
+                .args(["-9", &agent_pid.to_string()])
+                .status();
+            panic!("transcript for {session_id} never became resolvable/non-empty");
+        }
+        let out = crate::common::e2e_aiki(repo)
+            .current_dir(repo)
+            .args(["session", "transcript", &session_id, "-o", "path"])
+            .output()
+            .expect("aiki session transcript");
+        if out.status.success() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !path.is_empty()
+                && std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false)
+            {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    // A beat more so the last entry's timestamp is set, then freeze.
+    std::thread::sleep(Duration::from_secs(2));
+    let stopped = process::Command::new("kill")
+        .args(["-STOP", &agent_pid.to_string()])
+        .status()
+        .expect("run kill -STOP");
+    assert!(stopped.success(), "SIGSTOP {agent_pid} failed");
+
+    // The watchdog polls every 2s with a 20s idle threshold; give it ample
+    // room, then declare failure.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let status = loop {
+        match child.try_wait().expect("try_wait aiki run") {
+            Some(status) => break status,
+            None if Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = process::Command::new("kill")
+                    .args(["-9", &agent_pid.to_string()])
+                    .status();
+                panic!("watchdog never reaped the frozen worker (aiki run still blocked)");
+            }
+            None => std::thread::sleep(Duration::from_secs(1)),
+        }
+    };
+
+    // Cleanup safety net (the watchdog should already have SIGKILLed it).
+    let _ = process::Command::new("kill")
+        .args(["-9", &agent_pid.to_string()])
+        .status();
+
+    let mut stderr = String::new();
+    use std::io::Read;
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
     eprintln!("stale run stderr: {stderr}");
 
     assert!(
-        !output.status.success(),
+        !status.success(),
         "aiki run should fail when the worker stalls (watchdog), got success"
     );
     assert!(

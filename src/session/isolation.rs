@@ -562,12 +562,18 @@ pub fn absorb_workspace(
     // If this set is empty, every workspace commit is already an ancestor of
     // @- — the workspace was already absorbed (e.g. turn.completed followed
     // by session.ended). Return Absorbed: it genuinely is.
+    // `::ws_head` (the chain's full ancestry), NOT the bare `ws_head`: the
+    // live flow's per-tool `jj new` leaves ws_head as an EMPTY commit above
+    // the content commits, so a bare-`ws_head` set would rebase only the
+    // empty head and strand the content beneath it as sibling branches
+    // (caught by e2e_*_concurrent_sessions_both_absorb; unit tests missed it
+    // because their chains are one commit deep).
     let roots_output = jj_cmd()
         .current_dir(&target_dir)
         .args([
             "log",
             "-r",
-            &format!("roots({} ~ ::@-)", ws_head),
+            &format!("roots(::{} ~ ::@-)", ws_head),
             "--no-graph",
             "-T",
             "change_id ++ \"\\n\"",
@@ -1165,7 +1171,7 @@ fn workspace_unabsorbed_commits(repo_root: &Path, ws_change_id: &str) -> Option<
         .args([
             "log",
             "-r",
-            &format!("roots({} ~ ::@-)", ws_change_id),
+            &format!("roots(::{} ~ ::@-)", ws_change_id),
             "--no-graph",
             "-T",
             "change_id",
@@ -1621,10 +1627,6 @@ pub fn recover_orphaned_workspaces(session_uuid: &str) -> Result<u32> {
 /// the whole sweep holds the absorption lock so it cannot delete a
 /// directory a concurrent absorb has selected as its target.
 pub fn cleanup_orphaned_workspaces(repo_root: &Path) -> Result<u32> {
-    // Serialize with concurrent absorptions (reentrant with the nested
-    // acquisitions inside cleanup_workspace_safely).
-    let _lock = acquire_named_lock(repo_root, "workspace-absorption")?;
-
     let output = jj_cmd()
         .current_dir(repo_root)
         .args(["workspace", "list", "--ignore-working-copy"])
@@ -1636,21 +1638,42 @@ pub fn cleanup_orphaned_workspaces(repo_root: &Path) -> Result<u32> {
     }
 
     let list_str = String::from_utf8_lossy(&output.stdout);
+
+    // Cheap read-only pass first: this sweep runs on every turn, so it must
+    // not take the absorption lock (or fork more jj processes) in the
+    // common nothing-to-reap case — hooks have hard timeouts and contended
+    // locks here slow every concurrent session's turn.
+    let dead: Vec<String> = list_str
+        .lines()
+        .filter_map(|line| {
+            let ws_name = line.split(':').next()?.trim();
+            let uuid = ws_name.strip_prefix("aiki-")?;
+            if crate::global::global_sessions_dir().join(uuid).exists() {
+                None // Session is still active
+            } else {
+                Some(ws_name.to_string())
+            }
+        })
+        .collect();
+
+    if dead.is_empty() {
+        return Ok(0);
+    }
+
+    // Serialize with concurrent absorptions (reentrant with the nested
+    // acquisitions inside cleanup_workspace_safely).
+    let _lock = acquire_named_lock(repo_root, "workspace-absorption")?;
+
     let mut cleaned = 0u32;
 
-    for line in list_str.lines() {
-        // Match lines like "aiki-<uuid>: ..."
-        let ws_name = match line.split(':').next() {
-            Some(name) if name.starts_with("aiki-") => name.trim(),
-            _ => continue,
-        };
-
-        // Extract UUID from workspace name "aiki-<uuid>"
+    for ws_name in &dead {
+        let ws_name = ws_name.as_str();
         let uuid = &ws_name["aiki-".len()..];
 
-        // Check if this session is still active (has a session file)
+        // Re-check liveness under the lock (the session may have started
+        // between the read-only pass and here).
         if crate::global::global_sessions_dir().join(uuid).exists() {
-            continue; // Session is still active, skip
+            continue;
         }
 
         // Session is dead — reclaim the workspace, preserving content first
@@ -2703,6 +2726,54 @@ mod tests {
         match original_home {
             Some(v) => std::env::set_var("AIKI_HOME", v),
             None => std::env::remove_var("AIKI_HOME"),
+        }
+    }
+
+    /// Regression: the live flow's per-tool `jj new` leaves ws@ as an EMPTY
+    /// commit above the content commits. Absorption must move the WHOLE
+    /// chain (`roots(::ws_head ~ ::@-)`), not just the empty head — a bare
+    /// `ws_head` revset strands the content as sibling branches (the
+    /// concurrent-sessions incident, 2026-07-09).
+    #[test]
+    fn test_absorb_moves_full_chain_not_just_empty_head() {
+        use std::process::Command;
+
+        let _lock = env_lock();
+        let (repo_dir, ws_dir) = setup_jj_repo();
+        let original = std::env::var("AIKI_WORKSPACES_DIR").ok();
+        std::env::set_var("AIKI_WORKSPACES_DIR", ws_dir.path());
+
+        Command::new("jj")
+            .args(["new", "--ignore-working-copy"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+
+        let ws = create_isolated_workspace(repo_dir.path(), "session-chain").unwrap();
+        // Content commit…
+        jj_write_and_describe(&ws.path, "chained.txt", "deep content", "[aiki] chained edit");
+        // …then the per-tool `jj new` moves ws@ to an empty child above it.
+        Command::new("jj")
+            .args(["new"])
+            .current_dir(&ws.path)
+            .output()
+            .unwrap();
+
+        let result = absorb_workspace(repo_dir.path(), &ws, None);
+        assert!(matches!(result, Ok(AbsorbResult::Absorbed)), "{:?}", result);
+
+        assert!(
+            repo_dir.path().join("chained.txt").exists(),
+            "content commit below the empty ws head must be absorbed into main"
+        );
+        assert_eq!(
+            fs::read_to_string(repo_dir.path().join("chained.txt")).unwrap(),
+            "deep content"
+        );
+
+        match original {
+            Some(v) => std::env::set_var("AIKI_WORKSPACES_DIR", v),
+            None => std::env::remove_var("AIKI_WORKSPACES_DIR"),
         }
     }
 

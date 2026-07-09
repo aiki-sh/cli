@@ -922,6 +922,27 @@ fn bounded_sleep_ms(delay_ms: u64, elapsed: std::time::Duration, timeout: Option
     }
 }
 
+/// True when the session's file records a PID that is no longer alive.
+/// False when the file is missing (session ended cleanly and was removed,
+/// or never registered — both handled elsewhere) or has no PID.
+fn session_pid_is_dead(session_id: &str) -> bool {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let path = global::global_sessions_dir().join(session_id);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Some(pid) = content
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("parent_pid="))
+        .and_then(|v| v.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+    system.process(Pid::from_u32(pid)).is_none()
+}
+
 fn run_wait(
     ids: Vec<String>,
     any: bool,
@@ -952,6 +973,27 @@ fn run_wait(
 
     // Poll until condition is met
     loop {
+        let events = history::storage::read_events(&aiki_dir)?;
+
+        // Dead-worker guard: a session whose recorded PID is gone but whose
+        // session_end was never recorded (e.g. the agent's SessionEnd hook
+        // was killed or the process crashed) would otherwise make this wait
+        // poll forever — the pruner only runs at session STARTS, and a
+        // blocked orchestrator never starts one. Reap such sessions here:
+        // recover their workspaces and dispatch the synthetic session.ended
+        // this loop is waiting for.
+        for id in &ids {
+            if !has_session_ended(&events, id) && session_pid_is_dead(id) {
+                eprintln!(
+                    "[aiki] Session {} process is dead without a recorded end — reaping",
+                    &id[..id.len().min(8)]
+                );
+                crate::session::end_dead_session(
+                    id,
+                    crate::session::SessionCleanupReason::PidDead,
+                );
+            }
+        }
         let events = history::storage::read_events(&aiki_dir)?;
 
         let done = if any {

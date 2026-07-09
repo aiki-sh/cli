@@ -406,9 +406,16 @@ session.ended:
     # their description), and never merges, the root, or @ itself (abandoning
     # an empty @ just makes jj recreate one). Held under the absorption mutex
     # so the rewrite cannot interleave with a concurrent absorb's rebases.
+    #
+    # ~working_copies() is LOAD-BEARING: after an absorb, another live
+    # session's workspace @ is an empty description-less ancestor of @-.
+    # Abandoning it makes jj regenerate that workspace's working copy
+    # DETACHED from its content commits, and its next absorb then chains the
+    # regenerated empty while the real work strands as sibling commits
+    # (caught by e2e_*_concurrent_sessions_both_absorb).
     - mutex:
         workspace-absorption:
-            - jj: abandon 'ancestors(@-, 100) & empty() & ~root() & ~merges() & description(exact:"")' --ignore-working-copy
+            - jj: abandon 'ancestors(@-, 100) & empty() & ~root() & ~merges() & description(exact:"") & ~working_copies()' --ignore-working-copy
               on_failure: continue
 
 # ==============================================================================
