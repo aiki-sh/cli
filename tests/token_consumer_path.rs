@@ -283,6 +283,18 @@ fn claude_stop(session_id: &str, cwd: &str, transcript_path: &str) -> String {
     .to_string()
 }
 
+/// A `UserPromptSubmit` hook payload — starts a real turn (number > 0) so the
+/// re-dispatch idempotency guard (keyed on turn > 0) is exercised.
+fn claude_prompt(session_id: &str, cwd: &str, prompt: &str) -> String {
+    serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": session_id,
+        "cwd": cwd,
+        "prompt": prompt,
+    })
+    .to_string()
+}
+
 /// Read the denormalized total the display surfaces read off a task.
 fn displayed_total(task: &Task) -> Option<u64> {
     task.data
@@ -454,5 +466,72 @@ fn closed_before_stop_still_attributes_turn_tokens() {
         direct.get(&task_id).copied(),
         Some(EXPECTED_TOTAL),
         "the final turn's Response is tagged with the closed task id",
+    );
+}
+
+/// Regression (review finding: D3 double-record on the primary rollup path):
+/// a re-dispatched `turn.completed` for the same (session, turn) must NOT
+/// compound the token total. The session aggregate already dedups, but the
+/// production display reads the incremental `task.data["tokens"]` rollup written
+/// per turn — which blindly added its delta on every dispatch. Firing the Stop
+/// hook twice for one turn used to double the displayed total.
+///
+/// This drives the real binary: establish a real turn (UserPromptSubmit → turn 1)
+/// so the guard (keyed on turn > 0) applies, then fire Stop TWICE against the same
+/// transcript and assert both the displayed rollup AND the deduped per-task total
+/// stay at the single-turn value.
+#[test]
+fn redispatched_stop_does_not_double_count_tokens() {
+    if !common::jj_available() {
+        eprintln!("skipping: jj not installed");
+        return;
+    }
+
+    let fx = TokenFixture::new();
+    let repo = fx.repo.to_string_lossy().to_string();
+    let session_id = "tok-redispatch-session";
+
+    // 1. Session + a real prompt so the turn number is > 0 (the guard's domain).
+    fx.fire("SessionStart", &claude_session_start(session_id, &repo));
+    fx.fire(
+        "UserPromptSubmit",
+        &claude_prompt(session_id, &repo, "wire the token display"),
+    );
+
+    // 2. Focused task for attribution.
+    let task_id = fx.start_task("Wire token display");
+
+    // 3. Scripted transcript to the path both Stop hooks will read.
+    let transcript = fx.scratch.join("transcript.jsonl");
+    let mut emit = Command::new(fake_agent_path("claude"));
+    scripted_transcript(&mut emit, CLAUDE_FIXTURE, &transcript);
+    assert!(
+        emit.status().expect("run scripted fake agent").success(),
+        "scripted fake agent emits the transcript",
+    );
+
+    // 4. Fire the SAME Stop hook twice — a re-dispatched turn.completed.
+    let stop = claude_stop(session_id, &repo, transcript.to_str().unwrap());
+    fx.fire("Stop", &stop);
+    fx.fire("Stop", &stop);
+
+    // 5. The displayed per-task total is the single-turn total, not double it.
+    let graph = fx.task_graph();
+    let task = graph.tasks.get(&task_id).expect("task exists");
+    assert_eq!(
+        displayed_total(task),
+        Some(EXPECTED_TOTAL),
+        "re-dispatched Stop must not double the displayed task.data['tokens'] rollup",
+    );
+
+    // 6. The authoritative deduped per-task total also stays single-turn: the
+    //    duplicate Response was not recorded, and direct_token_totals dedups by
+    //    (session, turn) as a backstop.
+    let history = aiki::history::storage::read_events(&fx.aiki_home).expect("read history");
+    let direct = token_rollup::direct_token_totals(&history);
+    assert_eq!(
+        direct.get(&task_id).copied(),
+        Some(EXPECTED_TOTAL),
+        "the deduped per-task total is counted once across the re-dispatch",
     );
 }

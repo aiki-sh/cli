@@ -48,24 +48,49 @@ pub const UNATTRIBUTED_BUCKET: &str = "__session_overhead__";
 /// denormalized `task.data["tokens"]` rollup written by [`record_turn_tokens`] is
 /// a forward-only incremental cache of [`subtree_total`] over this map.
 ///
+/// **Deduplicated by `(session_id, turn)`** so a turn whose `Response` was
+/// recorded more than once (e.g. a re-dispatched `turn.completed`) contributes
+/// exactly once — the last record wins, mirroring the session aggregate
+/// (`events::session_ended::sum_session_turn_tokens`). `turn == 0` is the
+/// "unknown turn" sentinel (recorded when prompt lookup fails); each such
+/// `Response` is a *distinct* turn that lost its number, so those are summed,
+/// not deduped.
+///
 /// Forward-looking: backs the optional read-through display and the
 /// consumer-path test; the production write path uses [`rollup_updates`].
 #[allow(dead_code)]
 #[must_use]
 pub fn direct_token_totals(events: &[ConversationEvent]) -> HashMap<String, u64> {
+    // Real turns (number > 0) dedup by (session, turn); the last record wins.
+    let mut by_turn: HashMap<(&str, u32), (&Option<String>, u64)> = HashMap::new();
+    // Sentinel (turn == 0) responses are distinct turns, so accumulate directly.
     let mut totals: HashMap<String, u64> = HashMap::new();
+
+    let bucket_key = |task_id: &Option<String>| {
+        task_id
+            .clone()
+            .unwrap_or_else(|| UNATTRIBUTED_BUCKET.to_string())
+    };
+
     for event in events {
         if let ConversationEvent::Response {
+            session_id,
+            turn,
             task_id,
             tokens: Some(t),
             ..
         } = event
         {
-            let key = task_id
-                .clone()
-                .unwrap_or_else(|| UNATTRIBUTED_BUCKET.to_string());
-            *totals.entry(key).or_insert(0) += t.total();
+            if *turn == 0 {
+                *totals.entry(bucket_key(task_id)).or_insert(0) += t.total();
+            } else {
+                by_turn.insert((session_id.as_str(), *turn), (task_id, t.total()));
+            }
         }
+    }
+
+    for (task_id, total) in by_turn.into_values() {
+        *totals.entry(bucket_key(task_id)).or_insert(0) += total;
     }
     totals
 }
@@ -160,11 +185,16 @@ mod tests {
     use crate::tasks::graph::materialize_graph;
     use crate::tasks::types::{TaskPriority, TaskStatus};
 
-    fn response_with_task(task_id: Option<&str>, total: u64) -> ConversationEvent {
+    fn response_full(
+        session_id: &str,
+        turn: u32,
+        task_id: Option<&str>,
+        total: u64,
+    ) -> ConversationEvent {
         ConversationEvent::Response {
-            session_id: "sess".to_string(),
+            session_id: session_id.to_string(),
             agent_type: crate::agents::AgentType::ClaudeCode,
-            turn: 1,
+            turn,
             files_written: vec![],
             content: None,
             // Put the whole figure in `output` so `total()` == `total`.
@@ -180,6 +210,12 @@ mod tests {
             repo_id: None,
             cwd: None,
         }
+    }
+
+    /// One response per distinct turn in session `sess` (the common case: each
+    /// turn is recorded once). Turn numbers are assigned from `turn` upward.
+    fn response_with_task(task_id: Option<&str>, total: u64) -> ConversationEvent {
+        response_full("sess", 1, task_id, total)
     }
 
     fn created(task_id: &str) -> TaskEvent {
@@ -210,17 +246,59 @@ mod tests {
 
     #[test]
     fn direct_totals_sum_per_task_and_bucket_unattributed() {
+        // Distinct turns (the normal case: one Response per turn) sum per task.
         let events = vec![
-            response_with_task(Some("leaf"), 100),
-            response_with_task(Some("leaf"), 50),
-            response_with_task(Some("other"), 7),
-            response_with_task(None, 9),
-            response_with_task(None, 1),
+            response_full("sess", 1, Some("leaf"), 100),
+            response_full("sess", 2, Some("leaf"), 50),
+            response_full("sess", 3, Some("other"), 7),
+            response_full("sess", 4, None, 9),
+            response_full("sess", 5, None, 1),
         ];
         let totals = direct_token_totals(&events);
         assert_eq!(totals.get("leaf"), Some(&150));
         assert_eq!(totals.get("other"), Some(&7));
         assert_eq!(totals.get(UNATTRIBUTED_BUCKET), Some(&10));
+    }
+
+    #[test]
+    fn direct_totals_dedup_redispatched_turn_keeps_last() {
+        // A turn whose Response was recorded twice (re-dispatched turn.completed)
+        // must count ONCE — the last record wins, not the sum. Two records for
+        // (sess, turn 1) collapse to 50, not 150; a genuinely distinct turn 2
+        // still adds.
+        let events = vec![
+            response_full("sess", 1, Some("leaf"), 100),
+            response_full("sess", 1, Some("leaf"), 50),
+            response_full("sess", 2, Some("leaf"), 30),
+        ];
+        let totals = direct_token_totals(&events);
+        assert_eq!(totals.get("leaf"), Some(&80)); // 50 (deduped) + 30
+    }
+
+    #[test]
+    fn direct_totals_dedup_is_session_scoped() {
+        // The same turn number in a different session is a different turn: both
+        // count. Only a duplicate within the same (session, turn) is deduped.
+        let events = vec![
+            response_full("s1", 1, Some("leaf"), 100),
+            response_full("s2", 1, Some("leaf"), 40),
+        ];
+        let totals = direct_token_totals(&events);
+        assert_eq!(totals.get("leaf"), Some(&140));
+    }
+
+    #[test]
+    fn direct_totals_sum_unknown_turn_sentinel_responses() {
+        // turn == 0 is the unknown-turn sentinel: each is a distinct turn that
+        // lost its number, so they are summed, never deduped.
+        let events = vec![
+            response_full("sess", 0, Some("leaf"), 9),
+            response_full("sess", 0, Some("leaf"), 1),
+            response_full("sess", 0, None, 5),
+        ];
+        let totals = direct_token_totals(&events);
+        assert_eq!(totals.get("leaf"), Some(&10));
+        assert_eq!(totals.get(UNATTRIBUTED_BUCKET), Some(&5));
     }
 
     #[test]

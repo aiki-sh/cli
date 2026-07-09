@@ -154,32 +154,58 @@ pub fn handle_turn_completed(mut payload: AikiTurnCompletedPayload) -> Result<Ho
         }
     }
 
-    if let Err(e) = history::record_response(
-        &global::global_aiki_dir(),
-        &payload.session,
-        &payload.response,
-        files_written,
-        payload.turn.number,
-        payload.timestamp,
-        repo_id.as_deref(),
-        Some(&cwd_str),
-        payload.tokens.clone(),
-        payload.model.clone(),
-        focused_task_id.clone(),
-    ) {
-        debug_log(|| format!("Failed to record response: {}", e));
-    }
+    // Idempotency guard: a re-dispatched `turn.completed` (same session + turn)
+    // must not double-count tokens. `record_response` appends a token-tagged
+    // `Response` event and `record_turn_tokens` compounds the denormalized
+    // `task.data["tokens"]` rollup; both assume this turn is recorded exactly
+    // once. If a response for this turn is already on record, skip both token
+    // side effects. Only real turns (number > 0) can be deduped this way:
+    // `turn == 0` is the "unknown turn" sentinel whose responses are legitimately
+    // distinct (they are summed, not deduped — matching `aggregate_session_tokens`
+    // and `token_rollup::direct_token_totals`). Degrades safely: on a query error
+    // we treat the turn as new and record it (the readers dedup as a backstop).
+    let already_recorded = payload.turn.number > 0
+        && history::latest_response_turn(&global::global_aiki_dir(), payload.session.uuid())
+            .unwrap_or(None)
+            .is_some_and(|latest| latest >= payload.turn.number);
 
-    // Bridge this turn's tokens onto the focused task's denormalized rollup
-    // (`task.data["tokens"]`) so the build TUI, run summary, and `aiki tldr`
-    // render a real total. Rolls up over the `subtask-of` tree; best-effort and
-    // never fatal. Turns with no focused task or no token data write nothing.
-    if let (Some(graph), Some(focused)) = (task_graph.as_ref(), focused_task_id.as_deref()) {
-        let delta = payload.tokens.as_ref().map(|t| t.total()).unwrap_or(0);
-        if let Err(e) =
-            crate::tasks::token_rollup::record_turn_tokens(&payload.cwd, graph, focused, delta)
-        {
-            debug_log(|| format!("Failed to bridge turn tokens onto task rollup: {}", e));
+    if already_recorded {
+        debug_log(|| {
+            format!(
+                "Skipping duplicate turn.completed for session {} turn {} (already recorded)",
+                payload.session.uuid(),
+                payload.turn.number
+            )
+        });
+    } else {
+        if let Err(e) = history::record_response(
+            &global::global_aiki_dir(),
+            &payload.session,
+            &payload.response,
+            files_written,
+            payload.turn.number,
+            payload.timestamp,
+            repo_id.as_deref(),
+            Some(&cwd_str),
+            payload.tokens.clone(),
+            payload.model.clone(),
+            focused_task_id.clone(),
+        ) {
+            debug_log(|| format!("Failed to record response: {}", e));
+        }
+
+        // Bridge this turn's tokens onto the focused task's denormalized rollup
+        // (`task.data["tokens"]`) so the build TUI, run summary, and `aiki tldr`
+        // render a real total. Rolls up over the `subtask-of` tree; best-effort
+        // and never fatal. Turns with no focused task or no token data write
+        // nothing.
+        if let (Some(graph), Some(focused)) = (task_graph.as_ref(), focused_task_id.as_deref()) {
+            let delta = payload.tokens.as_ref().map(|t| t.total()).unwrap_or(0);
+            if let Err(e) =
+                crate::tasks::token_rollup::record_turn_tokens(&payload.cwd, graph, focused, delta)
+            {
+                debug_log(|| format!("Failed to bridge turn tokens onto task rollup: {}", e));
+            }
         }
     }
 

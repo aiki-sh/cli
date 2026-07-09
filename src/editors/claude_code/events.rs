@@ -79,6 +79,12 @@ struct SessionStartPayload {
     /// Source of the session start (startup, resume, clear, compact)
     #[serde(default = "default_session_source")]
     source: String,
+    /// Path to the JSONL transcript file for this session. Recorded into
+    /// conversation history so the stale-worker watchdog (and `aiki session
+    /// transcript`) can resolve the transcript without the legacy
+    /// session-file external-id fallback.
+    #[serde(default)]
+    transcript_path: Option<String>,
 }
 
 fn default_session_source() -> String {
@@ -246,7 +252,7 @@ fn build_session_started_event(payload: SessionStartPayload) -> AikiEvent {
             session,
             cwd,
             timestamp,
-            transcript_path: None,
+            transcript_path: payload.transcript_path,
         }),
     }
 }
@@ -949,6 +955,7 @@ mod tests {
             session_id: "test-session-123".to_string(),
             cwd: "/tmp/test".to_string(),
             source: source.to_string(),
+            transcript_path: None,
         }
     }
 

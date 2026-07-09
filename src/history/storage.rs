@@ -156,6 +156,66 @@ pub fn get_current_turn_info(cwd: &Path, session_id: &str) -> Result<(u32, TurnS
     Ok((turn, source))
 }
 
+/// Return the turn number of the newest `response` event recorded for
+/// `session_id`, or `None` when the session has no recorded responses yet.
+///
+/// Responses are recorded in increasing turn order, so the newest response
+/// carries the highest turn seen. Used to detect a **re-dispatched
+/// `turn.completed`**: if a response for the current turn is already on record,
+/// re-recording its tokens would double-count them (both the incremental
+/// `task.data["tokens"]` rollup and the tagged-history per-task total). Mirrors
+/// [`get_current_turn_info`]'s targeted revset so it stays cheap (one
+/// `jj log --limit 1`), not a full history scan.
+pub fn latest_response_turn(cwd: &Path, session_id: &str) -> Result<Option<u32>> {
+    if !crate::jj::branch_exists(cwd, CONVERSATIONS_BRANCH)? {
+        return Ok(None);
+    }
+
+    // Query for the newest response event from this session (newest change first).
+    let output = jj_cmd()
+        .current_dir(cwd)
+        .args([
+            "log",
+            "-r",
+            &format!(
+                "children(ancestors({})) & description(substring:'{}') & description(substring:'event=response') & description(substring:'session={}')",
+                CONVERSATIONS_BRANCH, METADATA_START, session_id
+            ),
+            "--no-graph",
+            "-T",
+            "description ++ \"\\n---EVENT-SEPARATOR---\\n\"",
+            "--limit",
+            "1",
+            "--ignore-working-copy",
+        ])
+        .output()
+        .map_err(|e| {
+            AikiError::JjCommandFailed(format!("Failed to query response events: {}", e))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AikiError::JjCommandFailed(format!(
+            "Failed to query response events: {}",
+            stderr
+        )));
+    }
+
+    let description = String::from_utf8_lossy(&output.stdout);
+    if description.trim().is_empty() {
+        return Ok(None);
+    }
+
+    for line in description.lines() {
+        if let Some(value) = line.trim().strip_prefix("turn=") {
+            if let Ok(t) = value.parse::<u32>() {
+                return Ok(Some(t));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Check if there's a pending autoreply for a session
 ///
 /// Returns true if the latest event for this session is an Autoreply event
