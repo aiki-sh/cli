@@ -77,7 +77,15 @@ fn acquire_task_write_lock(
     cwd: &Path,
 ) -> Result<crate::session::isolation::NamedLockGuard> {
     let repo_root = crate::jj::get_repo_root(cwd)?;
-    acquire_named_lock(&repo_root, "task-event-write")
+    // Task-event writes mutate the shared jj op store (`jj new` + `jj
+    // bookmark set`), so they must serialize on the SAME lock as workspace
+    // snapshots/absorption — a private lock only orders task writes against
+    // each other. A task close racing a workspace snapshot produces
+    // divergent operations whose reconcile can move the workspace pointer
+    // and strand a snapshotted-but-unabsorbed provenance commit (2026-07-09
+    // incident, session 9e6269fd). The guard is reentrant, so absorb paths
+    // that write task events while holding the lock nest safely.
+    acquire_named_lock(&repo_root, "workspace-absorption")
 }
 
 fn set_tasks_bookmark(cwd: &Path, change_id: &str) -> Result<()> {
@@ -114,8 +122,9 @@ pub fn ensure_tasks_branch(cwd: &Path) -> Result<()> {
 ///
 /// Uses `jj new --no-edit` to create the event change without affecting the working copy.
 pub fn write_event(cwd: &Path, event: &TaskEvent) -> Result<()> {
-    ensure_tasks_branch(cwd)?;
+    // Lock first: ensure_tasks_branch also runs jj ops on the shared store.
     let _lock = acquire_task_write_lock(cwd)?;
+    ensure_tasks_branch(cwd)?;
 
     let metadata = event_to_metadata_block(event);
 
@@ -162,8 +171,9 @@ pub fn write_events_batch(cwd: &Path, events: &[TaskEvent]) -> Result<()> {
         return write_event(cwd, &events[0]);
     }
 
-    ensure_tasks_branch(cwd)?;
+    // Lock first: ensure_tasks_branch also runs jj ops on the shared store.
     let _lock = acquire_task_write_lock(cwd)?;
+    ensure_tasks_branch(cwd)?;
 
     let metadata = events
         .iter()

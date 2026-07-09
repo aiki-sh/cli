@@ -923,7 +923,210 @@ const SNAPSHOT_MAX_NEW_FILE_SIZE: u64 = 64 * 1024 * 1024;
 /// failed snapshot means on-disk edits are NOT in the shared store, so
 /// callers must not destroy the directory or proceed into
 /// `--ignore-working-copy` operations that assume a fresh tree.
+///
+/// Self-heals the stale-working-copy case: concurrent sessions rewrite
+/// operations in the shared store, after which jj refuses to snapshot this
+/// workspace ("The working copy is stale"). Without healing, every absorb
+/// of the workspace defers forever and its work never lands (caught by the
+/// e2e_*_concurrent_sessions_both_absorb tests). `jj workspace update-stale`
+/// reconciles and the snapshot is retried once.
+///
+/// jj's own recovery commit only covers NOT-YET-SNAPSHOTTED edits. Files
+/// already snapshotted into the workspace head are a blind spot: if a
+/// concurrent reconcile moved the workspace pointer (e.g. a divergent-op
+/// merge during a racing task close), update-stale resets the disk to the
+/// new pointer and jj sees nothing to preserve — the old head's files
+/// vanish from disk, reachable only through a dangling or hidden commit
+/// (2026-07-09 incident, session 9e6269fd). So before update-stale this
+/// resolves the head the disk actually corresponds to (via the operation
+/// id in the stale error) and afterwards bookmarks it if it was stranded.
 pub fn checked_snapshot(dir: &Path) -> std::result::Result<(), String> {
+    match snapshot_once(dir) {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            if !first_err.contains("stale") {
+                return Err(first_err);
+            }
+            debug_log(|| {
+                format!(
+                    "[workspace] stale working copy at {}; running update-stale and retrying snapshot",
+                    dir.display()
+                )
+            });
+            let stale_head = stale_workspace_head(dir, &first_err);
+            let update = jj_cmd()
+                .current_dir(dir)
+                .args(["workspace", "update-stale"])
+                .output();
+            match update {
+                Ok(o) if o.status.success() => {
+                    if let Some((change_id, commit_id)) = stale_head {
+                        preserve_stranded_head(dir, &change_id, &commit_id);
+                    }
+                    snapshot_once(dir)
+                }
+                Ok(o) => Err(format!(
+                    "{first_err}; update-stale also failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                )),
+                Err(e) => Err(format!("{first_err}; update-stale failed to run: {e}")),
+            }
+        }
+    }
+}
+
+/// Resolve the workspace head the on-disk files correspond to: `@` as of
+/// the operation named in jj's stale-working-copy error ("not updated
+/// since operation <id>"). Returns `(change_id, commit_id)`; the commit id
+/// matters because after a reconcile the change may be hidden and only the
+/// commit id still resolves. `None` means the head could not be determined
+/// (update-stale proceeds as before; jj still preserves unsnapshotted
+/// edits).
+fn stale_workspace_head(dir: &Path, stale_err: &str) -> Option<(String, String)> {
+    let after = stale_err.split("since operation").nth(1)?;
+    let op_id: String = after
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    if op_id.len() < 8 {
+        return None;
+    }
+    let output = jj_cmd()
+        .current_dir(dir)
+        .args([
+            "log",
+            "--at-op",
+            &op_id,
+            "-r",
+            "@",
+            "--no-graph",
+            "-T",
+            "change_id ++ \" \" ++ commit_id",
+            "--limit",
+            "1",
+            "--ignore-working-copy",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        debug_log(|| {
+            format!(
+                "[workspace] could not resolve stale head at op {}: {}",
+                op_id,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        });
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut parts = stdout.split_whitespace();
+    match (parts.next(), parts.next()) {
+        (Some(change), Some(commit)) => Some((change.to_string(), commit.to_string())),
+        _ => None,
+    }
+}
+
+/// After a successful update-stale, preserve the previous head if the
+/// pointer moved away from it. "Stranded" means the old change is no
+/// longer in the new `@`'s ancestry: a fresh pointer left it as a dangling
+/// head, or the reconcile hid it outright. A rewrite that carried the
+/// change along (normal absorb-induced staleness resolves the change id
+/// inside `::@`) is NOT stranded and creates no bookmark.
+fn preserve_stranded_head(dir: &Path, old_change_id: &str, old_commit_id: &str) {
+    let check = jj_cmd()
+        .current_dir(dir)
+        .args([
+            "log",
+            "-r",
+            &format!("{} & ::@", old_change_id),
+            "--no-graph",
+            "-T",
+            "commit_id",
+            "--limit",
+            "1",
+            "--ignore-working-copy",
+        ])
+        .output();
+    let stranded_rev = match check {
+        Ok(o) if o.status.success() => {
+            if !String::from_utf8_lossy(&o.stdout).trim().is_empty() {
+                return; // carried along by a rewrite — nothing stranded
+            }
+            // Change is visible but outside ::@ — a dangling head.
+            // Bookmark the change's current commit (post-reconcile rewrite,
+            // if any) rather than the possibly-superseded old commit id.
+            resolve_visible_commit(dir, old_change_id)
+                .unwrap_or_else(|| old_commit_id.to_string())
+        }
+        // Resolution failed — the reconcile hid the change. The commit id
+        // still resolves hidden commits; bookmark it directly.
+        _ => old_commit_id.to_string(),
+    };
+
+    let label = workspace_label(dir);
+    match create_recovery_bookmark(dir, &label, Some(&stranded_rev)) {
+        Some(name) => eprintln!(
+            "[aiki] WARNING: the workspace pointer at {} was moved by a \
+             concurrent operation; the previous head {} (with its \
+             snapshotted files) is preserved at bookmark {}. \
+             Run `aiki recover` to inspect.",
+            dir.display(),
+            &stranded_rev[..stranded_rev.len().min(12)],
+            name
+        ),
+        None => eprintln!(
+            "[aiki] WARNING: the workspace pointer at {} was moved by a \
+             concurrent operation and the previous head {} could NOT be \
+             bookmarked. It may still be recoverable via `jj op log` and \
+             `jj log --at-op <op> -r @`.",
+            dir.display(),
+            &stranded_rev[..stranded_rev.len().min(12)]
+        ),
+    }
+}
+
+/// Resolve a change id to its current visible commit id, if any.
+fn resolve_visible_commit(dir: &Path, change_id: &str) -> Option<String> {
+    let output = jj_cmd()
+        .current_dir(dir)
+        .args([
+            "log",
+            "-r",
+            change_id,
+            "--no-graph",
+            "-T",
+            "commit_id",
+            "--limit",
+            "1",
+            "--ignore-working-copy",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!commit.is_empty()).then_some(commit)
+}
+
+/// Human-readable label for recovery bookmarks. Session workspaces live at
+/// `<session-id>/main` containers (isolation-11), so a bare `main` leaf is
+/// labeled by its session container instead.
+fn workspace_label(dir: &Path) -> String {
+    let leaf = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "workspace".to_string());
+    if leaf == "main" {
+        if let Some(parent) = dir.parent().and_then(|p| p.file_name()) {
+            return parent.to_string_lossy().to_string();
+        }
+    }
+    leaf
+}
+
+fn snapshot_once(dir: &Path) -> std::result::Result<(), String> {
     let output = jj_cmd()
         .current_dir(dir)
         .args([
@@ -2190,6 +2393,104 @@ mod tests {
             second.as_deref(),
             Some("aiki/recovered/aiki-session-bm-2"),
             "second recovery must get a suffixed name"
+        );
+
+        match original_ws {
+            Some(v) => std::env::set_var("AIKI_WORKSPACES_DIR", v),
+            None => std::env::remove_var("AIKI_WORKSPACES_DIR"),
+        }
+    }
+
+    /// Regression (2026-07-09 incident, session 9e6269fd): a divergent-op
+    /// reconcile during a racing task close moved a workspace pointer to a
+    /// fresh empty commit, stranding the snapshotted-but-unabsorbed
+    /// provenance commit; `jj workspace update-stale` then deleted the
+    /// on-disk file with NO recovery commit (the file was already
+    /// snapshotted, so jj saw nothing to preserve). The stale-heal in
+    /// checked_snapshot must bookmark the stranded head so the work stays
+    /// reachable.
+    #[test]
+    fn test_stale_heal_preserves_stranded_snapshotted_head() {
+        use std::process::Command;
+
+        let _lock = env_lock();
+        let (repo_dir, ws_dir) = setup_jj_repo();
+        let original_ws = std::env::var("AIKI_WORKSPACES_DIR").ok();
+        std::env::set_var("AIKI_WORKSPACES_DIR", ws_dir.path());
+
+        Command::new("jj")
+            .args(["new", "--ignore-working-copy"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+        let ws = create_isolated_workspace(repo_dir.path(), "session-strand").unwrap();
+
+        // The agent writes a file; the per-tool-call hook snapshots it into
+        // the workspace's working-copy commit (the provenance-commit analog).
+        fs::write(ws.path.join("gtm-launch.md"), "the plan").unwrap();
+        checked_snapshot(&ws.path).expect("initial snapshot");
+
+        let head = Command::new("jj")
+            .args(["log", "-r", "@", "--no-graph", "-T", "commit_id"])
+            .current_dir(&ws.path)
+            .output()
+            .unwrap();
+        let old_commit = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        assert!(!old_commit.is_empty());
+
+        // Simulate the reconcile stranding the head: rewrite the workspace's
+        // wc commit from the main repo. jj resets the pointer to a fresh
+        // empty commit and hides the old head; the workspace checkout is now
+        // stale, and its on-disk file corresponds to a commit that no jj
+        // recovery mechanism will preserve on update-stale.
+        let abandon = Command::new("jj")
+            .args(["abandon", &old_commit, "--ignore-working-copy"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            abandon.status.success(),
+            "abandon failed: {}",
+            String::from_utf8_lossy(&abandon.stderr)
+        );
+
+        // Healing must succeed AND preserve the stranded head.
+        checked_snapshot(&ws.path).expect("stale heal");
+
+        let bookmarks = Command::new("jj")
+            .args([
+                "log",
+                "-r",
+                "bookmarks(glob:\"aiki/recovered/*\")",
+                "--no-graph",
+                "-T",
+                "bookmarks",
+                "--ignore-working-copy",
+            ])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+        let names = String::from_utf8_lossy(&bookmarks.stdout).trim().to_string();
+        assert!(
+            !names.is_empty(),
+            "stranded head must get a recovery bookmark"
+        );
+        let bookmark = names.split_whitespace().next().unwrap().trim_end_matches('*');
+
+        let show = Command::new("jj")
+            .args(["file", "show", "-r", bookmark, "gtm-launch.md"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            show.status.success(),
+            "jj file show failed: {}",
+            String::from_utf8_lossy(&show.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&show.stdout),
+            "the plan",
+            "recovered bookmark must hold the snapshotted file content"
         );
 
         match original_ws {
