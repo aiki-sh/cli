@@ -18,6 +18,7 @@
 //! `Command::cargo_bin("aiki")` directly here; it would resolve the real
 //! `~/.aiki` and reintroduce that flake.
 
+mod isolation_recovery;
 mod multi_agent;
 mod provenance;
 mod session_thread;

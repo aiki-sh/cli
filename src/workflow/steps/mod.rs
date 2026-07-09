@@ -332,7 +332,7 @@ pub(crate) fn spawn_drain(
             if std::time::Instant::now() >= next_stale_check {
                 next_stale_check = std::time::Instant::now() + STALE_CHECK_INTERVAL;
                 if let Some(idle) = worker_idle_duration(cwd, task_id) {
-                    if idle > crate::commands::run::STALE_WORKER_THRESHOLD {
+                    if idle > crate::commands::run::stale_worker_threshold() {
                         let _ = agent_handle.kill();
                         let sid = worker_session_id(cwd, task_id).unwrap_or_default();
                         return crate::commands::run::handle_stale_worker(
@@ -392,7 +392,7 @@ pub(crate) fn spawn_drain(
             if std::time::Instant::now() >= next_stale_check {
                 next_stale_check = std::time::Instant::now() + STALE_CHECK_INTERVAL;
                 if let Some(idle) = worker_idle_duration(cwd, task_id) {
-                    if idle > crate::commands::run::STALE_WORKER_THRESHOLD {
+                    if idle > crate::commands::run::stale_worker_threshold() {
                         let _ = agent_handle.kill();
                         let sid = worker_session_id(cwd, task_id).unwrap_or_default();
                         return crate::commands::run::handle_stale_worker(

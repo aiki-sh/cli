@@ -504,11 +504,23 @@ fn spawn_and_discover(
     }
 }
 
-/// Threshold of transcript inactivity after which a live worker is
+/// Default transcript-inactivity threshold after which a live worker is
 /// considered stalled. Conservative: agents legitimately pause for long
 /// builds or large reads, but nothing healthy is silent for 5 minutes.
-pub(crate) const STALE_WORKER_THRESHOLD: std::time::Duration =
-    std::time::Duration::from_secs(300);
+const STALE_WORKER_DEFAULT_SECS: u64 = 300;
+
+/// Threshold of transcript inactivity after which a live worker is
+/// considered stalled. Overridable via `AIKI_STALE_WORKER_TIMEOUT_SECS`
+/// (used by e2e tests to exercise the watchdog without a 5-minute wait;
+/// also the escape hatch for repos with legitimately silent long tools).
+pub(crate) fn stale_worker_threshold() -> std::time::Duration {
+    let secs = std::env::var("AIKI_STALE_WORKER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(STALE_WORKER_DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
 
 /// Kill a stalled worker and stop its task so it can be restarted.
 ///
@@ -608,7 +620,7 @@ fn wait_for_task_completion(cwd: &Path, task_id: &str, session_id: Option<&str>)
             {
                 let idle = chrono::Utc::now().signed_duration_since(last_activity);
                 if let Ok(idle) = idle.to_std() {
-                    if idle > STALE_WORKER_THRESHOLD {
+                    if idle > stale_worker_threshold() {
                         return handle_stale_worker(cwd, task_id, sid, idle);
                     }
                 }
