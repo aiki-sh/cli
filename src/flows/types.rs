@@ -15,8 +15,28 @@ pub enum HookStatement {
     /// Handled by the composer (not the engine) because it requires
     /// the composer's HookLoader and call stack for cycle detection.
     Hook(HookAction),
+    /// Lock-guarded statement block (named file lock held across nested steps)
+    Mutex(MutexStatement),
     /// Action to execute
     Action(Action),
+}
+
+/// Lock-guarded statement block.
+///
+/// Acquires a named file lock (via `acquire_named_lock`, i.e. `flock(2)`)
+/// for the current repo, runs the nested statements, and releases the lock
+/// on scope exit — even when a nested step fails. Serializes with any other
+/// holder of the same lock name, e.g. workspace absorption.
+///
+/// ```yaml
+/// - mutex:
+///     workspace-absorption:
+///       - jj: new --ignore-working-copy
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MutexStatement {
+    /// Map of lock_name → nested statements. Exactly one key expected.
+    pub mutex: HashMap<String, Vec<HookStatement>>,
 }
 
 /// Conditional if statement

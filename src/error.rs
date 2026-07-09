@@ -127,6 +127,15 @@ pub enum AikiError {
     #[error("Lock failed: {0}")]
     LockFailed(String),
 
+    #[error(
+        "Worker stalled: task {task_id}, session {session_id} — no transcript activity for {idle_seconds}s (killed; task stopped for restart)"
+    )]
+    StaleWorker {
+        task_id: String,
+        session_id: String,
+        idle_seconds: u64,
+    },
+
     // Hook composition errors (Milestone 1.3)
     #[error(
         "Not in an Aiki project. No .aiki/ directory found searching upward from: {searched_from}"

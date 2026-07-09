@@ -247,6 +247,29 @@ pub(crate) trait DrainHandler {
 /// 3. `read_events(cwd)` → `materialize_graph` → `compute_delta` →
 ///    `handler.on_change()`.
 /// 4. After agent exits: 200ms silence window for final events.
+/// How often the drain loops sample transcript activity for the
+/// stale-worker watchdog.
+const STALE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The session currently attached to a task (from the task graph).
+fn worker_session_id(cwd: &Path, task_id: &str) -> Option<String> {
+    let events = read_events(cwd).ok()?;
+    let graph = crate::tasks::graph::materialize_graph(&events);
+    graph.tasks.get(task_id)?.last_session_id.clone()
+}
+
+/// Transcript idle time for the task's worker session. None when the
+/// session or transcript cannot be resolved (agent still initializing) —
+/// the watchdog then falls back to PID-based detection only.
+fn worker_idle_duration(cwd: &Path, task_id: &str) -> Option<std::time::Duration> {
+    let sid = worker_session_id(cwd, task_id)?;
+    let last_activity = crate::commands::session::check_transcript_activity(&sid)?;
+    chrono::Utc::now()
+        .signed_duration_since(last_activity)
+        .to_std()
+        .ok()
+}
+
 pub(crate) fn spawn_drain(
     cwd: &Path,
     task_id: &str,
@@ -297,11 +320,28 @@ pub(crate) fn spawn_drain(
         }
 
         // Main drain loop: wait for notifications via recv_timeout.
+        let mut next_stale_check = std::time::Instant::now() + STALE_CHECK_INTERVAL;
         while agent_handle
             .try_wait()
             .map_err(|e| AikiError::AgentSpawnFailed(format!("try_wait failed: {}", e)))?
             .is_none()
         {
+            // Activity watchdog: a live-but-stuck agent (hung API call,
+            // stuck subprocess write) never exits and never notifies, so
+            // this loop would otherwise wait forever.
+            if std::time::Instant::now() >= next_stale_check {
+                next_stale_check = std::time::Instant::now() + STALE_CHECK_INTERVAL;
+                if let Some(idle) = worker_idle_duration(cwd, task_id) {
+                    if idle > crate::commands::run::STALE_WORKER_THRESHOLD {
+                        let _ = agent_handle.kill();
+                        let sid = worker_session_id(cwd, task_id).unwrap_or_default();
+                        return crate::commands::run::handle_stale_worker(
+                            cwd, task_id, &sid, idle,
+                        );
+                    }
+                }
+            }
+
             // Block until a notification arrives or 100ms elapses (serves
             // as agent status check interval).
             match rx.recv_timeout(Duration::from_millis(100)) {
@@ -341,10 +381,28 @@ pub(crate) fn spawn_drain(
         handler.finish();
     } else {
         // No event channel — still must wait for the agent to exit before
-        // reading output and finalizing.
-        agent_handle
-            .wait()
-            .map_err(|e| AikiError::AgentSpawnFailed(format!("wait failed: {}", e)))?;
+        // reading output and finalizing. Poll (rather than block) so the
+        // activity watchdog can reap a live-but-stuck agent.
+        let mut next_stale_check = std::time::Instant::now() + STALE_CHECK_INTERVAL;
+        while agent_handle
+            .try_wait()
+            .map_err(|e| AikiError::AgentSpawnFailed(format!("try_wait failed: {}", e)))?
+            .is_none()
+        {
+            if std::time::Instant::now() >= next_stale_check {
+                next_stale_check = std::time::Instant::now() + STALE_CHECK_INTERVAL;
+                if let Some(idle) = worker_idle_duration(cwd, task_id) {
+                    if idle > crate::commands::run::STALE_WORKER_THRESHOLD {
+                        let _ = agent_handle.kill();
+                        let sid = worker_session_id(cwd, task_id).unwrap_or_default();
+                        return crate::commands::run::handle_stale_worker(
+                            cwd, task_id, &sid, idle,
+                        );
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     // Agent stderr is discarded — interactive agents (Claude Code, Codex) write

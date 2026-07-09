@@ -39,6 +39,7 @@ pub mod output;
 pub mod plan;
 pub mod plugin;
 pub mod remove;
+pub mod recover;
 pub mod resolve;
 pub mod review;
 pub mod run;

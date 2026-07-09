@@ -10,8 +10,8 @@ use crate::validation::is_valid_flow_identifier;
 use super::state::{ActionResult, AikiState};
 use super::types::{
     Action, AutoreplyAction, AutoreplyContent, CallAction, CommitMessageAction, CommitMessageOp,
-    ContextAction, HookStatement, IfStatement, JjAction, LetAction, LogAction, OnFailure,
-    OnFailureShortcut, ReviewAction, ShellAction, SwitchStatement, TaskRunAction,
+    ContextAction, HookStatement, IfStatement, JjAction, LetAction, LogAction, MutexStatement,
+    OnFailure, OnFailureShortcut, ReviewAction, ShellAction, SwitchStatement, TaskRunAction,
 };
 use super::variables::VariableResolver;
 use crate::error::{AikiError, Result};
@@ -775,6 +775,7 @@ impl HookEngine {
         match statement {
             HookStatement::If(if_stmt) => Self::execute_if(if_stmt, state),
             HookStatement::Switch(switch_stmt) => Self::execute_switch(switch_stmt, state),
+            HookStatement::Mutex(mutex_stmt) => Self::execute_mutex(mutex_stmt, state),
             HookStatement::Hook(hook_action) => {
                 // hook: actions should be intercepted by HookComposer, not the engine.
                 // If we reach here, it means the engine was called directly without
@@ -1942,6 +1943,61 @@ impl HookEngine {
         Self::execute_statements(statements_to_execute, state)
     }
 
+    /// Execute a lock-guarded statement block.
+    ///
+    /// Acquires the named file lock for the current repo (same lock namespace
+    /// as workspace absorption — `acquire_named_lock`), runs the nested
+    /// statements, and releases the lock when the guard drops on scope exit,
+    /// even if a nested step fails.
+    ///
+    /// Degraded modes (both warn, neither aborts the hook):
+    /// - Not inside a JJ repo: the steps run without a lock (there is no repo
+    ///   to serialize against).
+    /// - Lock acquisition fails (e.g. lock dir not creatable): the steps run
+    ///   unserialized — equivalent to the pre-mutex behavior.
+    fn execute_mutex(stmt: &MutexStatement, state: &mut AikiState) -> Result<HookOutcome> {
+        let mut entries = stmt.mutex.iter();
+        let (lock_name, statements) = match entries.next() {
+            Some(entry) => entry,
+            None => return Ok(HookOutcome::Success),
+        };
+        if entries.next().is_some() {
+            return Err(AikiError::Other(anyhow::anyhow!(
+                "mutex: expects exactly one lock-name key, found {}",
+                stmt.mutex.len()
+            )));
+        }
+
+        let _guard = match crate::session::isolation::find_jj_root(state.cwd()) {
+            Some(repo_root) => {
+                match crate::session::isolation::acquire_named_lock(&repo_root, lock_name) {
+                    Ok(guard) => {
+                        debug_log(|| format!("[flows] mutex '{}' acquired", lock_name));
+                        Some(guard)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[aiki] Warning: failed to acquire '{}' lock, running steps unserialized: {}",
+                            lock_name, e
+                        );
+                        None
+                    }
+                }
+            }
+            None => {
+                debug_log(|| {
+                    format!(
+                        "[flows] mutex '{}': not in a JJ repo, running steps without lock",
+                        lock_name
+                    )
+                });
+                None
+            }
+        };
+
+        Self::execute_statements(statements, state)
+    }
+
     /// Execute a switch/case statement
     fn execute_switch(stmt: &SwitchStatement, state: &mut AikiState) -> Result<HookOutcome> {
         let mut resolver = Self::create_resolver(state);
@@ -2405,6 +2461,10 @@ impl HookEngine {
                 let session = extract_session(&state.event)?;
                 crate::flows::core::workspace_absorb_all(session)
             }
+            ("core", "workspace_snapshot_current") => {
+                let session = extract_session(&state.event)?;
+                crate::flows::core::workspace_snapshot_current(session)
+            }
             _ => Err(AikiError::FunctionNotFoundInNamespace(
                 function.to_string(),
                 module.to_string(),
@@ -2607,6 +2667,10 @@ impl HookEngine {
             ("core", "workspace_absorb_all") => {
                 let session = extract_session(&state.event)?;
                 crate::flows::core::workspace_absorb_all(session)
+            }
+            ("core", "workspace_snapshot_current") => {
+                let session = extract_session(&state.event)?;
+                crate::flows::core::workspace_snapshot_current(session)
             }
             _ => Err(AikiError::FunctionNotFoundInNamespace(
                 function.to_string(),
@@ -2840,6 +2904,146 @@ mod tests {
                 edit_details: vec![],
             }),
         })
+    }
+
+    fn create_test_event_with_cwd(cwd: &std::path::Path) -> AikiEvent {
+        let session = AikiSession::new(
+            AgentType::ClaudeCode,
+            "test-session".to_string(),
+            None::<&str>,
+            crate::provenance::DetectionMethod::Hook,
+            SessionMode::Interactive,
+        );
+        AikiEvent::ChangeCompleted(AikiChangeCompletedPayload {
+            session,
+            cwd: cwd.to_path_buf(),
+            timestamp: chrono::Utc::now(),
+            tool_name: "Edit".to_string(),
+            success: true,
+            turn: crate::events::Turn::unknown(),
+            operation: ChangeOperation::Write(WriteOperation {
+                file_paths: vec!["/tmp/file.rs".to_string()],
+                edit_details: vec![],
+            }),
+        })
+    }
+
+    #[test]
+    fn test_mutex_parses_from_yaml() {
+        let yaml = r#"
+- mutex:
+    workspace-absorption:
+      - jj: new --ignore-working-copy
+"#;
+        let statements: Vec<HookStatement> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(statements.len(), 1);
+        match &statements[0] {
+            HookStatement::Mutex(m) => {
+                let steps = m.mutex.get("workspace-absorption").unwrap();
+                assert_eq!(steps.len(), 1);
+                assert!(matches!(
+                    steps[0],
+                    HookStatement::Action(Action::Jj(_))
+                ));
+            }
+            other => panic!("expected Mutex statement, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_execute_mutex_runs_nested_steps_under_lock() {
+        let _lock = crate::global::AIKI_HOME_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let repo_dir = tempfile::tempdir().unwrap();
+        let ws_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo_dir.path().join(".jj")).unwrap();
+        let original = std::env::var("AIKI_WORKSPACES_DIR").ok();
+        std::env::set_var("AIKI_WORKSPACES_DIR", ws_dir.path());
+
+        let marker = repo_dir.path().join("ran.txt");
+        let stmt = MutexStatement {
+            mutex: std::collections::HashMap::from([(
+                "test-lock".to_string(),
+                vec![HookStatement::Action(Action::Shell(ShellAction {
+                    shell: format!("touch {}", marker.display()),
+                    timeout: None,
+                    on_failure: OnFailure::default(),
+                    alias: None,
+                }))],
+            )]),
+        };
+
+        let mut state = AikiState::new(create_test_event_with_cwd(repo_dir.path()));
+        let outcome = HookEngine::execute_mutex(&stmt, &mut state).unwrap();
+        assert!(matches!(outcome, HookOutcome::Success));
+        assert!(marker.exists(), "nested step must run");
+
+        // The named lock file was created under the repo's workspaces dir
+        let repo_id = crate::repos::ensure_repo_id(repo_dir.path()).unwrap();
+        assert!(
+            ws_dir
+                .path()
+                .join(&repo_id)
+                .join(".test-lock.lock")
+                .exists(),
+            "named lock file must exist"
+        );
+
+        match original {
+            Some(v) => std::env::set_var("AIKI_WORKSPACES_DIR", v),
+            None => std::env::remove_var("AIKI_WORKSPACES_DIR"),
+        }
+    }
+
+    #[test]
+    fn test_execute_mutex_outside_jj_repo_still_runs_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran.txt");
+        let stmt = MutexStatement {
+            mutex: std::collections::HashMap::from([(
+                "test-lock".to_string(),
+                vec![HookStatement::Action(Action::Shell(ShellAction {
+                    shell: format!("touch {}", marker.display()),
+                    timeout: None,
+                    on_failure: OnFailure::default(),
+                    alias: None,
+                }))],
+            )]),
+        };
+        let mut state = AikiState::new(create_test_event_with_cwd(dir.path()));
+        let outcome = HookEngine::execute_mutex(&stmt, &mut state).unwrap();
+        assert!(matches!(outcome, HookOutcome::Success));
+        assert!(marker.exists(), "steps must run even without a repo lock");
+    }
+
+    #[test]
+    fn test_execute_mutex_multiple_keys_errors() {
+        let stmt = MutexStatement {
+            mutex: std::collections::HashMap::from([
+                ("lock-a".to_string(), vec![]),
+                ("lock-b".to_string(), vec![]),
+            ]),
+        };
+        let mut state = AikiState::new(create_test_event());
+        assert!(HookEngine::execute_mutex(&stmt, &mut state).is_err());
+    }
+
+    #[test]
+    fn test_execute_mutex_propagates_nested_failure_outcome() {
+        let stmt = MutexStatement {
+            mutex: std::collections::HashMap::from([(
+                "test-lock".to_string(),
+                vec![HookStatement::Action(Action::Stop(
+                    crate::flows::types::StopAction {
+                        failure: "halt".to_string(),
+                    },
+                ))],
+            )]),
+        };
+        let mut state = AikiState::new(create_test_event());
+        let outcome = HookEngine::execute_mutex(&stmt, &mut state).unwrap();
+        assert!(matches!(outcome, HookOutcome::FailedStop));
     }
 
     fn create_session_resumed_event() -> AikiEvent {

@@ -23,5 +23,6 @@ pub use functions::{
     // Workspace isolation functions
     workspace_absorb_all,
     workspace_ensure_isolated,
+    workspace_snapshot_current,
     write_ai_files_change,
 };

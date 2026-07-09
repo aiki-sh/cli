@@ -76,6 +76,7 @@ For Agents:
   decompose   Decompose a plan into subtasks under a target task
   loop        Orchestrate a parent task's subtasks via lanes
   resolve     Resolve JJ merge conflicts
+  recover     List/reclaim preserved unabsorbed session work
 
 For Everyone:
   tldr        Summarize what a closed epic changed
@@ -223,6 +224,8 @@ enum Commands {
     Review(commands::review::ReviewArgs),
     /// Resolve JJ merge conflicts
     Resolve(commands::resolve::ResolveArgs),
+    /// List and reclaim preserved-but-unabsorbed session work
+    Recover(commands::recover::RecoverArgs),
     /// Manage epics (create from plan files, show status, list)
     Epic {
         #[command(subcommand)]
@@ -508,6 +511,7 @@ fn run() -> Result<()> {
         Commands::Explore(args) => commands::explore::run(args),
         Commands::Review(args) => commands::review::run(args),
         Commands::Resolve(args) => commands::resolve::run(args),
+        Commands::Recover(args) => commands::recover::run(args),
         Commands::Epic { command } => commands::epic::run(command),
         Commands::Decompose(args) => commands::decompose::run(args),
         Commands::Build(args) => commands::build::run(args),

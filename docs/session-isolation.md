@@ -18,16 +18,45 @@ conditions that would arise if isolation were conditional on session count.
 ```
  ~/.aiki/sessions/                      /tmp/aiki/
  ├── {uuid-A}          (session file)   ├── {repo-id}/
- └── {uuid-B}          (session file)   │   ├── {uuid-A}/        (isolated workspace A)
-                                        │   │   ├── .jj/repo → ~/.../repo/.jj/repo
-                                        │   │   └── (working tree copy)
-                                        │   ├── {uuid-B}/        (isolated workspace B)
-                                        │   │   └── ...
-                                        │   └── .absorb.lock     (serializes absorptions)
+ └── {uuid-B}          (session file)   │   ├── {uuid-A}/        (session container A)
+                                        │   │   ├── .aiki-layout (layout marker: "v2")
+                                        │   │   └── main/        (isolated working copy)
+                                        │   │       ├── .jj/repo → ~/.../repo/.jj/repo
+                                        │   │       └── (working tree copy)
+                                        │   ├── {uuid-B}/        (session container B)
+                                        │   │   └── main/ ...
+                                        │   └── .workspace-absorption.lock  (serializes absorptions)
                                         │
                                         └── {other-repo-id}/
                                             └── ...
 ```
+
+### Layout v2 (session containers)
+
+Each session directory is a **container**; the JJ working copy lives at
+`<container>/main`. The `main` slot name is deliberate — a later change makes
+it branch-aware, and task (subagent) workspaces will live at sibling
+`subagents/<task-id>/` paths. A `.aiki-layout` marker identifies v2
+containers.
+
+- **Upgrade (old layout on disk, new binary):** migrated automatically and
+  lazily on the session's next workspace creation — the old container-root
+  working copy is absorbed into main first (tracked work carries forward),
+  then the workspace is recreated at `main/`. Untracked/ignored files
+  (build artifacts, `.env`) are dropped by the migration.
+- **Downgrade (new layout on disk, old binary): destructive.** An old binary
+  treats the container as the working copy, fails to resolve `@-` inside it,
+  and destroys/recreates it — discarding the `main/` working copy. **Drain
+  first:** end all sessions (which absorbs and removes containers) before
+  installing an older aiki.
+
+### Recovery surfaces
+
+Cleanup never silently destroys unabsorbed work. When absorption cannot
+complete, work is preserved on an `aiki/recovered/*` bookmark, or the
+directory is quarantined under `$AIKI_HOME/recovered-workspaces/`. Run
+`aiki recover` to list both, and `aiki recover reclaim <bookmark>` to drop a
+bookmark once its changes are in main.
 
 ---
 
@@ -225,13 +254,12 @@ Triggered on:
                             │
                             ▼
  ┌──────────────────────────────────────────────────────────────┐
- │  ACQUIRE ABSORB LOCK                                         │
- │  (isolation.rs:249, called at 405)                           │
+ │  ACQUIRE ABSORB LOCK (acquire_named_lock)                    │
  │                                                               │
- │  Path: /tmp/aiki/{repo-id}/.absorb.lock                     │
- │  Mechanism: O_CREAT|O_EXCL (atomic file creation)            │
- │  Timeout: 30 seconds (stale lock removal)                    │
- │  Poll interval: 100ms                                        │
+ │  Path: /tmp/aiki/{repo-id}/.workspace-absorption.lock       │
+ │  Mechanism: flock(2) via fd-lock (kernel-released on exit,  │
+ │  even SIGKILL — stale locks are impossible)                  │
+ │  Blocking: kernel blocks until available (no polling)        │
  └──────────────────────────┬───────────────────────────────────┘
                             │
                             ▼

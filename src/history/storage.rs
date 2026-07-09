@@ -17,7 +17,7 @@ use super::types::{
 
 fn acquire_conversation_write_lock(
     cwd: &Path,
-) -> Result<fd_lock::RwLockWriteGuard<'static, std::fs::File>> {
+) -> Result<crate::session::isolation::NamedLockGuard> {
     let repo_root = crate::jj::get_repo_root(cwd)?;
     acquire_named_lock(&repo_root, "conversation-event-write")
 }

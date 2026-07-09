@@ -973,6 +973,30 @@ pub fn workspace_ensure_isolated(
         }
     };
 
+    // A workspace without a session file is orphaned-from-birth: the orphan
+    // sweep keys liveness off $AIKI_HOME/sessions/<uuid> and would reap it
+    // mid-flight. If the session file could not be written at session start,
+    // fall back to the main workspace instead of creating a doomed one.
+    if !crate::global::global_sessions_dir()
+        .join(session.uuid())
+        .exists()
+    {
+        eprintln!(
+            "[aiki] Warning: no session file for {}; skipping workspace isolation",
+            session.uuid()
+        );
+        return Ok(ActionResult::success());
+    }
+
+    // Eager recovery (isolation-02 Phase 3): opportunistically reclaim dead
+    // sessions' workspaces at turn start instead of only at session start,
+    // so crash recovery is not gated on a later session happening to begin.
+    // Safe: the sweep absorbs-or-preserves before destroying and holds the
+    // absorption lock. Cheap when there is nothing to reclaim.
+    if let Err(e) = isolation::cleanup_orphaned_workspaces(&repo_root) {
+        debug_log(|| format!("[workspace] Orphan sweep failed: {}", e));
+    }
+
     match isolation::create_isolated_workspace(&repo_root, session.uuid()) {
         Ok(ws) => {
             debug_log(|| {
@@ -1002,6 +1026,74 @@ pub fn workspace_ensure_isolated(
             })
         }
     }
+}
+
+/// Durably capture the session workspace's on-disk state into the shared
+/// jj store.
+///
+/// Called from `change.completed` (write/delete/move) so the unsnapshotted
+/// loss window shrinks from a whole turn to a single tool call. This matters
+/// most for Codex sessions, which deliberately skip per-tool `jj new` (OTel
+/// events arrive asynchronously) and previously had an entire turn's edits
+/// unsnapshotted on disk.
+///
+/// Race-safe: the snapshot touches only the session workspace's private `@`,
+/// so no absorption lock is needed. Locates the workspace by session uuid
+/// (like `workspace_absorb_all`) — independent of the hook's cwd.
+///
+/// Never fails the edit flow: snapshot problems are reported on stderr only.
+pub fn workspace_snapshot_current(session: &crate::session::AikiSession) -> Result<ActionResult> {
+    use crate::session::isolation;
+
+    let session_uuid = session.uuid();
+    let workspaces_dir = isolation::workspaces_dir();
+
+    if !workspaces_dir.exists() {
+        return Ok(ActionResult {
+            success: true,
+            exit_code: Some(0),
+            stdout: "0".to_string(),
+            stderr: String::new(),
+        });
+    }
+
+    let mut snapped = 0u32;
+    let mut failures: Vec<String> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&workspaces_dir) {
+        for entry in entries.flatten() {
+            let repo_id_dir = entry.path();
+            if !repo_id_dir.is_dir() {
+                continue;
+            }
+            let container = repo_id_dir.join(session_uuid);
+            if !container.exists() {
+                continue;
+            }
+            let session_ws_dir = isolation::resolve_session_workspace_path(&container);
+            if !session_ws_dir.join(".jj").exists() {
+                continue;
+            }
+            match isolation::checked_snapshot(&session_ws_dir) {
+                Ok(()) => snapped += 1,
+                Err(reason) => {
+                    eprintln!(
+                        "[aiki] WARNING: mid-turn workspace snapshot failed at {}: {}",
+                        session_ws_dir.display(),
+                        reason
+                    );
+                    failures.push(reason);
+                }
+            }
+        }
+    }
+
+    Ok(ActionResult {
+        success: true,
+        exit_code: Some(0),
+        stdout: snapped.to_string(),
+        stderr: failures.join("; "),
+    })
 }
 
 /// Absorb all workspaces for the current session back into parent/main.
@@ -1052,10 +1144,16 @@ pub fn workspace_absorb_all(session: &crate::session::AikiSession) -> Result<Act
             continue;
         }
 
-        let session_ws_dir = repo_id_dir.join(session_uuid);
-        if !session_ws_dir.exists() {
+        let container = repo_id_dir.join(session_uuid);
+        if !container.exists() {
             continue;
         }
+        // Layout v2: the working copy lives at <container>/main (legacy
+        // sessions have it at the container root). Passing the container to
+        // find_repo_root_from_workspace would return None and previously
+        // led to remove_dir_all — the headline data-loss path of the
+        // rehome plan's consumer inventory.
+        let session_ws_dir = isolation::resolve_session_workspace_path(&container);
 
         let workspace_name = format!("aiki-{}", session_uuid);
 
@@ -1072,8 +1170,14 @@ pub fn workspace_absorb_all(session: &crate::session::AikiSession) -> Result<Act
                         session_ws_dir.display()
                     )
                 });
-                // Clean up directory even if we can't absorb
-                let _ = std::fs::remove_dir_all(&session_ws_dir);
+                // No resolvable repo root: the shared store is unreachable,
+                // so nothing can be preserved in jj. Quarantine — never
+                // delete a directory that may hold unabsorbed work.
+                let workspace = isolation::IsolatedWorkspace {
+                    name: workspace_name.clone(),
+                    path: session_ws_dir,
+                };
+                let _ = isolation::cleanup_workspace_safely(None, &workspace, None);
                 continue;
             }
         };
@@ -1087,25 +1191,21 @@ pub fn workspace_absorb_all(session: &crate::session::AikiSession) -> Result<Act
             path: session_ws_dir,
         };
 
+        // Hold the absorption lock across absorb + cleanup so a concurrent
+        // absorb (e.g. a child session targeting this workspace) cannot
+        // interleave between the absorb decision and the cleanup below.
+        // Reentrant with absorb_workspace's own acquisition.
+        let _cleanup_lock = isolation::acquire_named_lock(&repo_root, "workspace-absorption").ok();
+
         match isolation::absorb_workspace(&repo_root, &workspace, parent_session_uuid.as_deref()) {
             Ok(isolation::AbsorbResult::Absorbed) => {
                 absorbed += 1;
 
                 // Post-absorption: check if target's @ is conflicted.
-                // Compute target_dir same as absorb_workspace: parent workspace if
-                // it exists, otherwise repo root.
-                let target_dir = if let Some(ref parent_uuid) = parent_session_uuid {
-                    let repo_id = crate::repos::ensure_repo_id(&repo_root).unwrap_or_default();
-                    let parent_ws_path =
-                        isolation::workspaces_dir().join(&repo_id).join(parent_uuid);
-                    if parent_ws_path.exists() {
-                        parent_ws_path
-                    } else {
-                        repo_root.clone()
-                    }
-                } else {
-                    repo_root.clone()
-                };
+                // Shares absorb_workspace's target derivation (one source of
+                // truth — the two used to compute this independently).
+                let target_dir =
+                    isolation::absorb_target_dir(&repo_root, parent_session_uuid.as_deref());
 
                 // Uses `conflicts() & @` — if @ is clean, all ancestor conflicts
                 // have been resolved, so no false positives from historical conflicts.
@@ -1170,15 +1270,42 @@ pub fn workspace_absorb_all(session: &crate::session::AikiSession) -> Result<Act
                     }
                 }
             }
-            Ok(isolation::AbsorbResult::Skipped) => {
+            Ok(isolation::AbsorbResult::Empty) => {
+                // Nothing to preserve — safe to remove.
                 let _ = isolation::cleanup_workspace(&repo_root, &workspace);
+            }
+            Ok(isolation::AbsorbResult::Deferred { reason }) => {
+                // Absorption could not verifiably complete (snapshot or
+                // update-stale failure). The workspace is retained so no
+                // work is lost; a later absorb or the orphan sweep retries.
+                eprintln!(
+                    "[aiki] Warning: absorb of workspace '{}' deferred ({}); retaining workspace",
+                    workspace.name, reason
+                );
+            }
+            Ok(isolation::AbsorbResult::Skipped { reason }) => {
+                eprintln!(
+                    "[aiki] Warning: absorb of workspace '{}' skipped ({})",
+                    workspace.name, reason
+                );
+                // Preserve (bookmark/quarantine) before any delete.
+                let _ = isolation::cleanup_workspace_safely(
+                    Some(&repo_root),
+                    &workspace,
+                    parent_session_uuid.as_deref(),
+                );
             }
             Err(e) => {
                 eprintln!(
                     "[aiki] Warning: failed to absorb workspace '{}': {}",
                     workspace.name, e
                 );
-                let _ = isolation::cleanup_workspace(&repo_root, &workspace);
+                // Preserve (bookmark/quarantine) before any delete.
+                let _ = isolation::cleanup_workspace_safely(
+                    Some(&repo_root),
+                    &workspace,
+                    parent_session_uuid.as_deref(),
+                );
             }
         }
     }
@@ -1466,5 +1593,105 @@ mod tests {
         let result = classify_edits_change(&event).unwrap();
         // No edit details → assume AI-only
         assert_eq!(result.stdout, "ExactMatch");
+    }
+
+    // =========================================================================
+    // workspace_absorb_all consumer-path regression (isolation-11 Phase 0.2)
+    // =========================================================================
+
+    /// Drive the END-TO-END hook entry point (`workspace_absorb_all`), not
+    /// just the `absorb_workspace` primitive: with the v2 layout the
+    /// container path must resolve to `<container>/main`, absorb the work,
+    /// and never fall into the find-root-None `remove_dir_all` branch that
+    /// would silently discard the session's final changes.
+    #[test]
+    fn test_workspace_absorb_all_rehomed_consumer_path() {
+        use std::process::Command;
+
+        let _lock = crate::global::AIKI_HOME_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let repo_dir = TempDir::new().unwrap();
+        let ws_dir = TempDir::new().unwrap();
+        let aiki_home = TempDir::new().unwrap();
+        let original_ws = std::env::var("AIKI_WORKSPACES_DIR").ok();
+        let original_home = std::env::var("AIKI_HOME").ok();
+        let original_parent = std::env::var("AIKI_PARENT_SESSION_UUID").ok();
+        std::env::set_var("AIKI_WORKSPACES_DIR", ws_dir.path());
+        std::env::set_var("AIKI_HOME", aiki_home.path());
+        std::env::remove_var("AIKI_PARENT_SESSION_UUID");
+
+        // Set up a JJ repo
+        let out = Command::new("jj")
+            .args(["git", "init", "--colocate"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        std::fs::write(repo_dir.path().join("init.txt"), "initial").unwrap();
+        Command::new("jj")
+            .args(["describe", "-m", "initial"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+        Command::new("jj")
+            .args(["new"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+        let aiki_dir = repo_dir.path().join(".aiki");
+        std::fs::create_dir_all(&aiki_dir).unwrap();
+        std::fs::write(aiki_dir.join("repo-id"), "consumerrepo\n").unwrap();
+
+        // Create the session workspace (v2 layout) and do some work in main/
+        let session_uuid = "consumer-session";
+        let ws =
+            crate::session::isolation::create_isolated_workspace(repo_dir.path(), session_uuid)
+                .unwrap();
+        assert!(ws.path.ends_with("main"));
+        std::fs::write(ws.path.join("consumer.txt"), "end to end").unwrap();
+        Command::new("jj")
+            .args(["describe", "-m", "[aiki] consumer work"])
+            .current_dir(&ws.path)
+            .output()
+            .unwrap();
+
+        // Session file so the opportunistic orphan sweep doesn't reap it
+        let sessions_dir = crate::global::global_sessions_dir();
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(sessions_dir.join(session_uuid), "alive").unwrap();
+
+        // Drive the hook entry point
+        let session = AikiSession::from_uuid(
+            session_uuid.to_string(),
+            AgentType::ClaudeCode,
+            SessionMode::Interactive,
+        );
+        let result = workspace_absorb_all(&session).unwrap();
+        assert!(result.success);
+
+        // The work must have landed in the target repo — the old bug
+        // remove_dir_all'd the container without absorbing.
+        let landed = repo_dir.path().join("consumer.txt");
+        assert!(
+            landed.exists(),
+            "workspace_absorb_all must absorb <container>/main into the repo (result stdout: {})",
+            result.stdout
+        );
+        assert_eq!(std::fs::read_to_string(&landed).unwrap(), "end to end");
+
+        match original_ws {
+            Some(v) => std::env::set_var("AIKI_WORKSPACES_DIR", v),
+            None => std::env::remove_var("AIKI_WORKSPACES_DIR"),
+        }
+        match original_home {
+            Some(v) => std::env::set_var("AIKI_HOME", v),
+            None => std::env::remove_var("AIKI_HOME"),
+        }
+        match original_parent {
+            Some(v) => std::env::set_var("AIKI_PARENT_SESSION_UUID", v),
+            None => std::env::remove_var("AIKI_PARENT_SESSION_UUID"),
+        }
     }
 }

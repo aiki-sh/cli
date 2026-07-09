@@ -46,6 +46,10 @@ impl SessionMode {
 pub enum SessionCleanupReason {
     /// Parent process no longer alive
     PidDead,
+    /// Session file exceeded the maximum age (36h) regardless of PID state
+    TtlExpired,
+    /// Live-but-stuck worker killed by the activity watchdog
+    StaleWorker,
 }
 
 /// Session file handle for atomic file operations
@@ -1651,6 +1655,8 @@ fn emit_synthetic_session_ended(session_info: &SessionFileInfo, reason: SessionC
 
     let reason_str = match reason {
         SessionCleanupReason::PidDead => "pid_dead",
+        SessionCleanupReason::TtlExpired => "ttl_expired",
+        SessionCleanupReason::StaleWorker => "stale_worker",
     };
 
     debug_log(|| {
@@ -1686,13 +1692,26 @@ fn emit_synthetic_session_ended(session_info: &SessionFileInfo, reason: SessionC
     }
 }
 
+/// Maximum number of dead sessions reclaimed per pruner run.
+///
+/// The pruner runs synchronously at session start; during the 2026-03-19
+/// incident 161 stale session files overwhelmed it. Excess entries are
+/// picked up by subsequent session starts.
+const PRUNE_BATCH_LIMIT: usize = 20;
+
+/// Maximum session file age. Sessions older than this are reclaimed even
+/// when their recorded PID appears alive (PID reuse, unparseable files).
+/// No legitimate session runs this long.
+const SESSION_FILE_TTL: std::time::Duration = std::time::Duration::from_secs(36 * 3600);
+
 /// Remove session files whose parent PID is dead.
 ///
 /// Dispatches full session.ended events through the event bus for each dead
 /// session. The event handler records to history, executes flows, and cleans
 /// up the session file.
 ///
-/// Does not query JJ for TTL — only checks process liveness.
+/// Batch-limited to `PRUNE_BATCH_LIMIT` dead sessions per run so a large
+/// backlog cannot block session startup for minutes; later starts catch up.
 pub fn prune_dead_pid_sessions() {
     let sessions_dir = global::global_sessions_dir();
 
@@ -1717,13 +1736,27 @@ pub fn prune_dead_pid_sessions() {
         .filter_map(|entry| parse_session_file(&entry.path()))
         .collect();
 
+    let mut pruned = 0usize;
+
     for session_info in &session_files {
+        if pruned >= PRUNE_BATCH_LIMIT {
+            debug_log(|| {
+                format!(
+                    "Prune batch limit ({}) reached; remaining sessions handled next start",
+                    PRUNE_BATCH_LIMIT
+                )
+            });
+            break;
+        }
+
         let pid_alive = match session_info.parent_pid {
             Some(pid) => system.process(Pid::from_u32(pid)).is_some(),
             None => true, // No PID = can't determine, treat as alive
         };
 
         if !pid_alive {
+            pruned += 1;
+
             // Recover any orphaned workspaces from the dead session
             if let Some(ref session_uuid) = session_info.session_id {
                 match isolation::recover_orphaned_workspaces(session_uuid) {
@@ -1746,6 +1779,136 @@ pub fn prune_dead_pid_sessions() {
             // records history, runs flows, and deletes the session file.
             emit_synthetic_session_ended(session_info, SessionCleanupReason::PidDead);
         }
+    }
+}
+
+/// Kill the agent process recorded in a session file (SIGKILL).
+///
+/// Used by the stale-worker watchdog when a live-but-stuck agent must be
+/// reaped. Returns Err when the session file or PID cannot be resolved.
+pub fn kill_session_process(session_uuid: &str) -> Result<()> {
+    let path = global::global_sessions_dir().join(session_uuid);
+    let info = parse_session_file(&path).ok_or_else(|| {
+        AikiError::Other(anyhow::anyhow!(
+            "No session file for '{}' — cannot kill",
+            session_uuid
+        ))
+    })?;
+    let pid = info.parent_pid.ok_or_else(|| {
+        AikiError::Other(anyhow::anyhow!(
+            "Session '{}' has no recorded PID — cannot kill",
+            session_uuid
+        ))
+    })?;
+
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    match system.process(Pid::from_u32(pid)) {
+        Some(process) => {
+            process.kill();
+            Ok(())
+        }
+        None => Ok(()), // Already dead — the goal state
+    }
+}
+
+/// End a session we know is dead or was just killed (stale worker):
+/// recover its workspaces (absorb-or-preserve), dispatch a synthetic
+/// session.ended, and enforce session-file removal as a backstop.
+pub fn end_dead_session(session_uuid: &str, reason: SessionCleanupReason) {
+    let _ = isolation::recover_orphaned_workspaces(session_uuid);
+    let path = global::global_sessions_dir().join(session_uuid);
+    if let Some(info) = parse_session_file(&path) {
+        emit_synthetic_session_ended(&info, reason);
+    }
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+    }
+}
+
+/// Reclaim session files older than `SESSION_FILE_TTL` regardless of PID
+/// state (PID reuse and unparseable files defeat the PID-based pruner).
+///
+/// SAFETY-ORDERING (isolation-02 correction to the original plan): a bare
+/// file delete would make the session look dead to the orphan sweep, which
+/// would then reclaim its workspace. Removal therefore ALWAYS routes through
+/// workspace recovery (absorb-or-preserve) before the session file goes away.
+pub fn cleanup_stale_sessions() {
+    let sessions_dir = global::global_sessions_dir();
+
+    if !sessions_dir.exists() {
+        return;
+    }
+
+    let entries = match fs::read_dir(&sessions_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut reclaimed = 0usize;
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        if reclaimed >= PRUNE_BATCH_LIMIT {
+            break;
+        }
+
+        let path = entry.path();
+        if !path.is_file() || path.extension().is_some() {
+            continue;
+        }
+
+        let age = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| m.elapsed().ok());
+
+        let expired = match age {
+            Some(age) => age > SESSION_FILE_TTL,
+            None => false, // Can't determine age — leave it alone
+        };
+        if !expired {
+            continue;
+        }
+
+        reclaimed += 1;
+
+        // The session uuid is the filename; use it even when the file
+        // content no longer parses (corrupt files must still be swept).
+        let uuid_from_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        match parse_session_file(&path) {
+            Some(info) => {
+                let uuid = info
+                    .session_id
+                    .clone()
+                    .unwrap_or_else(|| uuid_from_name.clone());
+                let _ = isolation::recover_orphaned_workspaces(&uuid);
+                emit_synthetic_session_ended(&info, SessionCleanupReason::TtlExpired);
+                // Backstop: the event path normally removes the file; if it
+                // did not (dispatch failure), enforce the TTL directly —
+                // recovery already ran above.
+                if path.exists() {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+            None => {
+                // Unparseable session file: recover by filename-uuid, then
+                // remove the file directly (no event can be synthesized).
+                if !uuid_from_name.is_empty() {
+                    let _ = isolation::recover_orphaned_workspaces(&uuid_from_name);
+                }
+                let _ = fs::remove_file(&path);
+            }
+        }
+
+        eprintln!(
+            "[aiki] Reclaimed stale session file {} (older than 36h)",
+            uuid_from_name
+        );
     }
 }
 
@@ -2296,6 +2459,41 @@ mod tests {
 
         // Session file should be gone
         assert!(!session_file.exists());
+    }
+
+    #[test]
+    fn test_cleanup_stale_sessions_removes_expired_keeps_fresh() {
+        let _lock = env_lock();
+        let (_repo_dir, _aiki_home, _guard) = setup_test_repo_with_global_inner();
+        // Point the workspace scan at an empty temp dir so recovery does not
+        // touch the real /tmp/aiki.
+        let ws_tmp = TempDir::new().unwrap();
+        let _ws_guard = EnvGuard::new(
+            "AIKI_WORKSPACES_DIR",
+            Some(&ws_tmp.path().to_string_lossy()),
+        );
+
+        let sessions_dir = global::global_sessions_dir();
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Stale (and unparseable — corrupt files must still be swept)
+        let stale = sessions_dir.join("stale-uuid-ttl");
+        fs::write(&stale, "not a valid session file").unwrap();
+        // Backdate mtime well past the 36h TTL
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600);
+        let times = std::fs::FileTimes::new().set_modified(old);
+        let f = std::fs::OpenOptions::new().write(true).open(&stale).unwrap();
+        f.set_times(times).unwrap();
+        drop(f);
+
+        // Fresh
+        let fresh = sessions_dir.join("fresh-uuid-ttl");
+        fs::write(&fresh, "also not valid").unwrap();
+
+        cleanup_stale_sessions();
+
+        assert!(!stale.exists(), "stale session file must be reclaimed");
+        assert!(fresh.exists(), "fresh session file must be kept");
     }
 
     #[test]

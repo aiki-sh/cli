@@ -128,6 +128,27 @@ Actions are the building blocks of flow handlers.
 | `stop` | Stop hook execution silently | `- stop: "Reason"` |
 | `block` | Block the editor operation (exit code 2) | `- block: "Dangerous command"` |
 | `session.end` | End the current session | `- session.end: "Task completed"` |
+| `mutex` | Run nested steps under a named repo lock | see [Concurrency](#concurrency) |
+
+### Concurrency
+
+The `mutex` statement acquires a named file lock for the current repo, runs
+its nested steps, and releases the lock on scope exit — even when a nested
+step fails. The lock is an OS-level `flock(2)` at
+`/tmp/aiki/<repo-id>/.<name>.lock`, so it serializes across processes and is
+released by the kernel if the process dies.
+
+```yaml
+session.started:
+  - mutex:
+      workspace-absorption:
+        - jj: new --ignore-working-copy
+```
+
+Use the `workspace-absorption` lock name to serialize with Aiki's workspace
+absorption (which holds the same lock internally). Other names create
+independent locks. Outside a JJ repo, or if the lock cannot be created, the
+steps run without the lock and a warning is printed.
 
 ### Shell and JJ Actions
 

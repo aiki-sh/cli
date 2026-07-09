@@ -504,7 +504,75 @@ fn spawn_and_discover(
     }
 }
 
+/// Threshold of transcript inactivity after which a live worker is
+/// considered stalled. Conservative: agents legitimately pause for long
+/// builds or large reads, but nothing healthy is silent for 5 minutes.
+pub(crate) const STALE_WORKER_THRESHOLD: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
+/// Kill a stalled worker and stop its task so it can be restarted.
+///
+/// - Kills the agent process (SIGKILL via the session file's PID)
+/// - Recovers the session's workspaces (partial work absorb-or-preserve)
+///   and dispatches a synthetic session.ended
+/// - Stops (NOT closes) the task — it returns to a restartable state
+/// - Returns `AikiError::StaleWorker` so the caller decides retry policy
+pub(crate) fn handle_stale_worker(
+    cwd: &Path,
+    task_id: &str,
+    session_id: &str,
+    idle: std::time::Duration,
+) -> Result<()> {
+    use crate::session::SessionCleanupReason;
+
+    eprintln!(
+        "[aiki] Worker stalled: no transcript activity for {}s. Killing session {}.",
+        idle.as_secs(),
+        &session_id[..session_id.len().min(8)]
+    );
+
+    if let Err(e) = crate::session::kill_session_process(session_id) {
+        eprintln!("[aiki] Warning: failed to kill stale worker: {}", e);
+    }
+
+    // Preserves partial work (workspace recovery) + records session end.
+    crate::session::end_dead_session(session_id, SessionCleanupReason::StaleWorker);
+
+    // Stop the task (no-op if it closed in the race window between the
+    // staleness check and the kill — Stopped on a Closed task is ignored
+    // by the graph).
+    let events = read_events(cwd)?;
+    let graph = materialize_graph(&events);
+    if let Some(task) = graph.tasks.get(task_id) {
+        if task.status != TaskStatus::Closed {
+            let stop_event = TaskEvent::Stopped {
+                task_ids: vec![task_id.to_string()],
+                reason: Some(format!(
+                    "Worker stalled: no activity for {}s. Session {} killed.",
+                    idle.as_secs(),
+                    &session_id[..session_id.len().min(8)]
+                )),
+                session_id: Some(session_id.to_string()),
+                turn_id: None,
+                timestamp: chrono::Utc::now(),
+            };
+            crate::tasks::storage::write_event(cwd, &stop_event)?;
+        }
+    }
+
+    Err(AikiError::StaleWorker {
+        task_id: task_id.to_string(),
+        session_id: session_id.to_string(),
+        idle_seconds: idle.as_secs(),
+    })
+}
+
 /// Poll until task reaches a terminal status (Closed).
+///
+/// Includes the stale-worker activity guard: if the session's transcript
+/// shows no activity for `STALE_WORKER_THRESHOLD`, the worker is killed,
+/// the task stopped, and `AikiError::StaleWorker` returned — otherwise this
+/// loop would wait forever on a live-but-stuck agent.
 fn wait_for_task_completion(cwd: &Path, task_id: &str, session_id: Option<&str>) -> Result<()> {
     use std::thread;
     use std::time::Duration;
@@ -529,6 +597,21 @@ fn wait_for_task_completion(cwd: &Path, task_id: &str, session_id: Option<&str>)
                 ));
                 println!("{}", md);
                 return Ok(());
+            }
+        }
+
+        // Activity guard: transcript freshness. None (transcript not yet
+        // created / unresolvable) skips the guard — never kill a worker
+        // that is still initializing.
+        if let Some(sid) = session_id {
+            if let Some(last_activity) = crate::commands::session::check_transcript_activity(sid)
+            {
+                let idle = chrono::Utc::now().signed_duration_since(last_activity);
+                if let Ok(idle) = idle.to_std() {
+                    if idle > STALE_WORKER_THRESHOLD {
+                        return handle_stale_worker(cwd, task_id, sid, idle);
+                    }
+                }
             }
         }
 

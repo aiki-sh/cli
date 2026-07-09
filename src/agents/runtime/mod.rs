@@ -96,14 +96,11 @@ impl MonitoredChild {
     pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
         self.child.wait()
     }
-}
 
-/// Test-only access to the underlying child: `MonitoredChild` has no Drop
-/// impl and no reap-on-drop contract, so lifecycle tests need an explicit
-/// kill for cleanup.
-#[cfg(test)]
-impl MonitoredChild {
-    pub(crate) fn kill(&mut self) -> std::io::Result<()> {
+    /// Kill the child process (SIGKILL). Used by the stale-worker watchdog
+    /// when a live-but-stuck agent must be reaped, and by lifecycle tests
+    /// for cleanup (`MonitoredChild` has no reap-on-drop contract).
+    pub fn kill(&mut self) -> std::io::Result<()> {
         self.child.kill()
     }
 }

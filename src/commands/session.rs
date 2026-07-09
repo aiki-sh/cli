@@ -351,6 +351,7 @@ fn run_list(
 ) -> Result<()> {
     agent.validate()?;
     let agent_types = agent.agent_types();
+    session::cleanup_stale_sessions();
     session::prune_dead_pid_sessions();
     let mut active_sessions = session::list_all_sessions()?;
 
@@ -647,6 +648,51 @@ fn run_show(id: &str) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Timestamp of the most recent transcript entry for a session, or None if
+/// the transcript is unresolvable, unreadable, or empty.
+///
+/// Both Claude Code and Codex write JSONL transcripts where every entry has
+/// a top-level ISO-8601 `"timestamp"` field, and the file grows
+/// monotonically — the last line's timestamp is the latest activity. This is
+/// the only *complete* activity signal: agents read files, search, and
+/// reason without ever firing an aiki hook.
+///
+/// Reads only the file tail (transcripts can be 100MB+).
+pub(crate) fn check_transcript_activity(
+    session_id: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let path = resolve_transcript_path(session_id).ok()?;
+    let last_line = read_last_nonempty_line(&path)?;
+    let json: serde_json::Value = serde_json::from_str(&last_line).ok()?;
+    let ts = json.get("timestamp")?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// Read the last non-empty line of a file by scanning a bounded tail chunk.
+fn read_last_nonempty_line(path: &std::path::Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const TAIL_BYTES: u64 = 64 * 1024;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    let start = len.saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(String::from)
 }
 
 /// Resolve the transcript file path for a session.
@@ -952,9 +998,13 @@ fn run_wait(
                         // Try to absorb the workspace
                         let workspace = crate::session::isolation::IsolatedWorkspace {
                             name: workspace_name.clone(),
-                            path: crate::session::isolation::workspaces_dir()
-                                .join(&repo_id)
-                                .join(session_id),
+                            // Layout v2: working copy at <container>/main
+                            // (legacy sessions: container root).
+                            path: crate::session::isolation::resolve_session_workspace_path(
+                                &crate::session::isolation::session_container_dir(
+                                    &repo_id, session_id,
+                                ),
+                            ),
                         };
                         match crate::session::isolation::absorb_workspace(
                             &repo_root, &workspace, None,
@@ -1150,5 +1200,39 @@ mod tests {
         let flags = SessionIdFlags::default();
         let result = resolve_effective_id(None, &flags);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_last_nonempty_line_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+
+        // Empty file → None
+        std::fs::write(&path, "").unwrap();
+        assert!(read_last_nonempty_line(&path).is_none());
+
+        // Trailing newline + blank lines are skipped
+        std::fs::write(
+            &path,
+            "{\"timestamp\":\"2026-07-08T10:00:00Z\"}\n{\"timestamp\":\"2026-07-08T10:05:00Z\"}\n\n",
+        )
+        .unwrap();
+        let last = read_last_nonempty_line(&path).unwrap();
+        assert!(last.contains("10:05:00"), "got {last}");
+
+        // Large file: only the tail is read, last line still found
+        let mut big = String::new();
+        for i in 0..20000 {
+            big.push_str(&format!("{{\"timestamp\":\"2026-07-08T09:{:02}:{:02}Z\"}}\n", i / 600 % 60, i % 60));
+        }
+        big.push_str("{\"timestamp\":\"2026-07-08T11:59:59Z\"}\n");
+        std::fs::write(&path, big).unwrap();
+        let last = read_last_nonempty_line(&path).unwrap();
+        assert!(last.contains("11:59:59"), "got {last}");
+
+        // Timestamp parses as RFC3339
+        let json: serde_json::Value = serde_json::from_str(&last).unwrap();
+        let ts = json.get("timestamp").unwrap().as_str().unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(ts).is_ok());
     }
 }

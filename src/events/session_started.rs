@@ -2,7 +2,7 @@ use super::prelude::*;
 use crate::global;
 use crate::history;
 use crate::repos;
-use crate::session::{prune_dead_pid_sessions, AikiSessionFile};
+use crate::session::{cleanup_stale_sessions, prune_dead_pid_sessions, AikiSessionFile};
 
 /// session.started event payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,15 +29,31 @@ pub fn handle_session_started(payload: AikiSessionStartPayload) -> Result<HookRe
         crate::plugins::clear_all_fetch_failed(&plugins_base);
     }
 
-    // Clean up sessions from crashed agents (PID-based)
+    // Clean up sessions from crashed agents: TTL backstop first (catches
+    // PID-reuse and unparseable files), then PID-based pruning.
+    cleanup_stale_sessions();
     prune_dead_pid_sessions();
 
     // Create session file for PID-based session detection
     // This preserves the parent_pid from the payload session
     // Session files are stored globally at $AIKI_HOME/sessions/
+    //
+    // A session without this file is orphaned-from-birth: the orphan sweep
+    // keys workspace liveness off $AIKI_HOME/sessions/<uuid>, so a missing
+    // file lets a concurrent sweep reap the session's workspace mid-flight.
+    // Retry once, and surface the failure loudly (workspace_ensure_isolated
+    // independently refuses to create a workspace without a session file).
     let session_file = AikiSessionFile::new(&payload.session);
-    if let Err(e) = session_file.create() {
-        debug_log(|| format!("Failed to create session file: {}", e));
+    if let Err(first_err) = session_file.create() {
+        debug_log(|| format!("Failed to create session file: {}", first_err));
+        if let Err(e) = session_file.create() {
+            eprintln!(
+                "[aiki] Warning: could not write session file for {}: {} — \
+                 workspace isolation will be disabled for this session",
+                payload.session.uuid(),
+                e
+            );
+        }
     }
 
     // Write repo ID to session file so find_session_by_repo works as a fallback

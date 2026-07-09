@@ -123,8 +123,20 @@ mod tests {
         // Should have change.completed handler
         assert!(!core.handlers.change_completed.is_empty());
 
-        // First statement is the write operation check (change.completed handles all operations)
+        // First statement is the mid-turn workspace snapshot (durable capture
+        // per file mutation — isolation-02 Phase 3).
         match &core.handlers.change_completed[0] {
+            HookStatement::Action(crate::flows::types::Action::Call(call)) => {
+                assert!(
+                    call.call.contains("workspace_snapshot_current"),
+                    "First change.completed statement should snapshot the workspace"
+                );
+            }
+            other => panic!("Expected snapshot call as first statement, got {:?}", other),
+        }
+
+        // Next statement is the write operation check (change.completed handles all operations)
+        match &core.handlers.change_completed[1] {
             HookStatement::If(write_if) => {
                 // Verify checks for write operation
                 assert!(

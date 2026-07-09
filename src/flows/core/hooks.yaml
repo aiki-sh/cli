@@ -14,7 +14,14 @@ session.started:
     # revert user filesystem changes (e.g. files moved in Finder).
     # User working-copy changes are captured later by the absorption's own
     # jj status snapshot (isolation.rs) before any rebase touches @.
-    - jj: new --ignore-working-copy
+    #
+    # Held under the workspace-absorption mutex: a jj new slipping between an
+    # absorption's step 1 (rebase ws chain onto @-) and step 2 (rebase @ onto
+    # ws head) creates a fresh @ forking from @-, stranding the workspace
+    # chain on a sibling branch. absorb_workspace holds the same named lock.
+    - mutex:
+        workspace-absorption:
+            - jj: new --ignore-working-copy
 
     # NOTE: auto-init was removed here in init-v2. Initialization is now an
     # explicit user action (`aiki init`), which also records the first-run
@@ -246,6 +253,13 @@ change.permission_asked:
 
 # change.completed: Record provenance metadata after file mutations (write, delete, move)
 change.completed:
+    # Durably capture the session workspace's on-disk state into the shared
+    # jj store on every mutation. Shrinks the unsnapshotted-loss window from
+    # a whole turn to a single tool call (critical for Codex, which skips
+    # per-tool `jj new`). No-op when the session has no isolated workspace.
+    - call: self.workspace_snapshot_current
+      on_failure: continue
+
     # Write operations: full provenance tracking with user edit detection
     - if: event.write
       then:
@@ -361,7 +375,11 @@ repo.changed:
                 All file reads, writes, and edits must use paths relative to {{ws_path}}.
                 IMPORTANT: Do NOT mention workspace isolation to the user. Work silently from the workspace without discussing it. The user should not need to think about it.
                 Main repo: {{cwd}}
-    - jj: new --ignore-working-copy
+    # Same race as session.started: jj new must not interleave with an
+    # in-flight absorption's two-step rebase.
+    - mutex:
+        workspace-absorption:
+            - jj: new --ignore-working-copy
 
 # session.ended: Handle actions when agent session ends
 # Session file cleanup is handled automatically by the event handler
@@ -381,6 +399,17 @@ session.ended:
                 Conflicted files:
                 {{absorb_result}}
                 Run `aiki resolve <change-id>` to resolve conflicts.
+
+    # Clean up empty changes left by lifecycle `jj new` calls (session start,
+    # per-edit provenance separation). Scoped to recent ancestry (perf on big
+    # repos), description-less changes only (deliberate empty markers keep
+    # their description), and never merges, the root, or @ itself (abandoning
+    # an empty @ just makes jj recreate one). Held under the absorption mutex
+    # so the rewrite cannot interleave with a concurrent absorb's rebases.
+    - mutex:
+        workspace-absorption:
+            - jj: abandon 'ancestors(@-, 100) & empty() & ~root() & ~merges() & description(exact:"")' --ignore-working-copy
+              on_failure: continue
 
 # ==============================================================================
 # Task Lifecycle Events
