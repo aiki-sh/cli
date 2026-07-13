@@ -191,7 +191,9 @@ pub fn handle_turn_completed(mut payload: AikiTurnCompletedPayload) -> Result<Ho
             payload.model.clone(),
             focused_task_id.clone(),
         ) {
-            debug_log(|| format!("Failed to record response: {}", e));
+            // Visible, not debug-only: a lost Response event silently drops the
+            // turn's tokens from history (the canonical per-task totals).
+            eprintln!("[aiki] Warning: Failed to record response: {}", e);
         }
 
         // Bridge this turn's tokens onto the focused task's denormalized rollup
@@ -204,7 +206,12 @@ pub fn handle_turn_completed(mut payload: AikiTurnCompletedPayload) -> Result<Ho
             if let Err(e) =
                 crate::tasks::token_rollup::record_turn_tokens(&payload.cwd, graph, focused, delta)
             {
-                debug_log(|| format!("Failed to bridge turn tokens onto task rollup: {}", e));
+                // Visible, not debug-only: a skipped rollup write permanently
+                // drifts `task.data["tokens"]` below the event-derived truth.
+                eprintln!(
+                    "[aiki] Warning: Failed to bridge turn tokens onto task rollup: {}",
+                    e
+                );
             }
         }
     }

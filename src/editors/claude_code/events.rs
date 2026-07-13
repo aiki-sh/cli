@@ -844,9 +844,35 @@ fn build_turn_completed_event(payload: StopPayload) -> AikiEvent {
     })
 }
 
+/// Whether a `type: "user"` transcript line is a genuine user prompt (a turn
+/// boundary) rather than mid-turn bookkeeping. Claude Code writes several
+/// user-typed line shapes that do NOT start a turn:
+///
+/// - **Tool results**: after every tool call, the result comes back as a user
+///   line whose content blocks carry `tool_result`.
+/// - **Meta lines** (`isMeta: true`): injected context, command echoes.
+/// - **Sidechain lines** (`isSidechain: true`): a subagent's conversation
+///   interleaved into the file; its prompts are not this turn's boundary.
+fn is_turn_boundary_user_entry(entry: &serde_json::Value) -> bool {
+    if entry.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
+        || entry.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
+    {
+        return false;
+    }
+    match entry.get("message").and_then(|m| m.get("content")) {
+        Some(serde_json::Value::String(_)) => true,
+        Some(serde_json::Value::Array(blocks)) => !blocks
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result")),
+        _ => false,
+    }
+}
+
 /// Parse Claude Code JSONL content into transcript entries.
 ///
-/// Resets on `"user"` entries so only the current (last) turn's entries are returned.
+/// Resets on genuine user prompts so only the current (last) turn's entries are
+/// returned. Tool results and meta/sidechain lines also arrive as `type: "user"`
+/// mid-turn and must not reset — see [`is_turn_boundary_user_entry`].
 fn parse_transcript_lines(content: &str) -> Vec<TranscriptEntry> {
     let mut entries: Vec<TranscriptEntry> = Vec::new();
 
@@ -862,9 +888,14 @@ fn parse_transcript_lines(content: &str) -> Vec<TranscriptEntry> {
 
         let entry_type = entry.get("type").and_then(|t| t.as_str());
 
-        // Reset on user entry so we only return entries from the current turn
+        // Reset only on a genuine user prompt. Tool results are also
+        // `type: "user"` lines; clearing on those would drop every API call
+        // before the turn's last tool result, under-counting a tool-use turn
+        // to just its final call.
         if entry_type == Some("user") {
-            entries.clear();
+            if is_turn_boundary_user_entry(&entry) {
+                entries.clear();
+            }
             continue;
         }
 
@@ -1328,9 +1359,12 @@ mod tests {
     #[test]
     fn test_golden_streaming_and_tool_use_fixture_parses() {
         // Drive the committed golden transcript through the real harness parser.
-        // Phase 0 (D2) asserts only structural facts that survive the A1
-        // snapshot-dedup fix — the exact per-bucket TokenUsage assertions land
-        // with the Phase 2 extractor change. See cli/tests/fixtures/tokens/.
+        // The fixture is a realistic single turn: streaming snapshot + finalized
+        // pair (msg_01A, deduped by id), then two more distinct calls, with the
+        // turn's tool_result USER lines interleaved between calls exactly as
+        // Claude Code writes them. Exact sums are load-bearing: the parser once
+        // cleared its accumulator on every user-typed line (tool_results
+        // included), which silently dropped all but the final call.
         let content =
             include_str!("../../../tests/fixtures/tokens/claude_streaming_and_tool_use.jsonl");
         let extract = TurnTranscript::from_entries(parse_transcript_lines(content));
@@ -1342,12 +1376,89 @@ mod tests {
         );
         assert_eq!(extract.model.as_deref(), Some("claude-opus-4-8"));
 
-        // Every disjoint bucket is exercised (the fixture carries a
-        // cache-creation pair plus cache-read on every call).
+        // Sum over msg_01A (finalized) + msg_02B + msg_03C.
         let tokens = extract.tokens.expect("fixture carries usage");
-        assert!(tokens.input > 0, "input present");
-        assert!(tokens.output > 0, "output present");
-        assert!(tokens.cache_read > 0, "cache_read present");
-        assert!(tokens.cache_created > 0, "cache_created present");
+        assert_eq!(tokens.input, 4 + 12000 + 12500);
+        assert_eq!(tokens.output, 178 + 95 + 210);
+        assert_eq!(tokens.cache_read, 8693 + 16915 + 17000);
+        assert_eq!(tokens.cache_created, 16911);
+        assert_eq!(tokens.total(), 84_506);
+    }
+
+    #[test]
+    fn test_extract_tool_result_user_entries_do_not_reset() {
+        // Real turn shape: prompt → assistant tool_use → USER tool_result →
+        // assistant tool_use → USER tool_result → assistant end_turn. The
+        // tool_result carriers are `type: "user"` but are NOT turn boundaries;
+        // all three API calls must sum. Regression guard: the parser used to
+        // clear on every user line, keeping only the final call (a 78-96%
+        // under-count measured on real tool-heavy sessions).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = [
+            r#"{"type":"user","message":{"content":"Fix the bug"}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_a","model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}],"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"user","message":{"content":[{"tool_use_id":"t1","type":"tool_result","content":"file contents"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_b","model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t2","name":"Edit","input":{}}],"usage":{"input_tokens":200,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"user","message":{"content":[{"tool_use_id":"t2","type":"tool_result","content":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_c","model":"claude-opus-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"Fixed."}],"usage":{"input_tokens":300,"output_tokens":30,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, content).unwrap();
+
+        let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
+        assert_eq!(extract.response, "Fixed.");
+        let tokens = extract.tokens.unwrap();
+        assert_eq!(tokens.input, 600);
+        assert_eq!(tokens.output, 60);
+    }
+
+    #[test]
+    fn test_extract_meta_and_sidechain_user_entries_do_not_reset() {
+        // `isMeta` user lines (injected context) and `isSidechain` user lines
+        // (subagent prompts) are not turn boundaries even when their content is
+        // a plain string.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = [
+            r#"{"type":"user","message":{"content":"Do the thing"}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_a","model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}],"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"user","isMeta":true,"message":{"content":"<system-reminder>injected context</system-reminder>"}}"#,
+            r#"{"type":"user","isSidechain":true,"message":{"content":"You are a subagent, search for X"}}"#,
+            r#"{"type":"user","message":{"content":[{"tool_use_id":"t1","type":"tool_result","content":"done"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_b","model":"claude-opus-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":200,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, content).unwrap();
+
+        let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
+        assert_eq!(extract.response, "Done.");
+        let tokens = extract.tokens.unwrap();
+        assert_eq!(tokens.input, 300);
+        assert_eq!(tokens.output, 30);
+    }
+
+    #[test]
+    fn test_extract_genuine_prompt_still_resets_after_tool_results() {
+        // A genuine next prompt (string content, no meta flags) after a
+        // tool-use turn must still reset: only the last turn's calls count.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = [
+            r#"{"type":"user","message":{"content":"First request"}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_a","model":"claude-opus-4-6","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Read","input":{}}],"usage":{"input_tokens":1000,"output_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"user","message":{"content":[{"tool_use_id":"t1","type":"tool_result","content":"data"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_b","model":"claude-opus-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"First done."}],"usage":{"input_tokens":2000,"output_tokens":200,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            r#"{"type":"user","message":{"content":"Second request"}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_c","model":"claude-opus-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"Second done."}],"usage":{"input_tokens":50,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, content).unwrap();
+
+        let extract = TurnTranscript::parse(path.to_str().unwrap(), parse_transcript_lines);
+        assert_eq!(extract.response, "Second done.");
+        let tokens = extract.tokens.unwrap();
+        assert_eq!(tokens.input, 50);
+        assert_eq!(tokens.output, 5);
     }
 }
