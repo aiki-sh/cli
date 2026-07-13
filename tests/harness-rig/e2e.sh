@@ -15,11 +15,16 @@ RIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$RIG_DIR/../../.." && pwd)"
 PROFILE="$RIG_DIR/harnesses/$HARNESS.sh"
 RUNTIME="${RUNTIME:-container}"
-# Default filter: per-harness provenance, or the cross-agent suite for `multi`.
+# Default filter: the FULL per-harness suite (certification), or the cross-agent
+# suite for `multi`. Running the whole `e2e_<harness>_*` set is what makes a green
+# run a certification: every capability the harness declares (provenance, gate,
+# tokens, context injection, isolation) is exercised. Narrow with TESTFILTER for
+# a single test. (Was `e2e_<harness>_provenance` — provenance-only, which certified
+# only the Drive axis; see cli/tests/e2e/certification.rs.)
 if [ "$HARNESS" = "multi" ]; then
   TESTFILTER="${TESTFILTER:-e2e_multi}"
 else
-  TESTFILTER="${TESTFILTER:-e2e_${HARNESS}_provenance}"
+  TESTFILTER="${TESTFILTER:-e2e_${HARNESS}}"
 fi
 
 [ -f "$PROFILE" ] || { echo "no profile: $PROFILE"; exit 1; }

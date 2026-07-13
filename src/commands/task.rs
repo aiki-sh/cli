@@ -21,6 +21,9 @@ pub enum TaskOutputFormat {
     Id,
     /// Task summary/completion comment only
     Summary,
+    /// Rolled-up billed-token total for the task (the denormalized
+    /// `data["tokens"]` rollup); prints `0` when no turns have been attributed.
+    Tokens,
 }
 
 /// Bundled filter criteria for `run_list`.
@@ -4544,6 +4547,20 @@ fn run_show(
     }
 
     let task = tasks.get(&task_id).expect("Task should exist");
+
+    // If --output tokens, print the task's rolled-up billed-token total. Reads
+    // the same denormalized `data["tokens"]` the build TUI / run summary use, so
+    // it is a real consumer-path readout of token attribution (used by the
+    // certification e2e to prove a driven harness attributes tokens to its task).
+    if matches!(output_format, Some(TaskOutputFormat::Tokens)) {
+        let tokens = task
+            .data
+            .get(crate::tasks::token_rollup::TOKENS_DATA_KEY)
+            .map(String::as_str)
+            .unwrap_or("0");
+        println!("{tokens}");
+        return Ok(());
+    }
 
     // If --output summary, print task summary only (closed tasks only)
     if matches!(output_format, Some(TaskOutputFormat::Summary)) {

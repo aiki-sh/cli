@@ -9,6 +9,14 @@
 //! Run all e2e tests:  `cargo test --test e2e -- --ignored`
 //! Run one suite:      `cargo test --test e2e -- --ignored provenance`
 //!
+//! Certification: `certification.rs` makes a green rig run a *harness-support
+//! certification* — for a drivable harness, every capability its
+//! `HarnessDefinition` declares (drive/isolation, `[aiki]` provenance, policy
+//! gating, token attribution, context injection) is exercised live. Its
+//! `capability_coverage_is_complete` guard is a NORMAL (non-`#[ignore]`) test:
+//! it fails a plain `cargo test` if a declared capability has no live test. See
+//! that file and `cli/tests/harness-rig/README.md`.
+//!
 //! Isolation: every `aiki` invocation in a test MUST go through
 //! [`common::e2e_aiki`] (pure-aiki steps) or [`common::e2e_aiki_agent`]
 //! (steps that spawn a live agent). These share one hermetic `AIKI_HOME` per
@@ -18,6 +26,7 @@
 //! `Command::cargo_bin("aiki")` directly here; it would resolve the real
 //! `~/.aiki` and reintroduce that flake.
 
+mod certification;
 mod isolation_recovery;
 mod multi_agent;
 mod provenance;

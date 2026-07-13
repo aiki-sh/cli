@@ -10,9 +10,10 @@ runtime (no Docker Desktop); the same Dockerfiles + run flags also work with
   hook-replay tests. See [Capture rig](#capture-rig).
 - **Live e2e rig** (`e2e.sh` + `Dockerfile.e2e`): compiles aiki for Linux and
   runs the real `#[ignore]` e2e tests (`cli/tests/e2e/`) against the actual agent
-  in an isolated container, asserting end-to-end aiki behaviour (session
-  discovery, task lifecycle, workspace isolation, `[aiki]` provenance). See
-  [Live e2e rig](#live-e2e-rig).
+  in an isolated container. A green run is a **capability certification**: every
+  aiki capability the harness declares in its `HarnessDefinition` (drive/isolation,
+  `[aiki]` provenance, policy gating, token attribution, context injection) is
+  exercised end-to-end. See [Live e2e rig](#live-e2e-rig).
 
 The isolation unit is `$HOME`: every harness writes config/sessions/auth there
 and `aiki init` injects hooks into the same dirs, so each run gets its own
@@ -49,9 +50,16 @@ payloads), this asserts actual aiki behaviour end to end.
 
 | Config | Agents installed | Runs |
 |---|---|---|
-| `claude` | claude only | `e2e_claude_*` (provenance, task-diff, session/thread, lifecycle) |
+| `claude` | claude only | `e2e_claude_*` — the full certification: provenance, task-diff, session/thread, lifecycle, isolation-recovery, **gate**, **tokens**, **context injection** |
 | `codex`  | codex only  | `e2e_codex_*` (same set; codex acts as its own coder/reviewer) |
 | `multi`  | claude **and** codex | `e2e_multi_*` cross-agent handoffs (e.g. claude builds, codex reviews) |
+
+`e2e.sh <config>` runs the WHOLE `e2e_<config>_*` set by default, because the
+certification only holds when every declared capability is exercised. The
+non-live guard `capability_coverage_is_complete` (in
+`cli/tests/e2e/certification.rs`, runs under a plain `cargo test`) fails the build
+if a drivable harness declares a capability that no live test certifies — so
+"green rig run ⇒ fully supported" cannot silently regress.
 
 Single-agent configs validate one harness in isolation. The `multi` config exists
 for genuinely cross-agent workflows that a one-agent image structurally cannot
@@ -74,12 +82,32 @@ The first build per config compiles aiki and is slow (~5 min on the 16GB
 builder); switching the agent CLI afterward only rebuilds the thin install layer.
 `set -e` means a broken build never wastes a live API call.
 
-### What it asserts (single-agent provenance test)
+### What it certifies (per capability)
 
-1. `aiki run <task>` spawns the real agent, which creates a file and closes the task.
-2. The session UUID is discovered (the agent's `SessionStart` hook fired).
-3. The task is closed, and the file is present in jj history.
-4. An `[aiki]` provenance change carries `task=<id>`.
+Each capability the harness's `HarnessDefinition` declares maps to a live test
+(see `cli/tests/e2e/certification.rs`, and the two-axis model in
+`ops/now/harnesses/00-overview.md`):
+
+1. **Drive + per-change provenance** (`e2e_<h>_provenance_*`): `aiki run <task>`
+   spawns the real agent, which creates a file and closes the task; the session
+   UUID is discovered (the `SessionStart` hook fired); the file is in jj history;
+   an `[aiki]` change carries `task=<id>`.
+2. **Workspace isolation + recovery** (`e2e_<h>_*` in `isolation_recovery.rs`):
+   crash recovery, concurrent absorption, stale-worker watchdog.
+3. **Gate** (`e2e_<h>_gate_blocks_protected_change`): a `.aiki/hooks.yml` deny
+   policy actually STOPS the real agent from writing a protected path — the first
+   live proof `supports_blocking: true` is enforced. Codex normalizes every
+   `PreToolUse` (incl. `apply_patch`) to a shell ask, so the policy denies on both
+   the `change` and `shell` channels.
+4. **Tokens** (`e2e_<h>_tokens_attributed_to_task`): after a run, the task's
+   rolled-up `data["tokens"]` (via `aiki task show -o tokens`) is non-zero.
+5. **Context injection** (`e2e_<h>_context_injected`): a marker aiki injects at
+   `session.started` — present nowhere in the task prompt — ends up in a file the
+   agent wrote, proving the injected context reached and was consumed.
+
+The gate and injection tests each include a deterministic self-check (they drive
+`aiki hooks stdin` with a synthetic native payload and assert the policy fires)
+so a silently-broken policy fails loudly instead of masquerading as a pass.
 
 Note the provenance mechanism differs by harness: claude records it inline via a
 `PostToolUse` hook; **codex** has no such hook and records out-of-band via an OTel

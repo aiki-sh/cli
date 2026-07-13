@@ -7,7 +7,7 @@ use tempfile::tempdir;
 
 #[test]
 #[ignore] // e2e: requires claude binary + API key
-fn e2e_claude_provenance_on_trivial_change() {
+pub(crate) fn e2e_claude_provenance_on_trivial_change() {
     if !jj_available() {
         eprintln!("Skipping: jj not available");
         return;
@@ -57,7 +57,7 @@ fn e2e_claude_provenance_on_trivial_change() {
 
 #[test]
 #[ignore] // e2e: requires codex binary + API key
-fn e2e_codex_provenance_on_trivial_change() {
+pub(crate) fn e2e_codex_provenance_on_trivial_change() {
     if !jj_available() {
         eprintln!("Skipping: jj not available");
         return;
