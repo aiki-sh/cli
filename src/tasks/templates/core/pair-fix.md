@@ -1,5 +1,5 @@
 ---
-version: 3.0.0
+version: 3.1.0
 type: fix
 ---
 
@@ -29,8 +29,9 @@ Walk through each issue below **one at a time**, starting with the highest sever
 6. **Act immediately** on the user's choice:
    - For **Fix**:
      - If approaches were presented, include the chosen approach in the subtask description so the subagent knows which path to take
-     - Always create a subtask and delegate it via `aiki run <subtask-id> --async` so the conversation continues while the fix runs in the background
-     - Briefly report that the fix was delegated, then move directly to the next issue without asking for another confirmation
+     - **Serialize fixes that touch the same file**: before delegating, check whether this fix will edit any file that an already-delegated, still-running fix also edits. If it will, create the subtask but link it with `aiki task link <subtask-id> --depends-on <in-flight-subtask-id>` and do NOT run it yet — concurrent agents editing the same file clobber each other's changes when their workspaces are absorbed, and produce merge conflicts. You will delegate it from the wait loop (step 8) once its dependency completes.
+     - Otherwise, create the subtask and delegate it via `aiki run <subtask-id> --async` so the conversation continues while the fix runs in the background
+     - Briefly report that the fix was delegated (or queued behind the fix it depends on), then move directly to the next issue without asking for another confirmation
    - For **Plan**:
      - Write a concise fix plan for the issue
      - The plan should cover the problem, affected files, intended change, dependencies, and verification steps
@@ -57,9 +58,10 @@ Walk through each issue below **one at a time**, starting with the highest sever
       ```bash
       aiki session wait <id1> <id2> <id3> --any
       ```
-   3. When one returns, report its result to the user, restart the heartbeat, and repeat with the remaining IDs
-   4. On each heartbeat, give a brief status update (e.g., "Still waiting on 2 fixes: `<id1>`, `<id2>`")
-   5. Repeat until all delegated fixes have completed or failed
+   3. When one returns, report its result to the user; if a queued fix was waiting on it (linked with `--depends-on` in step 6), delegate that fix now via `aiki run <id> --async` and add its session to the wait set
+   4. Restart the heartbeat and repeat with the remaining IDs
+   5. On each heartbeat, give a brief status update (e.g., "Still waiting on 2 fixes: `<id1>`, `<id2>`")
+   6. Repeat until all delegated and queued fixes have completed or failed
 
 When all issues are addressed, summarize:
 - N issues fixed

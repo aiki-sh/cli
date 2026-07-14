@@ -409,7 +409,7 @@ fn merge_claude_hooks(settings: &mut serde_json::Value) -> Result<usize> {
     let claude_hooks: [(&str, &str, u64); 7] = [
         ("SessionStart", "", 10),
         ("PreCompact", "", 10),
-        ("UserPromptSubmit", "", 5),
+        ("UserPromptSubmit", "", 10),
         ("PreToolUse", tool_matcher, 5),
         ("PostToolUse", tool_matcher, 5),
         ("Stop", "", 5),
@@ -1441,6 +1441,28 @@ mod tests {
             1,
             "exactly one aiki entry"
         );
+    }
+
+    #[test]
+    fn claude_install_upgrades_user_prompt_submit_timeout() {
+        let mut settings = json!({
+            "hooks": {
+                "UserPromptSubmit": [{
+                    "matcher": "",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "aiki hooks stdin --claude UserPromptSubmit",
+                        "timeout": 5
+                    }]
+                }]
+            }
+        });
+
+        merge_claude_hooks(&mut settings).unwrap();
+
+        let entries = settings["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "the old aiki entry must be replaced");
+        assert_eq!(entries[0]["hooks"][0]["timeout"].as_u64(), Some(10));
     }
 
     #[test]

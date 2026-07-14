@@ -118,6 +118,34 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn staged_plugins_pass_install_validation() {
+        // Every non-`_`/`.` directory under the monorepo's `plugins/` is
+        // auto-published as an installable repo (publish-subtrees.yml), and
+        // the installer rejects any clone whose root fails `load_manifest`
+        // (the single validation point in `deps::install_single`). Sweep the
+        // staged dirs so a manifest-less plugin can't ship again — herdr
+        // shipped uninstallable exactly this way.
+        let staged = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&staged).expect("read staged plugins/ dir") {
+            let path = entry.expect("read dir entry").path();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            if !path.is_dir() || name.starts_with('_') || name.starts_with('.') {
+                continue; // publish-subtrees.yml skips these
+            }
+            if let Err(e) = load_manifest(&path) {
+                panic!("plugins/{name} would be uninstallable once published: {e}");
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no staged plugins found under {}", staged.display());
+    }
+
+    #[test]
     fn test_parse_full_manifest() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(
