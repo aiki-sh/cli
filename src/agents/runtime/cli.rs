@@ -15,6 +15,73 @@ use super::AgentType;
 use crate::error::{AikiError, Result};
 use crate::harnesses::definition::HarnessDefinition;
 use crate::harnesses::runtime::{CliArgs, RuntimeEnv, RuntimeKind};
+use crate::utils::quarantine::{self, QuarantineStatus};
+use crate::utils::sanitize::sanitize_field;
+
+/// What the quarantine pre-flight should do before a spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreflightAction {
+    /// No warning, no error — build the command and exec.
+    Proceed,
+    /// Well-formed pending xattr: warn (the first launch may hang behind a
+    /// Gatekeeper dialog) and proceed.
+    WarnPending,
+    /// Attribute present but uninterpretable: soft-warn and ALWAYS proceed —
+    /// a failed detection must never hard-block a spawn.
+    WarnUndetermined,
+    /// Well-formed pending xattr with nobody to approve the dialog: fail
+    /// before any exec instead of hanging to the discovery timeout.
+    FailQuarantined,
+}
+
+/// The status × mode → warn/error/proceed decision, shared by all three spawn
+/// methods. Pure so the full product is unit-testable.
+///
+/// `headless` comes from [`super::is_headless`] (stdout TTY-ness +
+/// `SSH_CONNECTION`; stderr state is deliberately irrelevant). `skip_hard_fail`
+/// is the `AIKI_SKIP_QUARANTINE_CHECK` escape hatch: it downgrades only the
+/// headless fail-fast to a warning, never silences warnings.
+fn preflight_action(
+    status: &QuarantineStatus,
+    headless: bool,
+    skip_hard_fail: bool,
+) -> PreflightAction {
+    match status {
+        QuarantineStatus::NotQuarantined | QuarantineStatus::Approved => PreflightAction::Proceed,
+        QuarantineStatus::Pending { .. } if headless && !skip_hard_fail => {
+            PreflightAction::FailQuarantined
+        }
+        QuarantineStatus::Pending { .. } => PreflightAction::WarnPending,
+        QuarantineStatus::Undetermined { .. } => PreflightAction::WarnUndetermined,
+        // A failure to detect must never block (or noise up) a spawn.
+        QuarantineStatus::CheckFailed { .. } => PreflightAction::Proceed,
+    }
+}
+
+fn pending_warning(agent: &str) -> String {
+    format!(
+        "[aiki] Warning: {agent} is quarantined by macOS Gatekeeper.\n\
+         [aiki] The first launch may hang behind a system confirmation dialog.\n\
+         [aiki] Approve the dialog if one appears, or run: aiki doctor --fix --quarantined --{agent}"
+    )
+}
+
+fn undetermined_warning(agent: &str, raw: &str) -> String {
+    format!(
+        "[aiki] Warning: {agent} carries a macOS quarantine attribute aiki could not interpret ({}).\n\
+         [aiki] If the first launch hangs behind a Gatekeeper dialog, approve it or run: \
+         aiki doctor --fix --quarantined --{agent}",
+        sanitize_field(raw)
+    )
+}
+
+/// Route a warning through the caller's sink, falling back to stderr.
+fn emit_warning(options: &AgentSpawnOptions, msg: &str) {
+    match &options.warn {
+        Some(sink) => sink.emit(msg),
+        None => eprintln!("{msg}"), // stderr-ok: pre-spawn warning fallback
+    }
+}
 
 pub struct CliAgentRuntime {
     binary: PathBuf,
@@ -42,6 +109,52 @@ impl CliAgentRuntime {
         })
     }
 
+    /// The agent name used in quarantine messages and `aiki doctor` fix
+    /// commands: the doctor scope flag (`claude`, `codex`) when the agent has
+    /// one, else the harness label.
+    fn quarantine_agent_name(&self) -> &str {
+        self.agent_type.doctor_flag().unwrap_or(self.label)
+    }
+
+    /// Quarantine pre-flight shared by all three spawn methods, run before the
+    /// command is built. Quarantine only affects the FIRST exec of a binary,
+    /// so spawn time is the only place detection is needed (per-jj-command
+    /// spawns and the stale-worker watchdog are deliberately not checked).
+    ///
+    /// Returns `Err(BinaryQuarantined)` only for a well-formed `Pending` xattr
+    /// in headless mode — where the Gatekeeper dialog can never be approved,
+    /// failing fast beats spawning a child guaranteed to hang to the discovery
+    /// timeout. The error originates here rather than in `from_harness` so it
+    /// propagates through the existing spawn error plumbing (and cannot be
+    /// swallowed by `get_runtime`'s `Option` shape).
+    fn quarantine_preflight(&self, options: &AgentSpawnOptions) -> Result<()> {
+        let status = quarantine::check(&self.binary);
+        let headless = super::is_headless();
+        let skip_hard_fail = std::env::var("AIKI_SKIP_QUARANTINE_CHECK")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+        let agent = self.quarantine_agent_name();
+        match preflight_action(&status, headless, skip_hard_fail) {
+            PreflightAction::Proceed => Ok(()),
+            PreflightAction::WarnPending => {
+                emit_warning(options, &pending_warning(agent));
+                Ok(())
+            }
+            PreflightAction::WarnUndetermined => {
+                let raw = match &status {
+                    QuarantineStatus::Undetermined { raw } => raw.as_str(),
+                    _ => "",
+                };
+                emit_warning(options, &undetermined_warning(agent, raw));
+                Ok(())
+            }
+            PreflightAction::FailQuarantined => Err(AikiError::BinaryQuarantined {
+                agent: agent.to_string(),
+                path: self.binary.clone(),
+            }),
+        }
+    }
+
     fn build_command(&self, options: &AgentSpawnOptions, mode: &str) -> Command {
         let args = (self.args_fn)(options);
         let mut cmd = Command::new(&self.binary);
@@ -61,6 +174,7 @@ impl CliAgentRuntime {
 
 impl AgentRuntime for CliAgentRuntime {
     fn spawn_blocking(&self, options: &AgentSpawnOptions) -> Result<AgentSessionResult> {
+        self.quarantine_preflight(options)?;
         let mut cmd = self.build_command(options, "background");
         match cmd.output() {
             Ok(output) => {
@@ -88,6 +202,7 @@ impl AgentRuntime for CliAgentRuntime {
     }
 
     fn spawn_background(&self, options: &AgentSpawnOptions) -> Result<BackgroundHandle> {
+        self.quarantine_preflight(options)?;
         let mut cmd = self.build_command(options, "background");
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -110,6 +225,7 @@ impl AgentRuntime for CliAgentRuntime {
     }
 
     fn spawn_monitored(&self, options: &AgentSpawnOptions) -> Result<MonitoredChild> {
+        self.quarantine_preflight(options)?;
         let mut cmd = self.build_command(options, "monitored");
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -244,6 +360,73 @@ mod tests {
         CliAgentRuntime::from_harness(def).expect("sh should resolve via which");
     }
 
+    // ── Quarantine pre-flight decision table (test matrix row (a)) ──
+    //
+    // The full status × headless × skip product for the ONE pure decision
+    // function all three spawn methods share. Run-mode inputs arrive as a
+    // plain bool here; consumer-path tests set the mode at the real boundary
+    // (piped stdout). Stderr state plays no part by construction — the
+    // function never sees it.
+
+    #[test]
+    fn preflight_decision_table_full_product() {
+        use PreflightAction::*;
+        let pending = QuarantineStatus::Pending {
+            raw: "0083;0;t;u".into(),
+        };
+        let undetermined = QuarantineStatus::Undetermined { raw: "??".into() };
+        let check_failed = QuarantineStatus::CheckFailed { errno: 13 };
+
+        // (status, headless, skip_hard_fail) → expected
+        let table = [
+            (&QuarantineStatus::NotQuarantined, false, false, Proceed),
+            (&QuarantineStatus::NotQuarantined, true, false, Proceed),
+            (&QuarantineStatus::NotQuarantined, false, true, Proceed),
+            (&QuarantineStatus::NotQuarantined, true, true, Proceed),
+            (&QuarantineStatus::Approved, false, false, Proceed),
+            (&QuarantineStatus::Approved, true, false, Proceed),
+            (&QuarantineStatus::Approved, false, true, Proceed),
+            (&QuarantineStatus::Approved, true, true, Proceed),
+            (&pending, false, false, WarnPending),
+            (&pending, true, false, FailQuarantined),
+            // Escape hatch downgrades ONLY the headless hard failure.
+            (&pending, true, true, WarnPending),
+            (&pending, false, true, WarnPending),
+            // Undetermined never hard-fails, in either mode.
+            (&undetermined, false, false, WarnUndetermined),
+            (&undetermined, true, false, WarnUndetermined),
+            (&undetermined, false, true, WarnUndetermined),
+            (&undetermined, true, true, WarnUndetermined),
+            // CheckFailed proceeds silently in both modes.
+            (&check_failed, false, false, Proceed),
+            (&check_failed, true, false, Proceed),
+            (&check_failed, false, true, Proceed),
+            (&check_failed, true, true, Proceed),
+        ];
+        for (status, headless, skip, expected) in table {
+            assert_eq!(
+                preflight_action(status, headless, skip),
+                expected,
+                "status={status:?} headless={headless} skip={skip}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_warning_names_agent_and_fix_command() {
+        let msg = pending_warning("claude");
+        assert!(msg.contains("claude is quarantined by macOS Gatekeeper"));
+        assert!(msg.contains("aiki doctor --fix --quarantined --claude"));
+    }
+
+    #[test]
+    fn undetermined_warning_sanitizes_untrusted_raw_value() {
+        let msg = undetermined_warning("codex", "evil\x1b[2J\nvalue");
+        assert!(msg.contains("\\x1b[2J\\nvalue"), "raw must render escaped: {msg}");
+        assert!(!msg.contains('\x1b'), "no raw ESC may reach the terminal");
+        assert!(msg.contains("aiki doctor --fix --quarantined --codex"));
+    }
+
     // ── Spawn lifecycle tests against fake binaries (B4/B5) ──
 
     #[cfg(unix)]
@@ -278,6 +461,100 @@ mod tests {
     fn fake_options(dir: &std::path::Path) -> AgentSpawnOptions {
         use crate::tasks::lanes::ThreadId;
         AgentSpawnOptions::new(dir, ThreadId::single("task123".to_string()))
+    }
+
+    /// One test (not several) because the env seams are process-global and
+    /// tests run concurrently; the forced status is path-scoped to this
+    /// test's unique fake binary so concurrent spawn tests are unaffected.
+    /// Interactive mode cannot be forced in-process (stdout's TTY-ness is
+    /// real); the pure decision table covers it.
+    #[test]
+    #[cfg(unix)]
+    fn spawn_methods_honor_forced_quarantine_status() {
+        use crate::agents::runtime::WarnSink;
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = write_fake_binary(tmp.path(), "fake-agent", "#!/bin/sh\nexit 0\n");
+        fn args(_: &AgentSpawnOptions) -> CliArgs {
+            CliArgs::new()
+        }
+        let runtime = fake_runtime(bin.clone(), args);
+        let options = fake_options(tmp.path());
+
+        // Force headless deterministically: SSH_CONNECTION classifies headless
+        // regardless of whether this test process's stdout is a TTY. Left set:
+        // every other preflight in this process resolves NotQuarantined for
+        // its own path and proceeds in either mode.
+        std::env::set_var("SSH_CONNECTION", "aiki-test");
+
+        // Pending + headless: all three spawn methods fail fast with the
+        // typed error, before any exec.
+        std::env::set_var(
+            "AIKI_TEST_QUARANTINE_STATUS",
+            format!("pending:{}", bin.display()),
+        );
+        match runtime.spawn_blocking(&options) {
+            Err(AikiError::BinaryQuarantined { agent, path }) => {
+                assert_eq!(path, bin);
+                // Unknown agent type has no doctor flag; falls back to label.
+                assert_eq!(agent, "fake");
+            }
+            other => panic!("spawn_blocking: expected BinaryQuarantined, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                runtime.spawn_background(&options),
+                Err(AikiError::BinaryQuarantined { .. })
+            ),
+            "spawn_background must fail fast on pending + headless"
+        );
+        assert!(
+            matches!(
+                runtime.spawn_monitored(&options).map(|_| ()),
+                Err(AikiError::BinaryQuarantined { .. })
+            ),
+            "spawn_monitored must fail fast on pending + headless"
+        );
+
+        // Undetermined: warn through the wired sink and PROCEED.
+        std::env::set_var(
+            "AIKI_TEST_QUARANTINE_STATUS",
+            format!("undetermined:{}", bin.display()),
+        );
+        let warnings: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink_warnings = Arc::clone(&warnings);
+        let with_sink = options.clone().with_warn_sink(WarnSink::new(move |msg| {
+            sink_warnings.lock().unwrap().push(msg.to_string());
+        }));
+        runtime
+            .spawn_blocking(&with_sink)
+            .expect("undetermined must never hard-fail");
+        let seen = warnings.lock().unwrap().join("\n");
+        assert!(
+            seen.contains("could not interpret"),
+            "undetermined warning must flow through the warn sink, got: {seen}"
+        );
+
+        // CheckFailed: silent proceed — no warning, no error.
+        std::env::set_var(
+            "AIKI_TEST_QUARANTINE_STATUS",
+            format!("checkfailed:{}", bin.display()),
+        );
+        warnings.lock().unwrap().clear();
+        let sink_warnings = Arc::clone(&warnings);
+        let with_sink = options.clone().with_warn_sink(WarnSink::new(move |msg| {
+            sink_warnings.lock().unwrap().push(msg.to_string());
+        }));
+        runtime
+            .spawn_blocking(&with_sink)
+            .expect("checkfailed must never block a spawn");
+        assert!(
+            warnings.lock().unwrap().is_empty(),
+            "checkfailed must proceed silently"
+        );
+
+        std::env::remove_var("AIKI_TEST_QUARANTINE_STATUS");
     }
 
     #[test]

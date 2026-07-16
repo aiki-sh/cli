@@ -114,10 +114,20 @@ enum Commands {
         force: bool,
     },
     /// Diagnose and fix configuration issues
+    #[command(override_usage = "aiki doctor [--fix] [--claude] [--codex]\n       aiki doctor --fix --quarantined [--<agent>]")]
     Doctor {
         /// Automatically fix detected issues
         #[arg(long)]
         fix: bool,
+        /// Scope to Claude Code checks only (skips repo-wide checks and mutations)
+        #[arg(long)]
+        claude: bool,
+        /// Scope to Codex checks only (skips repo-wide checks and mutations)
+        #[arg(long)]
+        codex: bool,
+        /// Authorize stripping macOS quarantine attributes (valid form: aiki doctor --fix --quarantined [--<agent>])
+        #[arg(long, requires = "fix")]
+        quarantined: bool,
     },
     /// Manage plugins (install, update, list, remove)
     Plugin {
@@ -425,7 +435,19 @@ fn run() -> Result<()> {
     match cli.command {
         Commands::Init { quiet } => commands::init::run(quiet),
         Commands::Remove { shared, global, force } => commands::remove::run(shared, global, force),
-        Commands::Doctor { fix } => commands::doctor::run(fix),
+        Commands::Doctor {
+            fix,
+            claude,
+            codex,
+            quarantined,
+        } => commands::doctor::run(
+            fix,
+            commands::doctor::DoctorScope {
+                claude,
+                codex,
+                fix_quarantined: quarantined,
+            },
+        ),
         Commands::Plugin { command } => commands::plugin::run(command),
         Commands::Hooks { command } => match command {
             HooksCommands::Stdin {

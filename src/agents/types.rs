@@ -97,6 +97,19 @@ impl AgentType {
         }
     }
 
+    /// The doctor agent-scope flag for this agent, e.g. `claude` in
+    /// `aiki doctor --fix --quarantined --claude`. Only spawnable agents have
+    /// doctor scope flags; quarantine messages fall back to the unscoped
+    /// command when this is `None`.
+    #[must_use]
+    pub fn doctor_flag(&self) -> Option<&'static str> {
+        match self {
+            AgentType::ClaudeCode => Some("claude"),
+            AgentType::Codex => Some("codex"),
+            AgentType::Cursor | AgentType::Gemini | AgentType::Unknown => None,
+        }
+    }
+
     /// Get the CLI binary name for spawnable agents.
     ///
     /// Returns `Some("binary")` for agents that have a runtime and can be spawned,

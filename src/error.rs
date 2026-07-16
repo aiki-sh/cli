@@ -276,6 +276,12 @@ Alternatively, install the agent globally:
     #[error("Failed to spawn agent: {0}")]
     AgentSpawnFailed(String),
 
+    #[error("{agent} is quarantined by macOS Gatekeeper and cannot launch unattended. Fix: aiki doctor --fix --quarantined --{agent}")]
+    BinaryQuarantined {
+        agent: String,
+        path: std::path::PathBuf,
+    },
+
     #[error("Cannot resolve --source prompt: no active session found. Use --source prompt:<change_id> to specify explicitly.")]
     NoActiveSessionForPromptSource,
 

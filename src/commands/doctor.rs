@@ -14,7 +14,46 @@ use anyhow::Context;
 use std::env;
 use std::fs;
 
-pub fn run(fix: bool) -> Result<()> {
+/// Scope selection for a doctor run.
+///
+/// An agent flag narrows doctor to that agent's checks only: binary
+/// presence/resolution, that harness's hooks config (and for Codex, the OTel
+/// receiver socket check). Multiple agent flags compose as a union. With no
+/// agent flag, doctor runs the full scan, including the stale-marker reaper
+/// and all repo-wide sections.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DoctorScope {
+    /// Scope to Claude Code checks (`--claude`).
+    pub claude: bool,
+    /// Scope to Codex checks (`--codex`).
+    pub codex: bool,
+    /// `--quarantined` was passed alongside `--fix`: authorizes the quarantine
+    /// strip. Validated against `--fix` at flag-parse time; the strip itself
+    /// lands with the quarantine detection section, so nothing consumes it yet.
+    pub fix_quarantined: bool,
+}
+
+impl DoctorScope {
+    /// True when no agent flag was given: run every section, including the
+    /// full-scan preamble (stale-marker reaper).
+    fn is_full(self) -> bool {
+        !self.claude && !self.codex
+    }
+
+    /// Claude Code checks run on a full scan or when `--claude` was given.
+    fn includes_claude(self) -> bool {
+        self.is_full() || self.claude
+    }
+
+    /// Codex checks run on a full scan or when `--codex` was given.
+    fn includes_codex(self) -> bool {
+        self.is_full() || self.codex
+    }
+}
+
+pub fn run(fix: bool, scope: DoctorScope) -> Result<()> {
+    let _ = scope.fix_quarantined; // Threaded through for the quarantine section; unused until it lands.
+
     let mut issues_found = 0;
     let fixes_applied = 0;
 
@@ -28,31 +67,36 @@ pub fn run(fix: bool) -> Result<()> {
     // for the rest of doctor — this is the one place (besides `aiki init`) that
     // removes stale markers. It NEVER creates a marker (that is reserved for
     // `aiki init`, so legacy auto-init repos are not silently re-enrolled).
-    let reaped = crate::repos::reap_stale_markers();
-    if reaped > 0 {
-        println!("✓ Reaped {reaped} stale aiki marker(s)\n");
-    }
-
-    // Check prerequisites
-    println!("Prerequisites:");
-
-    for &(cmd, description) in PREREQUISITES {
-        match check_command_version(cmd) {
-            Some(version) => {
-                println!("  ✓ {} ({})", description, version);
-            }
-            None => {
-                println!("  ✗ {} not found", description);
-                println!("    → Install {} and ensure it's on your PATH", description);
-                issues_found += 1;
-            }
+    //
+    // Full-scan preamble only: an agent-scoped run must perform no mutations
+    // outside its scoped checks and fixes. (Audited 2026-07: this is the only
+    // side effect in `run` that lives outside the section structure.)
+    if scope.is_full() {
+        let reaped = crate::repos::reap_stale_markers();
+        if reaped > 0 {
+            println!("✓ Reaped {reaped} stale aiki marker(s)\n");
         }
     }
 
-    println!();
+    if scope.is_full() {
+        // Check prerequisites
+        println!("Prerequisites:");
 
-    // Check repository setup
-    println!("Repository:");
+        for &(cmd, description) in PREREQUISITES {
+            match check_command_version(cmd) {
+                Some(version) => {
+                    println!("  ✓ {} ({})", description, version);
+                }
+                None => {
+                    println!("  ✗ {} not found", description);
+                    println!("    → Install {} and ensure it's on your PATH", description);
+                    issues_found += 1;
+                }
+            }
+        }
+
+        println!();
+    }
 
     let current_dir = env::current_dir().context("Failed to get current directory")?;
 
@@ -61,44 +105,49 @@ pub fn run(fix: bool) -> Result<()> {
     let project_root = RepoDetector::new(&current_dir)
         .find_repo_root()
         .unwrap_or_else(|_| current_dir.clone());
+    let aiki_dir = project_root.join(".aiki");
 
-    // Check JJ
-    if RepoDetector::has_jj(&project_root) {
-        let jj_ws = crate::jj::JJWorkspace::new(&project_root);
-        if jj_ws.is_healthy_non_colocated() {
-            println!("  ✓ JJ workspace initialized");
+    if scope.is_full() {
+        // Check repository setup
+        println!("Repository:");
+
+        // Check JJ
+        if RepoDetector::has_jj(&project_root) {
+            let jj_ws = crate::jj::JJWorkspace::new(&project_root);
+            if jj_ws.is_healthy_non_colocated() {
+                println!("  ✓ JJ workspace initialized");
+            } else {
+                println!("  ⚠ JJ workspace exists but is not non-colocated");
+                println!("    This may be your own jj repo, or was created by a newer jj");
+                println!("    that defaults to --colocate");
+                println!("    Warning: if you use jj for version control, removing .jj will delete your jj history");
+                println!("    Run: rm -rf .jj && aiki init");
+                issues_found += 1;
+            }
         } else {
-            println!("  ⚠ JJ workspace exists but is not non-colocated");
-            println!("    This may be your own jj repo, or was created by a newer jj");
-            println!("    that defaults to --colocate");
-            println!("    Warning: if you use jj for version control, removing .jj will delete your jj history");
-            println!("    Run: rm -rf .jj && aiki init");
+            println!("  ✗ JJ workspace not found");
+            println!("    → Run: aiki init");
             issues_found += 1;
         }
-    } else {
-        println!("  ✗ JJ workspace not found");
-        println!("    → Run: aiki init");
-        issues_found += 1;
-    }
 
-    // Check Git
-    if project_root.join(".git").exists() {
-        println!("  ✓ Git repository detected");
-    } else {
-        println!("  ⚠ No Git repository (optional)");
-    }
+        // Check Git
+        if project_root.join(".git").exists() {
+            println!("  ✓ Git repository detected");
+        } else {
+            println!("  ⚠ No Git repository (optional)");
+        }
 
-    // Check Aiki directory
-    let aiki_dir = project_root.join(".aiki");
-    if aiki_dir.exists() {
-        println!("  ✓ Aiki directory exists");
-    } else {
-        println!("  ✗ Aiki directory missing");
-        println!("    → Run: aiki init");
-        issues_found += 1;
-    }
+        // Check Aiki directory
+        if aiki_dir.exists() {
+            println!("  ✓ Aiki directory exists");
+        } else {
+            println!("  ✗ Aiki directory missing");
+            println!("    → Run: aiki init");
+            issues_found += 1;
+        }
 
-    println!();
+        println!();
+    }
 
     // Check global hooks
     println!("Global Hooks:");
@@ -106,111 +155,30 @@ pub fn run(fix: bool) -> Result<()> {
     let home_dir = dirs::home_dir().context("Failed to get home directory")?;
 
     // Check Git hooks
-    let git_hooks_dir = home_dir.join(".aiki/githooks");
-    if git_hooks_dir.exists() {
-        println!("  ✓ Git hooks installed (~/.aiki/githooks/)");
-    } else {
-        println!("  ✗ Git hooks missing");
-        println!("    → Run: aiki init or aiki doctor --fix");
-        issues_found += 1;
+    if scope.is_full() {
+        let git_hooks_dir = home_dir.join(".aiki/githooks");
+        if git_hooks_dir.exists() {
+            println!("  ✓ Git hooks installed (~/.aiki/githooks/)");
+        } else {
+            println!("  ✗ Git hooks missing");
+            println!("    → Run: aiki init or aiki doctor --fix");
+            issues_found += 1;
+        }
     }
 
     // Check Claude Code hooks - verify file exists AND contains all required hooks
     let claude_settings = home_dir.join(".claude/settings.json");
-    let claude_status = find_missing_claude_code_hooks(&claude_settings);
-    if claude_status.missing.is_empty() && claude_status.old_format.is_empty() {
-        println!("  ✓ Claude Code hooks configured");
-    } else if claude_status.missing.is_empty() {
-        // All hooks present but some use old format
-        println!("  ✓ Claude Code hooks configured");
-        println!("  ⚠ Claude Code hooks use deprecated format (--agent/--event → --claude shorthand)");
-        if fix {
-            match migrate_old_format_hooks_in_file(&claude_settings, "claude-code", "--claude") {
-                Ok(count) if count > 0 => {
-                    println!("    ✓ Migrated {} hook command(s) to new format", count);
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    println!("    ✗ Failed to migrate: {}", e);
-                }
-            }
-        } else {
-            println!("    → Run: aiki doctor --fix");
-        }
-    } else {
-        println!(
-            "  ✗ Claude Code hooks: missing {}",
-            claude_status.missing.join(", ")
-        );
-        if fix {
-            println!("    Installing Claude Code hooks...");
-            match config::install_claude_code_hooks_global() {
-                Ok(()) => {
-                    println!("    ✓ Claude Code hooks installed");
-                }
-                Err(e) => {
-                    println!("    ✗ Failed to install: {}", e);
-                    issues_found += 1;
-                }
-            }
-        } else {
-            println!("    → Run: aiki doctor --fix");
-            issues_found += 1;
-        }
-    }
-
-    // Check Cursor hooks - verify file exists AND contains aiki hooks
-    let cursor_hooks_path = home_dir.join(".cursor/hooks.json");
-    let cursor_status = check_cursor_hooks(&cursor_hooks_path);
-    if cursor_status.all_present && !cursor_status.has_old_format {
-        println!("  ✓ Cursor hooks configured");
-    } else if cursor_status.all_present && cursor_status.has_old_format {
-        println!("  ✓ Cursor hooks configured");
-        println!("  ⚠ Cursor hooks use deprecated format (--agent/--event → --cursor shorthand)");
-        if fix {
-            match migrate_old_format_hooks_in_file(&cursor_hooks_path, "cursor", "--cursor") {
-                Ok(count) if count > 0 => {
-                    println!("    ✓ Migrated {} hook command(s) to new format", count);
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    println!("    ✗ Failed to migrate: {}", e);
-                }
-            }
-        } else {
-            println!("    → Run: aiki doctor --fix");
-        }
-    } else {
-        println!("  ✗ Cursor hooks not configured");
-        if fix {
-            println!("    Installing Cursor hooks...");
-            match config::install_cursor_hooks_global() {
-                Ok(()) => {
-                    println!("    ✓ Cursor hooks installed");
-                }
-                Err(e) => {
-                    println!("    ✗ Failed to install: {}", e);
-                    issues_found += 1;
-                }
-            }
-        } else {
-            println!("    → Run: aiki doctor --fix");
-            issues_found += 1;
-        }
-    }
-
-    // Check Codex hooks - verify config.toml has OTel + hooks.json has hook definitions
-    let codex_config_path = home_dir.join(".codex/config.toml");
-    let codex_hooks_path = home_dir.join(".codex/hooks.json");
-    let codex_status = check_codex_hooks(&codex_config_path, &codex_hooks_path);
-    if codex_status.all_present {
-        println!("  ✓ Codex hooks configured");
-        // Two independent deprecation axes (see check_codex_hooks):
-        // 1. hooks.json command shorthand (--agent/--event → --codex).
-        if codex_status.has_old_format {
-            println!("  ⚠ Codex hooks use deprecated format (--agent/--event → --codex shorthand)");
+    if scope.includes_claude() {
+        let claude_status = find_missing_claude_code_hooks(&claude_settings);
+        if claude_status.missing.is_empty() && claude_status.old_format.is_empty() {
+            println!("  ✓ Claude Code hooks configured");
+        } else if claude_status.missing.is_empty() {
+            // All hooks present but some use old format
+            println!("  ✓ Claude Code hooks configured");
+            println!("  ⚠ Claude Code hooks use deprecated format (--agent/--event → --claude shorthand)");
             if fix {
-                match migrate_old_format_hooks_in_file(&codex_hooks_path, "codex", "--codex") {
+                match migrate_old_format_hooks_in_file(&claude_settings, "claude-code", "--claude")
+                {
                     Ok(count) if count > 0 => {
                         println!("    ✓ Migrated {} hook command(s) to new format", count);
                     }
@@ -222,73 +190,172 @@ pub fn run(fix: bool) -> Result<()> {
             } else {
                 println!("    → Run: aiki doctor --fix");
             }
-        }
-        // 2. config.toml [features] flag (codex_hooks → hooks); reinstall rewrites it.
-        if codex_status.has_deprecated_feature_flag {
-            println!("  ⚠ Codex hooks use deprecated feature flag (codex_hooks → hooks)");
+        } else {
+            println!(
+                "  ✗ Claude Code hooks: missing {}",
+                claude_status.missing.join(", ")
+            );
             if fix {
-                match config::install_codex_hooks_global() {
+                println!("    Installing Claude Code hooks...");
+                match config::install_claude_code_hooks_global() {
                     Ok(()) => {
-                        println!("    ✓ Migrated feature flag to [features].hooks");
+                        println!("    ✓ Claude Code hooks installed");
                     }
                     Err(e) => {
-                        println!("    ✗ Failed to migrate feature flag: {}", e);
+                        println!("    ✗ Failed to install: {}", e);
                         issues_found += 1;
                     }
                 }
             } else {
                 println!("    → Run: aiki doctor --fix");
+                issues_found += 1;
             }
         }
-    } else {
-        println!("  ✗ Codex hooks not configured");
-        if fix {
-            println!("    Installing Codex hooks...");
-            match config::install_codex_hooks_global() {
-                Ok(()) => {
-                    println!("    ✓ Codex hooks installed");
+    }
+
+    // Check Cursor hooks - verify file exists AND contains aiki hooks
+    let cursor_hooks_path = home_dir.join(".cursor/hooks.json");
+    if scope.is_full() {
+        let cursor_status = check_cursor_hooks(&cursor_hooks_path);
+        if cursor_status.all_present && !cursor_status.has_old_format {
+            println!("  ✓ Cursor hooks configured");
+        } else if cursor_status.all_present && cursor_status.has_old_format {
+            println!("  ✓ Cursor hooks configured");
+            println!("  ⚠ Cursor hooks use deprecated format (--agent/--event → --cursor shorthand)");
+            if fix {
+                match migrate_old_format_hooks_in_file(&cursor_hooks_path, "cursor", "--cursor") {
+                    Ok(count) if count > 0 => {
+                        println!("    ✓ Migrated {} hook command(s) to new format", count);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        println!("    ✗ Failed to migrate: {}", e);
+                    }
                 }
-                Err(e) => {
-                    println!("    ✗ Failed to install: {}", e);
-                    issues_found += 1;
+            } else {
+                println!("    → Run: aiki doctor --fix");
+            }
+        } else {
+            println!("  ✗ Cursor hooks not configured");
+            if fix {
+                println!("    Installing Cursor hooks...");
+                match config::install_cursor_hooks_global() {
+                    Ok(()) => {
+                        println!("    ✓ Cursor hooks installed");
+                    }
+                    Err(e) => {
+                        println!("    ✗ Failed to install: {}", e);
+                        issues_found += 1;
+                    }
+                }
+            } else {
+                println!("    → Run: aiki doctor --fix");
+                issues_found += 1;
+            }
+        }
+    }
+
+    // Check Codex hooks - verify config.toml has OTel + hooks.json has hook definitions
+    let codex_config_path = home_dir.join(".codex/config.toml");
+    let codex_hooks_path = home_dir.join(".codex/hooks.json");
+    if scope.includes_codex() {
+        let codex_status = check_codex_hooks(&codex_config_path, &codex_hooks_path);
+        if codex_status.all_present {
+            println!("  ✓ Codex hooks configured");
+            // Two independent deprecation axes (see check_codex_hooks):
+            // 1. hooks.json command shorthand (--agent/--event → --codex).
+            if codex_status.has_old_format {
+                println!("  ⚠ Codex hooks use deprecated format (--agent/--event → --codex shorthand)");
+                if fix {
+                    match migrate_old_format_hooks_in_file(&codex_hooks_path, "codex", "--codex") {
+                        Ok(count) if count > 0 => {
+                            println!("    ✓ Migrated {} hook command(s) to new format", count);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            println!("    ✗ Failed to migrate: {}", e);
+                        }
+                    }
+                } else {
+                    println!("    → Run: aiki doctor --fix");
+                }
+            }
+            // 2. config.toml [features] flag (codex_hooks → hooks); reinstall rewrites it.
+            if codex_status.has_deprecated_feature_flag {
+                println!("  ⚠ Codex hooks use deprecated feature flag (codex_hooks → hooks)");
+                if fix {
+                    match config::install_codex_hooks_global() {
+                        Ok(()) => {
+                            println!("    ✓ Migrated feature flag to [features].hooks");
+                        }
+                        Err(e) => {
+                            println!("    ✗ Failed to migrate feature flag: {}", e);
+                            issues_found += 1;
+                        }
+                    }
+                } else {
+                    println!("    → Run: aiki doctor --fix");
                 }
             }
         } else {
-            println!("    → Run: aiki doctor --fix");
-            issues_found += 1;
+            println!("  ✗ Codex hooks not configured");
+            if fix {
+                println!("    Installing Codex hooks...");
+                match config::install_codex_hooks_global() {
+                    Ok(()) => {
+                        println!("    ✓ Codex hooks installed");
+                    }
+                    Err(e) => {
+                        println!("    ✗ Failed to install: {}", e);
+                        issues_found += 1;
+                    }
+                }
+            } else {
+                println!("    → Run: aiki doctor --fix");
+                issues_found += 1;
+            }
         }
     }
 
     // Detect duplicate aiki-owned hook entries. The append-and-filter installers
     // never create duplicates, but a historical clobber bug or future detection
     // drift could; --fix dedupes, keeping the first aiki entry per event.
-    issues_found += check_duplicate_aiki_hooks(&claude_settings, "Claude Code settings.json", fix);
-    issues_found += check_duplicate_aiki_hooks(&cursor_hooks_path, "Cursor hooks.json", fix);
-    issues_found += check_duplicate_aiki_hooks(&codex_hooks_path, "Codex hooks.json", fix);
+    if scope.includes_claude() {
+        issues_found +=
+            check_duplicate_aiki_hooks(&claude_settings, "Claude Code settings.json", fix);
+    }
+    if scope.is_full() {
+        issues_found += check_duplicate_aiki_hooks(&cursor_hooks_path, "Cursor hooks.json", fix);
+    }
+    if scope.includes_codex() {
+        issues_found += check_duplicate_aiki_hooks(&codex_hooks_path, "Codex hooks.json", fix);
+    }
 
     // Check Codex OTel receiver socket (non-blocking connection test)
-    let otel_receiver_ok = check_otel_receiver();
-    if otel_receiver_ok && !fix {
-        println!("  ✓ OTel receiver listening on 127.0.0.1:19876");
-    } else if fix {
-        println!(
-            "  {} OTel receiver",
-            if otel_receiver_ok { "✓" } else { "✗" }
-        );
-        println!("    Restarting OTel receiver...");
-        match config::restart_otel_receiver() {
-            Ok(()) => {
-                println!("    ✓ OTel receiver restarted");
+    if scope.includes_codex() {
+        let otel_receiver_ok = check_otel_receiver();
+        if otel_receiver_ok && !fix {
+            println!("  ✓ OTel receiver listening on 127.0.0.1:19876");
+        } else if fix {
+            println!(
+                "  {} OTel receiver",
+                if otel_receiver_ok { "✓" } else { "✗" }
+            );
+            println!("    Restarting OTel receiver...");
+            match config::restart_otel_receiver() {
+                Ok(()) => {
+                    println!("    ✓ OTel receiver restarted");
+                }
+                Err(e) => {
+                    println!("    ✗ Failed to restart OTel receiver: {}", e);
+                    issues_found += 1;
+                }
             }
-            Err(e) => {
-                println!("    ✗ Failed to restart OTel receiver: {}", e);
-                issues_found += 1;
-            }
+        } else {
+            println!("  ✗ OTel receiver not listening");
+            println!("    → Run: aiki doctor --fix");
+            issues_found += 1;
         }
-    } else {
-        println!("  ✗ OTel receiver not listening");
-        println!("    → Run: aiki doctor --fix");
-        issues_found += 1;
     }
 
     println!();
@@ -296,54 +363,61 @@ pub fn run(fix: bool) -> Result<()> {
     // Check ACP (Agent Client Protocol) configuration
     println!("ACP Configuration:");
 
-    // Check Zed ACP configuration
-    match ide_config::is_zed_configured() {
-        Ok(true) => {
-            println!("  ✓ Zed editor configured for ACP");
-            if let Some(path) = ide_config::zed_settings_path() {
-                println!("    Settings: {}", path.display());
-            }
-        }
-        Ok(false) => {
-            if let Some(path) = ide_config::zed_settings_path() {
-                if path.parent().map(|p| p.exists()).unwrap_or(false) {
-                    println!("  ✗ Zed editor not configured for ACP");
-                    issues_found += 1; // Count unconfigured state as an issue
-                    if fix {
-                        println!("    Configuring Zed for ACP...");
-                        match ide_config::configure_zed() {
-                            Ok(()) => {
-                                println!("    ✓ Configured Zed editor");
-                                issues_found -= 1; // Clear the issue since we fixed it
-                            }
-                            Err(e) => {
-                                println!("    ✗ Failed to configure Zed: {}", e);
-                                // Issue already counted above
-                            }
-                        }
-                    } else {
-                        println!("    → Run: aiki doctor --fix (to configure Zed)");
-                    }
-                } else {
-                    println!("  - Zed editor not installed");
+    // Check Zed ACP configuration (repo-wide editor setup — full scan only)
+    if scope.is_full() {
+        match ide_config::is_zed_configured() {
+            Ok(true) => {
+                println!("  ✓ Zed editor configured for ACP");
+                if let Some(path) = ide_config::zed_settings_path() {
+                    println!("    Settings: {}", path.display());
                 }
             }
-        }
-        Err(e) => {
-            println!("  ✗ Error checking Zed configuration: {}", e);
-            issues_found += 1;
+            Ok(false) => {
+                if let Some(path) = ide_config::zed_settings_path() {
+                    if path.parent().map(|p| p.exists()).unwrap_or(false) {
+                        println!("  ✗ Zed editor not configured for ACP");
+                        issues_found += 1; // Count unconfigured state as an issue
+                        if fix {
+                            println!("    Configuring Zed for ACP...");
+                            match ide_config::configure_zed() {
+                                Ok(()) => {
+                                    println!("    ✓ Configured Zed editor");
+                                    issues_found -= 1; // Clear the issue since we fixed it
+                                }
+                                Err(e) => {
+                                    println!("    ✗ Failed to configure Zed: {}", e);
+                                    // Issue already counted above
+                                }
+                            }
+                        } else {
+                            println!("    → Run: aiki doctor --fix (to configure Zed)");
+                        }
+                    } else {
+                        println!("  - Zed editor not installed");
+                    }
+                }
+            }
+            Err(e) => {
+                println!("  ✗ Error checking Zed configuration: {}", e);
+                issues_found += 1;
+            }
         }
     }
 
     // Check ACP binary availability
     println!("\n  ACP Agent Binaries:");
 
-    // Check common agents
-    let agents_to_check = vec![
-        ("claude-code", "Claude Code"),
-        ("codex", "Codex"),
-        ("gemini", "Gemini"),
-    ];
+    // Check common agents (scoped runs only resolve their flagged agents)
+    let mut agents_to_check = Vec::new();
+    if scope.includes_claude() {
+        agents_to_check.push(("claude-code", "Claude Code"));
+    }
+    if scope.includes_codex() {
+        agents_to_check.push(("codex", "Codex"));
+    }
+    if scope.is_full() {
+        agents_to_check.push(("gemini", "Gemini"));
+    }
 
     for (agent_type, display_name) in agents_to_check {
         match zed_detection::resolve_agent_binary(agent_type) {
@@ -374,14 +448,16 @@ pub fn run(fix: bool) -> Result<()> {
     }
 
     // Check Node.js for Node.js-based agents
-    if let Ok(_) = zed_detection::check_nodejs_installed() {
-        // Node.js check already prints version to stderr
+    if scope.is_full() {
+        if let Ok(_) = zed_detection::check_nodejs_installed() {
+            // Node.js check already prints version to stderr
+        }
     }
 
     println!();
 
     // Check local configuration (only if in a repo)
-    if project_root.join(".git").exists() {
+    if scope.is_full() && project_root.join(".git").exists() {
         println!("Local Configuration:");
 
         // Check git core.hooksPath
@@ -408,10 +484,42 @@ pub fn run(fix: bool) -> Result<()> {
         println!();
     }
 
+    // Repo-wide config sections (instruction files, hookfile, plugins,
+    // templates) are skipped by agent-scoped runs.
+    if scope.is_full() {
+        issues_found += check_repo_config_sections(&project_root, &aiki_dir, fix);
+    }
+
+    // Summary
+    if issues_found == 0 {
+        println!("✓ All checks passed! Aiki is healthy.");
+    } else {
+        println!("Found {} issue(s).", issues_found);
+        if !fix {
+            println!("\nRun 'aiki doctor --fix' to automatically fix issues.");
+        } else if fixes_applied > 0 {
+            println!("\nFixed {} issue(s).", fixes_applied);
+        }
+    }
+
+    Ok(())
+}
+
+/// Repo-wide config sections: instruction files, hookfile, plugins, templates.
+///
+/// Split out of `run` so agent-scoped runs skip them wholesale. Returns the
+/// number of issues found.
+fn check_repo_config_sections(
+    project_root: &std::path::Path,
+    aiki_dir: &std::path::Path,
+    fix: bool,
+) -> usize {
+    let mut issues_found = 0;
+
     // Check instruction files (AGENTS.md / CLAUDE.md)
     println!("Agent Instructions:");
 
-    issues_found += check_instruction_files(&project_root, fix);
+    issues_found += check_instruction_files(project_root, fix);
 
     println!();
 
@@ -582,23 +690,11 @@ pub fn run(fix: bool) -> Result<()> {
     }
 
     // Check template health
-    issues_found += check_templates(&project_root, fix);
+    issues_found += check_templates(project_root, fix);
 
     println!();
 
-    // Summary
-    if issues_found == 0 {
-        println!("✓ All checks passed! Aiki is healthy.");
-    } else {
-        println!("Found {} issue(s).", issues_found);
-        if !fix {
-            println!("\nRun 'aiki doctor --fix' to automatically fix issues.");
-        } else if fixes_applied > 0 {
-            println!("\nFixed {} issue(s).", fixes_applied);
-        }
-    }
-
-    Ok(())
+    issues_found
 }
 
 /// Check instruction file health using `RepoInstructionsKind`.

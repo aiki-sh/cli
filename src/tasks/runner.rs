@@ -397,6 +397,11 @@ fn map_tui_effect(cwd: &Path, task_id: &str, effect: Effect) -> Result<AgentSess
 /// 6. Handles the result and updates task state
 pub fn task_run(cwd: &Path, task_id: &str, options: TaskRunOptions) -> Result<()> {
     let quiet = options.quiet;
+    // stdout TTY-ness selects TUI vs blocking mode — deliberately the SAME
+    // signal the quarantine pre-flight uses to classify interactive vs
+    // headless (`is_headless` in cli/src/agents/runtime/mod.rs), so the
+    // pre-flight's classification always matches the execution mode actually
+    // taken; change both sites together.
     let show_tui = std::io::stdout().is_terminal() && !quiet;
 
     // Show loading spinner during prepare (TTY only)

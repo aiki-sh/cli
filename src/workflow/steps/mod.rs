@@ -278,8 +278,15 @@ pub(crate) fn spawn_drain(
     output: WorkflowOutput,
     handler: &mut dyn DrainHandler,
 ) -> crate::error::Result<()> {
-    let _ = output;
-    let prepared = prepare_task_run(cwd, task_id, run_options, |_| {})?;
+    let mut prepared = prepare_task_run(cwd, task_id, run_options, |_| {})?;
+    // Route pre-spawn warnings (quarantine pre-flight) through the workflow's
+    // output handle instead of raw stderr, where the live progress display
+    // could overwrite them.
+    prepared.spawn_options = prepared
+        .spawn_options
+        .with_warn_sink(crate::agents::runtime::WarnSink::new(move |msg| {
+            output.warn(msg)
+        }));
 
     let mut agent_handle = match prepared.runtime.spawn_monitored(&prepared.spawn_options) {
         Ok(handle) => handle,

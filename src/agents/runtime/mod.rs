@@ -159,6 +159,33 @@ impl AgentSessionResult {
     }
 }
 
+/// Destination for pre-spawn warnings (quarantine pre-flight).
+///
+/// Callers with a live output display (e.g. `aiki build`) set a sink so
+/// warnings route through their display instead of raw stderr, where a
+/// live-updating display could overwrite them. Without a sink, spawn methods
+/// fall back to `eprintln!`.
+#[derive(Clone)]
+pub struct WarnSink(std::sync::Arc<dyn Fn(&str) + Send + Sync>);
+
+impl WarnSink {
+    /// Wrap a warning callback.
+    pub fn new(f: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(f))
+    }
+
+    /// Emit one warning message (possibly multi-line).
+    pub fn emit(&self, msg: &str) {
+        (self.0)(msg);
+    }
+}
+
+impl std::fmt::Debug for WarnSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WarnSink(..)")
+    }
+}
+
 /// Options for spawning an agent session
 #[derive(Debug, Clone)]
 pub struct AgentSpawnOptions {
@@ -170,6 +197,8 @@ pub struct AgentSpawnOptions {
     pub parent_session_uuid: Option<String>,
     /// Path to the event FIFO pipe for push-based event streaming
     pub event_pipe: Option<std::path::PathBuf>,
+    /// Warning sink for pre-spawn warnings; `None` falls back to stderr
+    pub warn: Option<WarnSink>,
 }
 
 impl AgentSpawnOptions {
@@ -181,7 +210,15 @@ impl AgentSpawnOptions {
             thread,
             parent_session_uuid: None,
             event_pipe: None,
+            warn: None,
         }
+    }
+
+    /// Route pre-spawn warnings through `sink` instead of stderr
+    #[must_use]
+    pub fn with_warn_sink(mut self, sink: WarnSink) -> Self {
+        self.warn = Some(sink);
+        self
     }
 
     /// Set the parent session UUID for workspace isolation chaining
@@ -284,6 +321,70 @@ pub fn get_runtime(agent_type: AgentType) -> Option<Box<dyn AgentRuntime>> {
         .and_then(|runtime| runtime.ok())
 }
 
+/// Whether this process runs without a human who could approve a macOS
+/// Gatekeeper dialog.
+///
+/// Keys on stdout TTY-ness — deliberately the SAME signal `task_run` uses to
+/// select TUI vs blocking mode (`show_tui` in `cli/src/tasks/runner.rs`), so
+/// the quarantine pre-flight's classification always matches the execution
+/// mode actually taken; change both sites together. An SSH session can have a
+/// TTY but no way to see a local GUI dialog, so `SSH_CONNECTION` forces
+/// headless. Mixed-TTY (stdout piped, stderr a TTY, e.g. `aiki run <id> |
+/// tee log`) is headless by construction; stderr state is deliberately
+/// irrelevant.
+pub(crate) fn is_headless() -> bool {
+    use std::io::IsTerminal;
+    !std::io::stdout().is_terminal() || std::env::var_os("SSH_CONNECTION").is_some()
+}
+
+/// Session-discovery timeout, injectable in debug builds so timeout tests run
+/// in about a second instead of 30.
+fn discovery_timeout() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("AIKI_TEST_SESSION_DISCOVERY_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    // Session startup can take longer than the original 5s budget.
+    std::time::Duration::from_secs(30)
+}
+
+/// Error message for a session-discovery timeout, enriched with quarantine
+/// detail when the agent's binary carries the xattr.
+///
+/// Quarantine only affects the FIRST exec: when the binary is `Pending`, the
+/// spawned agent is almost certainly sitting behind a Gatekeeper confirmation
+/// dialog, which is exactly what a produced-no-session timeout looks like.
+/// Re-resolving and re-checking the binary here costs microseconds and only
+/// runs on the already-failed path.
+fn discovery_timeout_message(agent_type: AgentType, timeout: std::time::Duration) -> String {
+    use crate::utils::quarantine::{self, QuarantineStatus};
+
+    const GENERIC: &str = "Session UUID not discovered within timeout";
+    let (Some(binary), Some(agent)) = (agent_type.cli_binary(), agent_type.doctor_flag()) else {
+        return GENERIC.to_string();
+    };
+    let Ok(path) = which::which(binary) else {
+        return GENERIC.to_string();
+    };
+    let secs = timeout.as_secs();
+    match quarantine::check(&path) {
+        QuarantineStatus::Pending { .. } => format!(
+            "Agent produced no session within {secs}s. Probable cause: {agent} is quarantined \
+             by macOS Gatekeeper and is waiting on a confirmation dialog. \
+             Fix: `aiki doctor --fix --quarantined --{agent}`."
+        ),
+        QuarantineStatus::Undetermined { .. } => format!(
+            "Agent produced no session within {secs}s. Possible cause: {agent} carries a macOS \
+             quarantine attribute aiki could not interpret. If a Gatekeeper confirmation dialog \
+             is blocking it, fix: `aiki doctor --fix --quarantined --{agent}`."
+        ),
+        _ => GENERIC.to_string(),
+    }
+}
+
 /// Poll session state until a thread-bound session is registered.
 ///
 /// After spawning an agent, `session.started` is recorded in conversation
@@ -292,13 +393,15 @@ pub fn get_runtime(agent_type: AgentType) -> Option<Box<dyn AgentRuntime>> {
 ///
 /// Conversation events live in the global JJ repo (`~/.aiki/`), not the
 /// project repo, so we read from `global_aiki_dir()`.
-pub fn discover_session_id(thread: &ThreadId) -> Result<String> {
+///
+/// `agent_type` identifies the spawned binary so the timeout error can name
+/// quarantine as the probable cause when the attribute is present.
+pub fn discover_session_id(thread: &ThreadId, agent_type: AgentType) -> Result<String> {
     use crate::history::storage::find_session_started_for_thread;
     use std::thread as std_thread;
     use std::time::{Duration, Instant};
 
-    // Session startup can take longer than the original 5s budget.
-    let timeout = Duration::from_secs(30);
+    let timeout = discovery_timeout();
     let start = Instant::now();
     let mut delay = Duration::from_millis(100);
     let max_delay = Duration::from_millis(500);
@@ -312,7 +415,9 @@ pub fn discover_session_id(thread: &ThreadId) -> Result<String> {
         }
 
         if start.elapsed() >= timeout {
-            return Err(anyhow::anyhow!("Session UUID not discovered within timeout").into());
+            return Err(
+                anyhow::anyhow!("{}", discovery_timeout_message(agent_type, timeout)).into(),
+            );
         }
 
         std_thread::sleep(delay);

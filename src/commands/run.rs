@@ -451,7 +451,7 @@ fn spawn_and_discover(
     let head_id = &handle.thread.head;
 
     // Discover session UUID (works for all agents with native hooks)
-    let session_id = match discover_session_id(&handle.thread) {
+    let session_id = match discover_session_id(&handle.thread, handle.agent_type) {
         Ok(sid) => sid,
         Err(e) => {
             // The agent never registered its session within the timeout: it hung
